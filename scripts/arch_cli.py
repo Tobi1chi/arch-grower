@@ -178,8 +178,8 @@ def _flatten_folds(graph: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str
     that currently shows it (itself, or the outermost super node holding it).
     Edges are taken from their members, so an edge drawn to a module attaches
     to the child it really reaches. An endpoint that is still a super node
-    (an edge attached while folded) resolves through the module's unique
-    entry / exit child; when that is ambiguous the edge is left out.
+    (an edge attached while folded) resolves through the module's entry /
+    exit children; when there are several, the edge connects to all of them.
     """
     flat_nodes: List[Dict[str, Any]] = []
     top_of: Dict[str, str] = {}
@@ -192,23 +192,24 @@ def _flatten_folds(graph: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str
                 flat_nodes.append(n)
                 top_of[n["id"]] = top["id"]
 
-    def resolve(nid: str, side: str) -> Optional[str]:
-        seen = set()
-        while nid in supers and nid not in seen:
-            seen.add(nid)
-            candidates = supers[nid]["entry_children" if side == "to" else "exit_children"]
-            if len(candidates) != 1:
-                return None
-            nid = candidates[0]
-        return nid if nid in top_of else None
+    def resolve(nid: str, side: str, seen: frozenset = frozenset()) -> List[str]:
+        if nid in top_of:
+            return [nid]
+        if nid not in supers or nid in seen:
+            return []
+        candidates = supers[nid]["entry_children" if side == "to" else "exit_children"]
+        return [leaf for c in candidates for leaf in resolve(c, side, seen | {nid})]
 
     raw = list(graph["edges"]) + [e for sn in supers.values() for e in sn.get("inner_edges", [])]
     flat_edges = []
     for e in raw:
         for m in _edge_members(e):
-            u, v = resolve(m["from"], "from"), resolve(m["to"], "to")
-            if u and v:
-                flat_edges.append({"from": u, "to": v, "contract": m.get("contract", "")})
+            # An endpoint that is still ambiguous connects to every candidate:
+            # extra dependencies can only remove entries and exits, so the
+            # skeleton is never reported ready on a guess.
+            for u in resolve(m["from"], "from"):
+                for v in resolve(m["to"], "to"):
+                    flat_edges.append({"from": u, "to": v, "contract": m.get("contract", "")})
     return {"nodes": flat_nodes, "edges": flat_edges}, top_of
 
 
@@ -682,10 +683,26 @@ def op_deactivate_node(node_id: str, reason: str = "", bypass_contract: str = ""
     for inc in incoming:
         for out in outgoing:
             u, v = inc["from"], out["to"]
-            if u != v and not any(e["from"] == u and e["to"] == v for e in graph["edges"]):
-                ct = bypass_contract or inc.get("contract") or out.get("contract") or "Bypass-Bridged"
-                graph["edges"].append({"from": u, "to": v, "contract": ct})
+            if u == v:
+                continue
+            ct = bypass_contract or inc.get("contract") or out.get("contract") or "Bypass-Bridged"
+            # Join the original endpoints on both sides, so a bypass touching a
+            # folded module still knows which child it really starts or ends at.
+            bypass = [
+                {"from": a["from"], "to": b["to"], "contract": ct}
+                for a in _edge_members(inc) for b in _edge_members(out) if a["from"] != b["to"]
+            ]
+            existing = next((e for e in graph["edges"] if e["from"] == u and e["to"] == v), None)
+            if existing is None:
+                graph["edges"].append(_edge_from_members(u, v, bypass))
                 bridged_edges.append(f"{u} -> {v}")
+                continue
+            known = {(m["from"], m["to"]) for m in _edge_members(existing)}
+            extra = [m for m in bypass if (m["from"], m["to"]) not in known]
+            if extra:
+                graph["edges"][graph["edges"].index(existing)] = _edge_from_members(
+                    u, v, _edge_members(existing) + extra
+                )
 
     graph["step"] += 1
     tag = f"deactivate-{node_id}-s{graph['step']:02d}"

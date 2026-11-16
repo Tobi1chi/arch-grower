@@ -303,6 +303,43 @@ class FoldTest(EngineTestCase):
         arch_cli.op_fold(["s", "m"], "outer", "外层", "spec")  # nested fold
         self.assertEqual(arch_cli._find_walking_skeleton(self.graph()), ["outer", "t"])
 
+    def test_ambiguous_attachment_never_reports_a_false_skeleton(self) -> None:
+        # Review finding: h2 hangs off a module with two exits; dropping that
+        # undecided edge made the module look like a finished trunk.
+        self._custom_graph(["a", "b", "c"], ["h1"], [("a", "b"), ("a", "c"), ("c", "h1")])
+        arch_cli.op_fold(["a", "b", "c"], "m", "模块", "spec")
+        out = arch_cli.op_add_node("h2", "? 待定", "spec", after_node="m")
+        self.assertNotIn("WALKING_SKELETON_READY", out)
+        # While h2's attachment is undecided the engine stays conservative.
+        self.assertIsNone(arch_cli._find_walking_skeleton(self.graph()))
+        folded = self.graph()
+        arch_cli.op_unfold("m", {"h2": "b"})  # both exits blocked: not ready
+        self.assertIsNone(arch_cli._find_walking_skeleton(self.graph()))
+        arch_cli._save_graph(folded)
+        arch_cli.op_unfold("m", {"h2": "c"})  # a -> b is free: ready
+        self.assertEqual(arch_cli._find_walking_skeleton(self.graph()), ["a", "b"])
+
+    def test_bypass_around_deactivated_neighbour_keeps_the_real_child(self) -> None:
+        # Review finding: a -> x -> t with x deactivated came back as b -> t.
+        self._custom_graph(["a", "b", "x", "t"], ["h"], [("a", "b"), ("a", "x"), ("x", "t"), ("b", "h")])
+        arch_cli.op_fold(["a", "b"], "m", "模块", "spec")
+        arch_cli.op_deactivate_node("x")
+        arch_cli.op_unfold("m")
+        edges = {(e["from"], e["to"]) for e in self.graph()["edges"]}
+        self.assertIn(("a", "t"), edges)
+        self.assertNotIn(("b", "t"), edges)
+        self._assert_plain_edges()
+
+    def test_bypass_merges_into_an_existing_module_edge(self) -> None:
+        # m already reaches t through b; the bypass through x adds a -> t.
+        self._custom_graph(["a", "b", "x", "t"], [], [("a", "b"), ("a", "x"), ("x", "t"), ("b", "t")])
+        arch_cli.op_fold(["a", "b"], "m", "模块", "spec")
+        arch_cli.op_deactivate_node("x")
+        self.assertEqual(sum(1 for e in self.graph()["edges"] if (e["from"], e["to"]) == ("m", "t")), 1)
+        arch_cli.op_unfold("m")
+        edges = {(e["from"], e["to"]) for e in self.graph()["edges"]}
+        self.assertTrue({("a", "t"), ("b", "t")} <= edges)
+
     def test_super_type_cannot_be_set_by_hand(self) -> None:
         with self.assertRaisesRegex(arch_cli.ArchEngineError, "arch_fold"):
             arch_cli.op_add_node("fake", "假的", "spec", status="solid", node_type="super_node")
