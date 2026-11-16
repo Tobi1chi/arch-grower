@@ -5,6 +5,7 @@ exposing native Tool Calls backed by arch_cli.py state machine.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -15,6 +16,13 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import arch_cli  # noqa: E402
+
+# The engine keeps state in a relative `.arch/` directory. Hosts launch MCP
+# servers from different working directories (Claude Desktop and global configs
+# often do not use the project folder), so ARCH_ROOT pins the project root.
+_ARCH_ROOT = os.environ.get("ARCH_ROOT", "").strip()
+if _ARCH_ROOT:
+    os.chdir(os.path.expanduser(_ARCH_ROOT))
 
 
 TOOLS: List[Dict[str, Any]] = [
@@ -53,7 +61,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "out_contract": {"type": "string", "description": "可选：下游输出数据结构契约"},
                 "node_type": {
                     "type": "string",
-                    "enum": ["port", "adapter", "reality_gate", "super_node"],
+                    "enum": ["port", "adapter", "reality_gate"],
                     "description": "节点类型（默认 port）",
                 },
                 "stage": {"type": "string", "description": "可选：指定归属的生命周期 Stage 阶段名称"},
@@ -71,7 +79,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "label": {"type": "string"},
                 "spec": {"type": "string"},
                 "status": {"type": "string", "enum": ["hole", "solid", "fog"]},
-                "node_type": {"type": "string", "enum": ["port", "adapter", "reality_gate", "super_node"]},
+                "node_type": {"type": "string", "enum": ["port", "adapter", "reality_gate"]},
                 "stage": {"type": "string", "description": "可选：指定归属的生命周期 Stage 阶段名称"},
                 "after_node": {"type": "string", "description": "可选：上游前驱节点 ID"},
                 "before_node": {"type": "string", "description": "可选：下游后继节点 ID"},
@@ -117,6 +125,44 @@ TOOLS: List[Dict[str, Any]] = [
                 "after_node": {"type": "string", "description": "可选：挂载在哪个上游节点之后"},
                 "before_node": {"type": "string", "description": "可选：插入在哪个下游节点之前"},
                 "contract": {"type": "string", "description": "连线契约描述"},
+            },
+            "required": ["node_id"],
+        },
+    },
+    {
+        "name": "arch_fold",
+        "description": (
+            "将已确定（solid / super_node）、彼此连通的子图折叠为一个超级节点，压缩认知负荷。"
+            "子节点与内部连线完整保存在超级节点内，对外连线改接到超级节点并保留契约。"
+            "当 focus 提示活跃实心节点过多时使用。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "node_ids": {"type": "array", "items": {"type": "string"}, "description": "待折叠的节点 ID（至少 2 个）"},
+                "super_id": {"type": "string", "description": "超级节点 ID"},
+                "label": {"type": "string", "description": "模块名称"},
+                "spec": {"type": "string", "description": "模块整体职责描述"},
+                "stage": {"type": "string", "description": "可选：所属 Stage；缺省时若子节点同属一个 Stage 则沿用"},
+            },
+            "required": ["node_ids", "super_id", "label", "spec"],
+        },
+    },
+    {
+        "name": "arch_unfold",
+        "description": (
+            "展开超级节点，原样恢复子节点、内部连线与对外连线。折叠期间新增的连线自动接到唯一的入口/出口子节点；"
+            "无法自动归位时会报错并列出候选，此时向用户确认后通过 attach 指定。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string", "description": "超级节点 ID"},
+                "attach": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "可选：{外部节点ID: 子节点ID}，指定折叠期间新增连线接到哪个子节点",
+                },
             },
             "required": ["node_id"],
         },
@@ -272,6 +318,16 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             before_node=args.get("before_node", ""),
             contract=args.get("contract", "TBD"),
         )
+    if name == "arch_fold":
+        return arch_cli.op_fold(
+            node_ids=args["node_ids"],
+            super_id=args["super_id"],
+            label=args["label"],
+            spec=args["spec"],
+            stage=args.get("stage", ""),
+        )
+    if name == "arch_unfold":
+        return arch_cli.op_unfold(args["node_id"], args.get("attach") or {})
     if name == "arch_verify":
         return arch_cli.op_verify(args["fact"], args["constraint"])
     if name == "arch_ground":
