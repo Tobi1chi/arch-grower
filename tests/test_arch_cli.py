@@ -4,6 +4,7 @@ Run from the repository root:
     python3 -m unittest discover -s tests
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -78,6 +79,121 @@ class FocusOrderTest(EngineTestCase):
         )
         out = arch_cli.op_focus()
         self.assertIn('"id": "decoder"', out.split('"focus_node"')[1].split("}")[0])
+
+
+def _snapshot(graph):
+    """Order-insensitive view of the top-level graph for round-trip checks."""
+    nodes = sorted((json.dumps(n, sort_keys=True, ensure_ascii=False) for n in graph["nodes"]))
+    edges = sorted((e["from"], e["to"], e.get("contract", "")) for e in graph["edges"])
+    return nodes, edges
+
+
+class FoldTest(EngineTestCase):
+    """Trunk used below: entry_input -> decoder -> core_transform -> final_output (all solid)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+        arch_cli.op_add_node(
+            "decoder", "解码", "spec", status="solid",
+            after_node="entry_input", before_node="core_transform", contract="Frame",
+        )
+
+    def graph(self):
+        return arch_cli._load_graph()
+
+    def test_fold_replaces_members_and_keeps_skeleton(self) -> None:
+        out = arch_cli.op_fold(["decoder", "core_transform"], "proc", "处理模块", "解码并翻译")
+        g = self.graph()
+        ids = [n["id"] for n in g["nodes"]]
+        self.assertNotIn("decoder", ids)
+        self.assertIn("proc", ids)
+        self.assertEqual(
+            sorted((e["from"], e["to"]) for e in g["edges"]),
+            [("entry_input", "proc"), ("proc", "final_output")],
+        )
+        self.assertIn("entry_input -> proc -> final_output", out)
+
+    def test_unfold_round_trip_is_exact(self) -> None:
+        before = _snapshot(self.graph())
+        arch_cli.op_fold(["decoder", "core_transform"], "proc", "处理模块", "spec")
+        arch_cli.op_unfold("proc")
+        self.assertEqual(_snapshot(self.graph()), before)
+
+    def test_nested_fold_round_trip(self) -> None:
+        before = _snapshot(self.graph())
+        arch_cli.op_fold(["decoder", "core_transform"], "proc", "处理模块", "spec")
+        arch_cli.op_fold(["entry_input", "proc"], "front", "前端", "spec")
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "front"):
+            arch_cli.op_collapse("decoder", "x", "y")  # points at the outermost container
+        arch_cli.op_unfold("front")
+        arch_cli.op_unfold("proc")
+        self.assertEqual(_snapshot(self.graph()), before)
+
+    def test_rejects_unsettled_nodes(self) -> None:
+        arch_cli.op_add_node("idea", "? 想法", "tbd", after_node="final_output")
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "尚未确定"):
+            arch_cli.op_fold(["final_output", "idea"], "s", "l", "s")
+
+    def test_rejects_disconnected_members(self) -> None:
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "不连通"):
+            arch_cli.op_fold(["entry_input", "final_output"], "s", "l", "s")
+
+    def test_rejects_fold_that_would_create_cycle(self) -> None:
+        g = self.graph()
+        g["edges"].append({"from": "entry_input", "to": "core_transform", "contract": "skip"})
+        arch_cli._save_graph(g)
+        # entry -> decoder -> core leaves the set and comes back in.
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "形成环"):
+            arch_cli.op_fold(["entry_input", "core_transform"], "s", "l", "s")
+
+    def test_contract_changed_while_folded_is_restored(self) -> None:
+        arch_cli.op_fold(["decoder", "core_transform"], "proc", "处理模块", "spec")
+        arch_cli.op_collapse("final_output", "输出", "spec", in_contract="Subtitle[]")
+        arch_cli.op_unfold("proc")
+        edge = next(e for e in self.graph()["edges"] if e["to"] == "final_output")
+        self.assertEqual((edge["from"], edge["contract"]), ("core_transform", "Subtitle[]"))
+
+    def test_edge_added_while_folded_attaches_to_unique_exit(self) -> None:
+        arch_cli.op_fold(["decoder", "core_transform"], "proc", "处理模块", "spec")
+        arch_cli.op_add_node("logger", "日志", "spec", status="solid", after_node="proc")
+        arch_cli.op_unfold("proc")
+        edges = {(e["from"], e["to"]) for e in self.graph()["edges"]}
+        self.assertIn(("core_transform", "logger"), edges)
+
+    def test_ambiguous_new_edge_needs_attach(self) -> None:
+        arch_cli.op_add_node("wav", "录音", "spec", status="solid", after_node="core_transform")
+        arch_cli.op_fold(["core_transform", "final_output", "wav"], "back", "后端", "spec")
+        arch_cli.op_add_node("archive", "归档", "spec", status="solid", after_node="back")
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "attach"):
+            arch_cli.op_unfold("back")
+        arch_cli.op_unfold("back", {"archive": "wav"})
+        edges = {(e["from"], e["to"]) for e in self.graph()["edges"]}
+        self.assertIn(("wav", "archive"), edges)
+
+    def test_super_node_blocks_node_level_operations(self) -> None:
+        arch_cli.op_fold(["decoder", "core_transform"], "proc", "处理模块", "spec")
+        for call in (
+            lambda: arch_cli.op_collapse("proc", "x", "y"),
+            lambda: arch_cli.op_export_task("proc"),
+            lambda: arch_cli.op_reset_node("proc", "why"),
+            lambda: arch_cli.op_deactivate_node("proc"),
+        ):
+            with self.assertRaisesRegex(arch_cli.ArchEngineError, "arch_unfold"):
+                call()
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "已折叠在超级节点 'proc'"):
+            arch_cli.op_export_task("decoder")
+
+    def test_focus_shows_super_node_compactly(self) -> None:
+        arch_cli.op_fold(["decoder", "core_transform"], "proc", "处理模块", "spec")
+        out = arch_cli.op_focus("proc")
+        self.assertIn('"folded_children"', out)
+        self.assertNotIn('"inner_edges"', out)
+
+    def test_super_type_cannot_be_set_by_hand(self) -> None:
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "arch_fold"):
+            arch_cli.op_add_node("fake", "假的", "spec", status="solid", node_type="super_node")
 
 
 class SignatureDetectionTest(unittest.TestCase):

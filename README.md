@@ -166,7 +166,15 @@ python3 scripts/arch_cli.py add-node \
   --spec "异步上传分片至 S3" \
   --status "fog"
 
-# 5. 导出交互式阶段泳道看板 HTML
+# 5. 主干稳定后，把成熟子图折叠为一个超级节点（需要修改时用 unfold 展开）
+#    只能折叠已确定的节点：这里假设 core_transform 与 final_output 已经 collapse
+python3 scripts/arch_cli.py fold \
+  --nodes "core_transform,final_output" \
+  --id "translate_out" \
+  --label "翻译与输出模块" \
+  --spec "将音频分片翻译后经骨传导播放"
+
+# 6. 导出交互式阶段泳道看板 HTML
 python3 scripts/arch_cli.py export-ui
 # 浏览器打开 .arch/dashboard.html 即可查看全局泳道看板
 ```
@@ -190,6 +198,8 @@ python3 scripts/arch_cli.py export-ui
 | `arch_commit_node`| `commit-node` | 子代理单测通过后提交快照并绑定实现代码路径 |
 | `arch_sync_manual`| `sync-manual` | 感知人类在 IDE 中的手动修改，同步快照以解除防覆盖拦截 |
 | `arch_reset_node` | `reset-node` | 运行踩坑时将叶子节点重置为待定状态，并将失败教训记录进 `graveyard.md` |
+| `arch_fold` | `fold` | 将已确定、彼此连通的子图折叠为一个超级节点（子节点与内部连线完整保存，对外连线与契约保留），降低认知负荷 |
+| `arch_unfold` | `unfold` | 展开超级节点并原样恢复；折叠期间新增的连线自动接到唯一的入口/出口子节点，无法判断时通过 `attach` 指定 |
 | `arch_fork` | `fork` | 分支回滚：从指定快照标签回滚架构状态，已绑定节点的代码文件随图一并回滚（保留避坑记录；存在未提交改动时拒绝执行） |
 | `arch_export_ui` | `export-ui` | 导出阶段泳道（Stage Swimlane）交互式看板 HTML |
 

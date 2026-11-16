@@ -107,6 +107,52 @@ def _active_topology(graph: Dict[str, Any]) -> Tuple[Dict[str, List[str]], Dict[
     return adj, in_deg, out_deg
 
 
+def _iter_all_nodes(nodes: List[Dict[str, Any]]):
+    """Yield every node, descending into the children of folded super nodes."""
+    for n in nodes:
+        yield n
+        yield from _iter_all_nodes(n.get("children", []))
+
+
+def _find_container(graph: Dict[str, Any], node_id: str) -> Optional[Dict[str, Any]]:
+    """Return the top-level super node that (transitively) holds node_id."""
+    for n in graph["nodes"]:
+        if n["status"] == "super_node" and any(
+            c["id"] == node_id for c in _iter_all_nodes(n.get("children", []))
+        ):
+            return n
+    return None
+
+
+def _get_node(graph: Dict[str, Any], node_id: str, allow_super: bool = True) -> Dict[str, Any]:
+    """Look up a top-level node, with JIT guidance for folded or super nodes."""
+    for n in graph["nodes"]:
+        if n["id"] == node_id:
+            if not allow_super and n["status"] == "super_node":
+                raise ArchEngineError(
+                    f"节点 '{node_id}' 是折叠后的超级节点，不能直接执行该操作。\n"
+                    f"JIT 指令：先调用 arch_unfold(node_id='{node_id}') 展开，再对其中的子节点操作。"
+                )
+            return n
+    container = _find_container(graph, node_id)
+    if container:
+        raise ArchEngineError(
+            f"节点 '{node_id}' 已折叠在超级节点 '{container['id']}' 内。\n"
+            f"JIT 指令：先调用 arch_unfold(node_id='{container['id']}') 展开后再操作。"
+        )
+    raise ArchEngineError(f"节点 '{node_id}' 不存在。")
+
+
+def _compact_node(node: Dict[str, Any]) -> Dict[str, Any]:
+    """Super nodes appear in slices as one module: children shown as id/label only."""
+    if node["status"] != "super_node":
+        return node
+    view = {k: v for k, v in node.items()
+            if k not in ("children", "inner_edges", "boundary_edges", "folded_edges")}
+    view["folded_children"] = [{"id": c["id"], "label": c["label"]} for c in node["children"]]
+    return view
+
+
 def _find_walking_skeleton(graph: Dict[str, Any]) -> Optional[List[str]]:
     """BFS for a path from a real entry to a real exit made only of solid nodes.
 
@@ -252,10 +298,11 @@ def op_focus(node_id: Optional[str] = None) -> str:
 
     holes = [n for n in graph["nodes"] if n["status"] == "hole"]
     solids = [n for n in graph["nodes"] if n["status"] == "solid"]
+    settled = [n for n in graph["nodes"] if n["status"] in SOLID_STATUSES]
 
     target = None
-    if node_id and node_id in nodes:
-        target = nodes[node_id]
+    if node_id:
+        target = _get_node(graph, node_id)
     elif holes:
         # Cognitive serialization: settle the most upstream hole first.
         hole_ids = {n["id"] for n in holes}
@@ -263,8 +310,8 @@ def op_focus(node_id: Optional[str] = None) -> str:
             (nodes[nid] for nid in _topological_order(graph) if nid in hole_ids),
             holes[0],
         )
-    elif solids:
-        target = solids[-1]
+    elif settled:
+        target = settled[-1]
 
     seed_txt = SEED_FILE.read_text(encoding="utf-8").strip() if SEED_FILE.exists() else ""
     gt_txt = GROUND_TRUTH_FILE.read_text(encoding="utf-8").strip() if GROUND_TRUTH_FILE.exists() else ""
@@ -286,7 +333,7 @@ def op_focus(node_id: Optional[str] = None) -> str:
     if len(solids) > MAX_UNFOLDED_SOLID:
         out.append(
             f"[CIRCUIT_BREAKER_WARNING] 当前活跃实心节点 ({len(solids)}) 超过 {MAX_UNFOLDED_SOLID} 个，"
-            "建议先将已稳定的子图模块折叠以降低认知负荷。"
+            "建议调用 arch_fold 将已稳定的子图折叠为超级节点，以降低认知负荷。"
         )
 
     skeleton = _find_walking_skeleton(graph)
@@ -305,10 +352,10 @@ def op_focus(node_id: Optional[str] = None) -> str:
 
     slice_payload = {
         "current_step": graph["step"],
-        "focus_node": target,
+        "focus_node": _compact_node(target),
         "upstream_edges": in_edges,
         "downstream_edges": out_edges,
-        "neighbors": [nodes[nid] for nid in neighbor_ids if nid in nodes],
+        "neighbors": [_compact_node(nodes[nid]) for nid in neighbor_ids if nid in nodes],
         "fog_backlog": [{"id": f["id"], "label": f["label"]} for f in fog_nodes],
     }
     out.append("=== 当前焦点 1-Hop 切片 ===")
@@ -326,10 +373,10 @@ def op_collapse(
     node_type: str = "port",
     stage: str = "",
 ) -> str:
+    _reject_manual_super_type(node_type)
     graph = _load_graph()
     nodes = {n["id"]: n for n in graph["nodes"]}
-    if node_id not in nodes:
-        raise ArchEngineError(f"节点 '{node_id}' 不存在。")
+    _get_node(graph, node_id, allow_super=False)
 
     node = nodes[node_id]
     node["label"] = label
@@ -368,9 +415,13 @@ def op_add_node(
     before_node: str = "",
     contract: str = "TBD",
 ) -> str:
+    _reject_manual_super_type(node_type)
     graph = _load_graph()
-    if any(n["id"] == node_id for n in graph["nodes"]):
+    if any(n["id"] == node_id for n in _iter_all_nodes(graph["nodes"])):
         raise ArchEngineError(f"节点 '{node_id}' 已存在。")
+    for ref in (after_node, before_node):
+        if ref:
+            _get_node(graph, ref)
 
     holes = [n for n in graph["nodes"] if n["status"] == "hole"]
     if status == "hole" and len(holes) >= MAX_ACTIVE_HOLES:
@@ -438,8 +489,7 @@ def op_ground(source_type: str, source: str, note: str = "") -> str:
 def op_export_task(node_id: str) -> str:
     graph = _load_graph()
     nodes = {n["id"]: n for n in graph["nodes"]}
-    if node_id not in nodes:
-        raise ArchEngineError(f"节点 '{node_id}' 不存在。")
+    _get_node(graph, node_id, allow_super=False)
 
     node = nodes[node_id]
     if node["status"] == "hole":
@@ -472,8 +522,7 @@ def op_export_task(node_id: str) -> str:
 def op_commit_node(node_id: str, file_path: str) -> str:
     graph = _load_graph()
     nodes = {n["id"]: n for n in graph["nodes"]}
-    if node_id not in nodes:
-        raise ArchEngineError(f"节点 '{node_id}' 不存在。")
+    _get_node(graph, node_id, allow_super=False)
 
     graph["step"] += 1
     tag = f"node-{node_id}-s{graph['step']:02d}"
@@ -487,8 +536,7 @@ def op_commit_node(node_id: str, file_path: str) -> str:
 def op_sync_manual(node_id: str, summary: str) -> str:
     graph = _load_graph()
     nodes = {n["id"]: n for n in graph["nodes"]}
-    if node_id not in nodes:
-        raise ArchEngineError(f"节点 '{node_id}' 不存在。")
+    _get_node(graph, node_id, allow_super=False)
 
     node = nodes[node_id]
     file_path = node.get("file_path", "")
@@ -505,8 +553,7 @@ def op_sync_manual(node_id: str, summary: str) -> str:
 def op_reset_node(node_id: str, reason: str) -> str:
     graph = _load_graph()
     nodes = {n["id"]: n for n in graph["nodes"]}
-    if node_id not in nodes:
-        raise ArchEngineError(f"节点 '{node_id}' 不存在。")
+    _get_node(graph, node_id, allow_super=False)
 
     node = nodes[node_id]
     old_label = node["label"]
@@ -548,8 +595,7 @@ def op_fork(from_tag: str) -> str:
 def op_deactivate_node(node_id: str, reason: str = "", bypass_contract: str = "") -> str:
     graph = _load_graph()
     nodes = {n["id"]: n for n in graph["nodes"]}
-    if node_id not in nodes:
-        raise ArchEngineError(f"节点 '{node_id}' 不存在。")
+    _get_node(graph, node_id, allow_super=False)
 
     node = nodes[node_id]
     if node["status"] == "fog":
@@ -599,8 +645,7 @@ def op_activate_node(
 ) -> str:
     graph = _load_graph()
     nodes = {n["id"]: n for n in graph["nodes"]}
-    if node_id not in nodes:
-        raise ArchEngineError(f"节点 '{node_id}' 不存在。")
+    _get_node(graph, node_id, allow_super=True)
 
     node = nodes[node_id]
     if node["status"] != "fog":
@@ -612,6 +657,9 @@ def op_activate_node(
             f"[CircuitBreakerError] 未决空洞已达上限 ({MAX_ACTIVE_HOLES})！"
             "JIT 指令：必须先通过 collapse 收敛现有空洞，才能激活新的迷雾节点。"
         )
+    for ref in (after_node, before_node):
+        if ref:
+            _get_node(graph, ref)
 
     node["status"] = "hole"
     if not node["label"].startswith("?"):
@@ -634,6 +682,208 @@ def op_activate_node(
     _save_graph(graph)
     _shadow_commit(tag, f"activate {node_id} (fog -> hole)")
     return f"已成功从迷雾区激活节点 '{node_id}' 并接入主干！\n\n" + op_focus(node_id)
+
+
+def _reject_manual_super_type(node_type: str) -> None:
+    if node_type == "super_node":
+        raise ArchEngineError(
+            "超级节点只能通过 arch_fold 折叠已确定的子图生成，不能用 collapse / add-node 直接指定类型。"
+        )
+
+
+def _merge_contracts(contracts: List[str]) -> str:
+    unique = list(dict.fromkeys(c for c in contracts if c))
+    return " | ".join(unique) if unique else "TBD"
+
+
+def op_fold(
+    node_ids: List[str],
+    super_id: str,
+    label: str,
+    spec: str,
+    stage: str = "",
+) -> str:
+    """Fold a settled, connected, convex sub-graph into a single super node.
+
+    Children, inner edges and the original boundary edges are stored inside the
+    super node so arch_unfold can restore them exactly. Edges crossing the fold
+    boundary are re-pointed at the super node; parallel edges to the same
+    neighbour are merged and their contracts joined with " | ".
+    """
+    graph = _load_graph()
+    ids = list(dict.fromkeys(i.strip() for i in node_ids if i and i.strip()))
+    if len(ids) < 2:
+        raise ArchEngineError("折叠至少需要 2 个节点。")
+    if any(n["id"] == super_id for n in _iter_all_nodes(graph["nodes"])):
+        raise ArchEngineError(f"节点 '{super_id}' 已存在，请换一个超级节点 ID。")
+
+    members = {nid: _get_node(graph, nid) for nid in ids}
+    unsettled = [f"{nid}({n['status']})" for nid, n in members.items() if n["status"] not in SOLID_STATUSES]
+    if unsettled:
+        raise ArchEngineError(
+            f"只能折叠已确定的节点，以下节点尚未确定：{', '.join(unsettled)}。\n"
+            "JIT 指令：折叠用于收起已稳定的子图；待定节点请先 collapse，迷雾节点不应纳入折叠。"
+        )
+
+    member_set = set(ids)
+    inner = [e for e in graph["edges"] if e["from"] in member_set and e["to"] in member_set]
+    incoming = [e for e in graph["edges"] if e["to"] in member_set and e["from"] not in member_set]
+    outgoing = [e for e in graph["edges"] if e["from"] in member_set and e["to"] not in member_set]
+
+    # Weak connectivity: the members must form one module.
+    undirected: Dict[str, set] = {nid: set() for nid in ids}
+    for e in inner:
+        undirected[e["from"]].add(e["to"])
+        undirected[e["to"]].add(e["from"])
+    seen, stack = {ids[0]}, [ids[0]]
+    while stack:
+        for nxt in undirected[stack.pop()]:
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    if seen != member_set:
+        raise ArchEngineError(
+            f"待折叠节点之间并不连通（与 {ids[0]} 不相连：{', '.join(sorted(member_set - seen))}）。\n"
+            "JIT 指令：只折叠彼此有连线的同一模块，不相关的部分请分别折叠。"
+        )
+
+    # Convexity: no path may leave the set and come back in, or folding would
+    # create a cycle through the super node.
+    frontier = [e["to"] for e in outgoing]
+    reachable_outside = set(frontier)
+    while frontier:
+        curr = frontier.pop()
+        for e in graph["edges"]:
+            if e["from"] == curr:
+                if e["to"] in member_set:
+                    raise ArchEngineError(
+                        f"外部节点 '{curr}' 位于待折叠子图的中间（存在 子图 → {curr} → 子图 的路径），"
+                        "折叠后会形成环。\nJIT 指令：把它一并纳入折叠，或缩小折叠范围。"
+                    )
+                if e["to"] not in reachable_outside:
+                    reachable_outside.add(e["to"])
+                    frontier.append(e["to"])
+
+    entry_children = [nid for nid in ids if not any(e["to"] == nid for e in inner)]
+    exit_children = [nid for nid in ids if not any(e["from"] == nid for e in inner)]
+
+    merged: Dict[Tuple[str, str], List[str]] = {}
+    for e in incoming:
+        merged.setdefault((e["from"], super_id), []).append(e.get("contract", ""))
+    for e in outgoing:
+        merged.setdefault((super_id, e["to"]), []).append(e.get("contract", ""))
+    folded_edges = [
+        {"from": u, "to": v, "contract": _merge_contracts(cs)} for (u, v), cs in merged.items()
+    ]
+
+    child_stages = {members[nid].get("stage", "") for nid in ids}
+    super_node = {
+        "id": super_id,
+        "label": label,
+        "status": "super_node",
+        "type": "super_node",
+        "stage": stage or (child_stages.pop() if len(child_stages) == 1 else ""),
+        "spec": spec,
+        "file_path": "",
+        "last_tag": "",
+        "children": [members[nid] for nid in ids],
+        "inner_edges": inner,
+        "boundary_edges": incoming + outgoing,
+        "folded_edges": [dict(e) for e in folded_edges],
+        "entry_children": entry_children,
+        "exit_children": exit_children,
+    }
+
+    # Put the super node where its first member was, so ordering stays stable.
+    insert_at = min(i for i, n in enumerate(graph["nodes"]) if n["id"] in member_set)
+    remaining = [n for n in graph["nodes"] if n["id"] not in member_set]
+    graph["nodes"] = remaining[:insert_at] + [super_node] + remaining[insert_at:]
+    graph["edges"] = [
+        e for e in graph["edges"] if e["from"] not in member_set and e["to"] not in member_set
+    ] + folded_edges
+
+    graph["step"] += 1
+    tag = f"fold-{super_id}-s{graph['step']:02d}"
+    _save_graph(graph)
+    _shadow_commit(tag, f"fold {', '.join(ids)} -> {super_id}")
+    return (
+        f"已将 {len(ids)} 个节点折叠为超级节点 '{super_id}' ({label})，快照 {tag}。\n"
+        f"入口子节点：{', '.join(entry_children)}；出口子节点：{', '.join(exit_children)}。\n\n"
+        + op_focus()
+    )
+
+
+def op_unfold(super_id: str, attach: Optional[Dict[str, str]] = None) -> str:
+    """Restore a super node's children, inner edges and boundary edges.
+
+    Boundary edges keep their original contracts unless the contract on the
+    folded edge was changed while folded; then the new contract wins. Edges
+    attached to the super node after folding are re-attached to the unique
+    entry / exit child, or to the child named in `attach` (neighbour -> child).
+    """
+    attach = attach or {}
+    graph = _load_graph()
+    sn = _get_node(graph, super_id)
+    if sn["status"] != "super_node":
+        raise ArchEngineError(f"节点 '{super_id}' 不是超级节点，无需展开。")
+
+    child_ids = {c["id"] for c in sn["children"]}
+    bad = {k: v for k, v in attach.items() if v not in child_ids}
+    if bad:
+        raise ArchEngineError(
+            f"attach 指定的子节点不在 '{super_id}' 内：{bad}。可选子节点：{', '.join(sorted(child_ids))}。"
+        )
+
+    folded = {(e["from"], e["to"]): e["contract"] for e in sn.get("folded_edges", [])}
+
+    def folded_key(b: Dict[str, Any]) -> Tuple[str, str]:
+        return (b["from"], super_id) if b["to"] in child_ids else (super_id, b["to"])
+
+    current = [e for e in graph["edges"] if super_id in (e["from"], e["to"])]
+    restored: List[Dict[str, Any]] = [dict(e) for e in sn["inner_edges"]]
+    unresolved: List[str] = []
+
+    for e in current:
+        key = (e["from"], e["to"])
+        if key in folded:
+            changed = e.get("contract") != folded[key]
+            for b in sn["boundary_edges"]:
+                if folded_key(b) == key:
+                    restored.append({**b, "contract": e["contract"] if changed else b["contract"]})
+            continue
+
+        # Edge added while folded: re-attach it to the right child.
+        inbound = e["to"] == super_id
+        neighbour = e["from"] if inbound else e["to"]
+        candidates = sn["entry_children"] if inbound else sn["exit_children"]
+        child = attach.get(neighbour) or (candidates[0] if len(candidates) == 1 else "")
+        if not child:
+            arrow = f"{neighbour} -> {super_id}" if inbound else f"{super_id} -> {neighbour}"
+            unresolved.append(f"{arrow}（可选：{', '.join(candidates or sorted(child_ids))}）")
+            continue
+        restored.append(
+            {**e, "from": neighbour, "to": child} if inbound else {**e, "from": child, "to": neighbour}
+        )
+
+    if unresolved:
+        raise ArchEngineError(
+            f"超级节点 '{super_id}' 折叠期间新增了无法自动归位的连线：\n  - "
+            + "\n  - ".join(unresolved)
+            + "\nJIT 指令：向用户确认每条连线应接到哪个子节点，然后带上 attach={外部节点ID: 子节点ID} 重新调用 arch_unfold。"
+        )
+
+    idx = next(i for i, n in enumerate(graph["nodes"]) if n["id"] == super_id)
+    graph["nodes"] = graph["nodes"][:idx] + sn["children"] + graph["nodes"][idx + 1:]
+    graph["edges"] = [e for e in graph["edges"] if super_id not in (e["from"], e["to"])] + restored
+
+    graph["step"] += 1
+    tag = f"unfold-{super_id}-s{graph['step']:02d}"
+    _save_graph(graph)
+    _shadow_commit(tag, f"unfold {super_id}")
+    return (
+        f"已展开超级节点 '{super_id}'，恢复 {len(sn['children'])} 个子节点，快照 {tag}。\n\n"
+        + op_focus()
+    )
 
 
 def op_export_ui(out_path: str = "") -> str:
@@ -739,6 +989,7 @@ def op_export_ui(out_path: str = "") -> str:
           <div onclick="selectNode('${{t.id}}')" class="p-3 rounded-xl border cursor-pointer transition-all ${{selectedId === t.id ? 'border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-500/5' : 'border-emerald-500/30 bg-[var(--card)] hover:border-emerald-500'}}">
             <div class="font-bold text-xs text-[var(--foreground)] mb-1">${{t.label}}</div>
             <p class="text-[11px] text-[var(--muted-foreground)] line-clamp-2 leading-relaxed mb-2">${{t.spec || ''}}</p>
+            ${{t.children ? `<div class="mb-2 text-[11px] text-[var(--muted-foreground)]">⊞ 已折叠 ${{t.children.length}} 个节点</div>` : ''}}
             <div class="pt-2 border-t border-[var(--border)]/60 flex items-center justify-between text-[11px] font-mono text-[var(--muted-foreground)]">
               <span>${{t.id}}</span>
               <span class="text-emerald-500 font-semibold">${{t.status.toUpperCase()}}</span>
@@ -819,6 +1070,13 @@ def op_export_ui(out_path: str = "") -> str:
             <span class="text-xs font-semibold text-[var(--muted-foreground)]">📁 映射源码</span>
             <div class="p-2 bg-[var(--background)] border border-[var(--border)] rounded-lg font-mono text-xs break-all">${{n.file_path}}</div>
           </div>` : ''}}
+          ${{n.children ? `
+          <div class="space-y-1">
+            <span class="text-xs font-semibold text-[var(--muted-foreground)]">⊞ 折叠的子节点（arch_unfold 展开）</span>
+            <div class="p-2 bg-[var(--background)] border border-[var(--border)] rounded-lg text-xs space-y-1">
+              ${{n.children.map(c => `<div><span class="font-mono text-[var(--muted-foreground)]">${{c.id}}</span> · ${{c.label}}</div>`).join('')}}
+            </div>
+          </div>` : ''}}
         </div>
       `;
     }}
@@ -880,6 +1138,20 @@ def main() -> None:
     p_act.add_argument("--before", default="")
     p_act.add_argument("--contract", default="TBD")
 
+    p_fold = sub.add_parser("fold", help="将已确定、相互连通的子图折叠为一个超级节点")
+    p_fold.add_argument("--nodes", required=True, help="逗号分隔的待折叠节点 ID，如 a,b,c")
+    p_fold.add_argument("--id", required=True, help="超级节点 ID")
+    p_fold.add_argument("--label", required=True)
+    p_fold.add_argument("--spec", required=True)
+    p_fold.add_argument("--stage", default="")
+
+    p_unfold = sub.add_parser("unfold", help="展开超级节点，恢复其子节点与连线")
+    p_unfold.add_argument("--node", required=True)
+    p_unfold.add_argument(
+        "--attach", action="append", default=[], metavar="NEIGHBOUR=CHILD",
+        help="折叠期间新增连线的归位：外部节点ID=子节点ID（可重复）",
+    )
+
     p_ver = sub.add_parser("verify")
     p_ver.add_argument("--fact", required=True)
     p_ver.add_argument("--constraint", required=True)
@@ -929,6 +1201,16 @@ def main() -> None:
             print(op_deactivate_node(args.node, args.reason, args.bypass_contract))
         elif args.cmd == "activate":
             print(op_activate_node(args.node, args.after, args.before, args.contract))
+        elif args.cmd == "fold":
+            print(op_fold(args.nodes.split(","), args.id, args.label, args.spec, args.stage))
+        elif args.cmd == "unfold":
+            attach = {}
+            for pair in args.attach:
+                neighbour, sep, child = pair.partition("=")
+                if not sep or not neighbour.strip() or not child.strip():
+                    raise ArchEngineError(f"--attach 格式应为 外部节点ID=子节点ID，收到：{pair}")
+                attach[neighbour.strip()] = child.strip()
+            print(op_unfold(args.node, attach))
         elif args.cmd == "verify":
             print(op_verify(args.fact, args.constraint))
         elif args.cmd == "ground":
