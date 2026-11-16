@@ -170,46 +170,88 @@ def _compact_node(node: Dict[str, Any]) -> Dict[str, Any]:
     return view
 
 
-def _super_holds_skeleton(node: Dict[str, Any]) -> bool:
-    """A super node standing alone is a complete trunk if its interior is one."""
-    return node["status"] == "super_node" and _find_walking_skeleton(
-        {"nodes": node.get("children", []), "edges": node.get("inner_edges", [])}
-    ) is not None
+def _flatten_folds(graph: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """Expand every super node into its original nodes and edges.
 
-
-def _find_walking_skeleton(graph: Dict[str, Any]) -> Optional[List[str]]:
-    """BFS for a path from a real entry to a real exit made only of solid nodes.
-
-    Entries and exits are judged on the whole active graph (fog excluded), not on
-    the solid sub-graph alone; otherwise a solid node whose successor is still a
-    hole would wrongly count as an exit. A single super node that is both entry
-    and exit counts when its own interior holds a complete path, so folding a
-    finished trunk does not hide it.
+    Returns the flat graph and a map from each flat node to the top-level node
+    that currently shows it (itself, or the outermost super node holding it).
+    Edges are taken from their members, so an edge drawn to a module attaches
+    to the child it really reaches. An endpoint that is still a super node
+    (an edge attached while folded) resolves through the module's unique
+    entry / exit child; when that is ambiguous the edge is left out.
     """
+    flat_nodes: List[Dict[str, Any]] = []
+    top_of: Dict[str, str] = {}
+    supers: Dict[str, Dict[str, Any]] = {}
+    for top in graph["nodes"]:
+        for n in _iter_all_nodes([top]):
+            if n["status"] == "super_node":
+                supers[n["id"]] = n
+            else:
+                flat_nodes.append(n)
+                top_of[n["id"]] = top["id"]
+
+    def resolve(nid: str, side: str) -> Optional[str]:
+        seen = set()
+        while nid in supers and nid not in seen:
+            seen.add(nid)
+            candidates = supers[nid]["entry_children" if side == "to" else "exit_children"]
+            if len(candidates) != 1:
+                return None
+            nid = candidates[0]
+        return nid if nid in top_of else None
+
+    raw = list(graph["edges"]) + [e for sn in supers.values() for e in sn.get("inner_edges", [])]
+    flat_edges = []
+    for e in raw:
+        for m in _edge_members(e):
+            u, v = resolve(m["from"], "from"), resolve(m["to"], "to")
+            if u and v:
+                flat_edges.append({"from": u, "to": v, "contract": m.get("contract", "")})
+    return {"nodes": flat_nodes, "edges": flat_edges}, top_of
+
+
+def _solid_path(graph: Dict[str, Any]) -> Optional[List[str]]:
+    """BFS for a path of >= 2 solid nodes from a real entry to a real exit."""
     nodes = {n["id"]: n for n in graph["nodes"]}
     adj, in_deg, out_deg = _active_topology(graph)
     solid_ids = {nid for nid in adj if nodes[nid]["status"] in SOLID_STATUSES}
-    if not solid_ids:
-        return None
-
     starts = [nid for nid in adj if in_deg[nid] == 0 and nid in solid_ids]
     ends = {nid for nid in adj if out_deg[nid] == 0 and nid in solid_ids}
-    if not starts or not ends:
-        return None
-
     for s in starts:
         queue = deque([[s]])
         visited = {s}
         while queue:
             path = queue.popleft()
             curr = path[-1]
-            if curr in ends and (len(path) >= 2 or _super_holds_skeleton(nodes[curr])):
+            if curr in ends and len(path) >= 2:
                 return path
             for nxt in adj[curr]:
                 if nxt in solid_ids and nxt not in visited:
                     visited.add(nxt)
                     queue.append(path + [nxt])
     return None
+
+
+def _find_walking_skeleton(graph: Dict[str, Any]) -> Optional[List[str]]:
+    """A complete solid path from a real entry to a real exit, in top-level ids.
+
+    Entries and exits are judged on the whole active graph (fog excluded), not on
+    the solid sub-graph alone; otherwise a solid node whose successor is still a
+    hole would wrongly count as an exit. Folded modules are expanded first, so a
+    path must really get through a module's interior (in through one child, out
+    through a reachable one); steps inside one module collapse to its id, and a
+    trunk folded whole is reported as that single module.
+    """
+    flat, top_of = _flatten_folds(graph)
+    path = _solid_path(flat)
+    if not path:
+        return None
+    shown: List[str] = []
+    for nid in path:
+        if not shown or shown[-1] != top_of[nid]:
+            shown.append(top_of[nid])
+    return shown
 
 
 def _topological_order(graph: Dict[str, Any]) -> List[str]:

@@ -276,6 +276,33 @@ class FoldTest(EngineTestCase):
         arch_cli.op_fold(["entry_input", "decoder", "core_transform", "final_output"], "all", "全部", "spec")
         self.assertIsNone(arch_cli._find_walking_skeleton(self.graph()))
 
+    def _custom_graph(self, solids, holes, edges) -> None:
+        mk = lambda i, st: {"id": i, "label": i, "status": st, "type": "port",
+                            "spec": "", "file_path": "", "last_tag": ""}
+        g = self.graph()
+        g["nodes"] = [mk(i, "solid") for i in solids] + [mk(i, "hole") for i in holes]
+        g["edges"] = [{"from": u, "to": v, "contract": "c"} for u, v in edges]
+        arch_cli._save_graph(g)
+
+    def test_skeleton_must_get_through_the_module_interior(self) -> None:
+        # Review finding: s -> c enters the module at c, but only a -> t leaves
+        # it and there is no path c -> a inside, so nothing is runnable.
+        self._custom_graph(
+            ["s", "a", "c", "t"], ["h1", "h2"],
+            [("s", "c"), ("h1", "a"), ("a", "c"), ("a", "t"), ("c", "h2")],
+        )
+        self.assertIsNone(arch_cli._find_walking_skeleton(self.graph()))
+        out = arch_cli.op_fold(["a", "c"], "m", "模块", "spec")
+        self.assertNotIn("WALKING_SKELETON_READY", out)
+        self.assertIsNone(arch_cli._find_walking_skeleton(self.graph()))
+
+    def test_skeleton_through_module_when_interior_connects(self) -> None:
+        self._custom_graph(["s", "a", "c", "t"], [], [("s", "a"), ("a", "c"), ("c", "t")])
+        arch_cli.op_fold(["a", "c"], "m", "模块", "spec")
+        self.assertEqual(arch_cli._find_walking_skeleton(self.graph()), ["s", "m", "t"])
+        arch_cli.op_fold(["s", "m"], "outer", "外层", "spec")  # nested fold
+        self.assertEqual(arch_cli._find_walking_skeleton(self.graph()), ["outer", "t"])
+
     def test_super_type_cannot_be_set_by_hand(self) -> None:
         with self.assertRaisesRegex(arch_cli.ArchEngineError, "arch_fold"):
             arch_cli.op_add_node("fake", "假的", "spec", status="solid", node_type="super_node")
