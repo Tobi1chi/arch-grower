@@ -7,6 +7,7 @@ for Autoregressive Architecture Co-Creation.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import deque
@@ -24,6 +25,15 @@ SHADOW_GIT_DIR = ARCH_DIR / ".git"
 
 MAX_ACTIVE_HOLES = 3
 MAX_UNFOLDED_SOLID = 7
+
+# A changed diff line that declares a function / type, across common languages
+# (Python, JS/TS, Go, Rust, C#/Java-style modifiers). Anchored at the start of the
+# line so keywords inside strings or comments do not count.
+SIGNATURE_LINE = re.compile(
+    r"^[+-]\s*"
+    r"(?:(?:export|default|pub(?:\([^)]*\))?|public|private|protected|internal|static|abstract|async|unsafe)\s+)*"
+    r"(?:def|class|function|interface|fn|func|struct|trait|enum|type|impl)\b"
+)
 
 
 class ArchEngineError(Exception):
@@ -79,29 +89,39 @@ def _save_graph(data: Dict[str, Any]) -> None:
     )
 
 
-def _find_walking_skeleton(graph: Dict[str, Any]) -> Optional[List[str]]:
-    """BFS check for a complete path from entry to exit with zero 'hole' nodes."""
-    nodes = {n["id"]: n for n in graph["nodes"]}
-    solid_ids = {
-        nid for nid, n in nodes.items()
-        if n["status"] in ("solid", "super_node")
-    }
-    if not solid_ids:
-        return None
+SOLID_STATUSES = ("solid", "super_node")
 
-    adj: Dict[str, List[str]] = {nid: [] for nid in solid_ids}
-    in_deg: Dict[str, int] = {nid: 0 for nid in solid_ids}
-    out_deg: Dict[str, int] = {nid: 0 for nid in solid_ids}
 
+def _active_topology(graph: Dict[str, Any]) -> Tuple[Dict[str, List[str]], Dict[str, int], Dict[str, int]]:
+    """Adjacency and degrees of the active graph (every node that is not fog)."""
+    active_ids = {n["id"] for n in graph["nodes"] if n["status"] != "fog"}
+    adj: Dict[str, List[str]] = {nid: [] for nid in active_ids}
+    in_deg: Dict[str, int] = {nid: 0 for nid in active_ids}
+    out_deg: Dict[str, int] = {nid: 0 for nid in active_ids}
     for e in graph["edges"]:
         u, v = e["from"], e["to"]
-        if u in solid_ids and v in solid_ids:
+        if u in active_ids and v in active_ids:
             adj[u].append(v)
             in_deg[v] += 1
             out_deg[u] += 1
+    return adj, in_deg, out_deg
 
-    starts = [nid for nid, d in in_deg.items() if d == 0]
-    ends = {nid for nid, d in out_deg.items() if d == 0}
+
+def _find_walking_skeleton(graph: Dict[str, Any]) -> Optional[List[str]]:
+    """BFS for a path from a real entry to a real exit made only of solid nodes.
+
+    Entries and exits are judged on the whole active graph (fog excluded), not on
+    the solid sub-graph alone; otherwise a solid node whose successor is still a
+    hole would wrongly count as an exit.
+    """
+    nodes = {n["id"]: n for n in graph["nodes"]}
+    adj, in_deg, out_deg = _active_topology(graph)
+    solid_ids = {nid for nid in adj if nodes[nid]["status"] in SOLID_STATUSES}
+    if not solid_ids:
+        return None
+
+    starts = [nid for nid in adj if in_deg[nid] == 0 and nid in solid_ids]
+    ends = {nid for nid in adj if out_deg[nid] == 0 and nid in solid_ids}
     if not starts or not ends:
         return None
 
@@ -114,10 +134,30 @@ def _find_walking_skeleton(graph: Dict[str, Any]) -> Optional[List[str]]:
             if curr in ends and len(path) >= 2:
                 return path
             for nxt in adj[curr]:
-                if nxt not in visited:
+                if nxt in solid_ids and nxt not in visited:
                     visited.add(nxt)
                     queue.append(path + [nxt])
     return None
+
+
+def _topological_order(graph: Dict[str, Any]) -> List[str]:
+    """Kahn order of the active graph; nodes left over (cycles) keep insertion order."""
+    adj, in_deg, _ = _active_topology(graph)
+    order_index = {n["id"]: i for i, n in enumerate(graph["nodes"])}
+    remaining = dict(in_deg)
+    ready = sorted((nid for nid, d in remaining.items() if d == 0), key=order_index.get)
+    order: List[str] = []
+    while ready:
+        curr = ready.pop(0)
+        order.append(curr)
+        for nxt in adj[curr]:
+            remaining[nxt] -= 1
+            if remaining[nxt] == 0:
+                ready.append(nxt)
+        ready.sort(key=order_index.get)
+    seen = set(order)
+    order += [n["id"] for n in graph["nodes"] if n["id"] in adj and n["id"] not in seen]
+    return order
 
 
 def _check_node_drift(node: Dict[str, Any]) -> None:
@@ -129,8 +169,7 @@ def _check_node_drift(node: Dict[str, Any]) -> None:
     diff_res = _run_shadow_git(["diff", last_tag, "--", file_path], check=False)
     if diff_res.stdout.strip():
         sig_changed = any(
-            line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
-            and any(kw in line for kw in ("def ", "class ", "function ", "export ", "interface "))
+            not line.startswith(("+++", "---")) and SIGNATURE_LINE.match(line)
             for line in diff_res.stdout.splitlines()
         )
         if sig_changed:
@@ -218,7 +257,12 @@ def op_focus(node_id: Optional[str] = None) -> str:
     if node_id and node_id in nodes:
         target = nodes[node_id]
     elif holes:
-        target = holes[0]
+        # Cognitive serialization: settle the most upstream hole first.
+        hole_ids = {n["id"] for n in holes}
+        target = next(
+            (nodes[nid] for nid in _topological_order(graph) if nid in hole_ids),
+            holes[0],
+        )
     elif solids:
         target = solids[-1]
 
@@ -607,6 +651,18 @@ def op_export_ui(out_path: str = "") -> str:
   <title>{seed[:30]} - 架构阶段泳道看板</title>
   <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
   <style>
+    /* Fallback theme for opening the file directly in a browser. :where() keeps
+       specificity at zero so a host that injects these variables still wins. */
+    :where(:root) {{
+      --background: #f8fafc; --foreground: #0f172a; --card: #ffffff;
+      --border: #e2e8f0; --muted-foreground: #64748b;
+    }}
+    @media (prefers-color-scheme: dark) {{
+      :where(:root) {{
+        --background: #0b1120; --foreground: #e2e8f0; --card: #111827;
+        --border: #1f2937; --muted-foreground: #94a3b8;
+      }}
+    }}
     ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
     ::-webkit-scrollbar-track {{ background: transparent; }}
     ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 3px; }}

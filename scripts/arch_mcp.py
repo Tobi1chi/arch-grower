@@ -5,6 +5,7 @@ exposing native Tool Calls backed by arch_cli.py state machine.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -15,6 +16,13 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import arch_cli  # noqa: E402
+
+# The engine keeps state in a relative `.arch/` directory. Hosts launch MCP
+# servers from different working directories (Claude Desktop and global configs
+# often do not use the project folder), so ARCH_ROOT pins the project root.
+_ARCH_ROOT = os.environ.get("ARCH_ROOT", "").strip()
+if _ARCH_ROOT:
+    os.chdir(os.path.expanduser(_ARCH_ROOT))
 
 
 TOOLS: List[Dict[str, Any]] = [

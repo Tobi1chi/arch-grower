@@ -75,6 +75,8 @@ arch-grower/
 ├── scripts/
 │   ├── arch_cli.py          # 纯标准库状态机、1-Hop 切片器与 Shadow Git 引擎
 │   └── arch_mcp.py          # 标准 Stdio MCP (Model Context Protocol) 服务端
+├── tests/
+│   └── test_arch_cli.py     # 标准库 unittest 回归测试：python3 -m unittest discover -s tests
 └── references/
     ├── onboarding_tutorial.md   # 5 分钟交互式新手演练剧本
     ├── stage_patterns.md        # 阶段内并发并行与多态设计模式
@@ -92,7 +94,7 @@ arch-grower/
 
 ```bash
 # 克隆仓库到个人技能目录（以 ~/.agents/skills 为例）
-git clone https://github.com/<your-username>/arch-grower.git ~/.agents/skills/arch-grower
+git clone https://github.com/Tobi1chi/arch-grower.git ~/.agents/skills/arch-grower
 
 # 若使用 Antigravity，可直接软链接至配置目录：
 mkdir -p ~/.gemini/config/skills
@@ -109,13 +111,16 @@ ln -s ~/.agents/skills/arch-grower ~/.gemini/config/skills/arch-grower
 
 `arch_mcp.py` 实现了无额外依赖的标准 JSON-RPC Stdio MCP 协议，可直接注册到支持 MCP 的宿主工具中。
 
+> **项目目录**：引擎把状态写在工作目录下的 `.arch/` 中。不同宿主启动 MCP 进程时的工作目录不一定是你的项目（Claude Desktop 与全局配置尤其如此），请用环境变量 `ARCH_ROOT` 指定项目根目录。
+
 #### 1. Claude Desktop / Claude Code 配置 (`claude_desktop_config.json`):
 ```json
 {
   "mcpServers": {
     "arch-grower": {
       "command": "python3",
-      "args": ["/path/to/arch-grower/scripts/arch_mcp.py"]
+      "args": ["/path/to/arch-grower/scripts/arch_mcp.py"],
+      "env": { "ARCH_ROOT": "/path/to/your/project" }
     }
   }
 }
@@ -127,7 +132,8 @@ ln -s ~/.agents/skills/arch-grower ~/.gemini/config/skills/arch-grower
   "mcpServers": {
     "arch-grower": {
       "command": "python3",
-      "args": ["/path/to/arch-grower/scripts/arch_mcp.py"]
+      "args": ["/path/to/arch-grower/scripts/arch_mcp.py"],
+      "env": { "ARCH_ROOT": "/path/to/your/project" }
     }
   }
 }
@@ -140,22 +146,22 @@ ln -s ~/.agents/skills/arch-grower ~/.gemini/config/skills/arch-grower
 你也可以在终端中直接体验这套状态机引擎：
 
 ```bash
-# 1. 用一句话想法初始化架构状态机
-python3 scripts/arch_cli.py init "实时多模态翻译耳机：BLE输入处理到骨传导输出"
+# 1. 用一句话想法初始化架构状态机（自动生成 entry_input / core_transform / final_output 三个待定节点）
+python3 scripts/arch_cli.py init --seed "实时多模态翻译耳机：BLE输入处理到骨传导输出"
 
-# 2. 查看当前需要决策的局部切片与 Mermaid 图
+# 2. 查看当前需要决策的局部切片（按依赖顺序挑选最上游的待定节点）
 python3 scripts/arch_cli.py focus
 
 # 3. 拍板某个节点，将其锁定为具体实现规范
 python3 scripts/arch_cli.py collapse \
-  --node-id "ble_input" \
+  --node "entry_input" \
   --label "BLE 音频接收器" \
   --spec "监听低功耗蓝牙音频流，按 200ms 分片压入内存队列" \
   --stage "S1-Ingestion"
 
 # 4. 把暂缓开发的发散想法放入储备区
 python3 scripts/arch_cli.py add-node \
-  --node-id "fog_cloud_backup" \
+  --node "fog_cloud_backup" \
   --label "云端录音备份" \
   --spec "异步上传分片至 S3" \
   --status "fog"
@@ -178,11 +184,13 @@ python3 scripts/arch_cli.py export-ui
 | `arch_add_fog` | `add-node --status fog` | 快捷工具：将发散想法放入迷雾储备区，保持主干清晰聚焦 |
 | `arch_deactivate`| `deactivate` | 将活跃节点移入暂缓储备区，自动缝合上下游依赖连线 |
 | `arch_activate` | `activate` | 将储备区的节点重新激活为待定节点并接入主线 |
+| `arch_verify` | `verify` | 将用户实测确认的现实事实与推导出的硬约束写入 `ground_truth.md` |
+| `arch_ground` | `ground` | 挂载外部资料或探针（文档、命令、代码引用）到 `grounding.json` |
 | `arch_export_task`| `export-task` | 导出单节点的独立编码任务卡（专供临时子代理在沙箱中执行） |
 | `arch_commit_node`| `commit-node` | 子代理单测通过后提交快照并绑定实现代码路径 |
 | `arch_sync_manual`| `sync-manual` | 感知人类在 IDE 中的手动修改，同步快照以解除防覆盖拦截 |
 | `arch_reset_node` | `reset-node` | 运行踩坑时将叶子节点重置为待定状态，并将失败教训记录进 `graveyard.md` |
-| `arch_fork` | `fork` | 分支回滚：从指定快照标签安全回滚架构状态 |
+| `arch_fork` | `fork` | 分支回滚：从指定快照标签回滚架构状态，已绑定节点的代码文件随图一并回滚（保留避坑记录；存在未提交改动时拒绝执行） |
 | `arch_export_ui` | `export-ui` | 导出阶段泳道（Stage Swimlane）交互式看板 HTML |
 
 ---
