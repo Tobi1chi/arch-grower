@@ -36,9 +36,10 @@ SIGNATURE_LINE = re.compile(
     # Declarations: def / class / function / fn / func / struct ...
     r"(?:(?:export|default|pub(?:\([^)]*\))?|public|private|protected|internal|static|abstract|async|unsafe)\s+)*"
     r"(?:def|class|function|interface|fn|func|struct|trait|enum|type|impl)\b"
-    # Exported bindings are public API too: `export const f = (x) => ...`,
-    # `export default (x) => ...`, and CommonJS `module.exports = ...`.
-    r"|export\s+(?:default\b|(?:const|let|var)\b)"
+    # Any export statement is public API: bindings (`export const f = ...`),
+    # `export default`, export lists (`export { a }`), re-exports
+    # (`export * from "./x"`), TypeScript `export =`; and CommonJS exports.
+    r"|export\b"
     r"|(?:module\.)?exports(?:\.[\w$]+)?\s*="
     r")"
 )

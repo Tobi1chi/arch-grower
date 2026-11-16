@@ -361,6 +361,11 @@ class SignatureDetectionTest(unittest.TestCase):
             "+export let handler = async (req) => {",
             "+export default (frame) => frame",
             "+module.exports = { encode }",
+            "-export { encode }",
+            "+export { decode as encode } from './codec'",
+            "+export * from './frames'",
+            "+export type { Frame } from './types'",
+            "+export = Codec;",
             "+exports.encode = function (v) {",
         ):
             self.assertTrue(self.check(line), line)
