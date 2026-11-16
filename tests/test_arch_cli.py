@@ -196,6 +196,38 @@ class FoldTest(EngineTestCase):
             arch_cli.op_add_node("fake", "假的", "spec", status="solid", node_type="super_node")
 
 
+class ExportUiTest(EngineTestCase):
+    def export(self) -> str:
+        arch_cli.op_export_ui()
+        return Path(".arch/dashboard.html").read_text(encoding="utf-8")
+
+    def embedded(self, page: str) -> dict:
+        start = page.index('<script id="arch-data" type="application/json">') + len(
+            '<script id="arch-data" type="application/json">')
+        return json.loads(page[start:page.index("</script>", start)])
+
+    def test_dashboard_is_self_contained(self) -> None:
+        page = self.export()
+        self.assertNotIn("__ARCH_", page)
+        self.assertNotRegex(page, r"(src|href)=\"https?://")
+
+    def test_node_text_cannot_break_out_of_the_data_script(self) -> None:
+        arch_cli.op_collapse("entry_input", "</script><script>alert(1)</script>", "a < b && c")
+        page = self.export()
+        self.assertNotIn("</script><script>alert(1)", page)
+        data = self.embedded(page)
+        labels = [n["label"] for n in data["graph"]["nodes"]]
+        self.assertIn("</script><script>alert(1)</script>", labels)
+
+    def test_payload_carries_engine_decisions(self) -> None:
+        self.collapse("entry_input")
+        data = self.embedded(self.export())
+        self.assertEqual(data["next_focus"], "core_transform")
+        self.assertEqual(data["topo_order"], ["entry_input", "core_transform", "final_output"])
+        self.assertIsNone(data["skeleton"])
+        self.assertEqual(data["seed"], "test seed")
+
+
 class SignatureDetectionTest(unittest.TestCase):
     def check(self, line: str) -> bool:
         return bool(arch_cli.SIGNATURE_LINE.match(line))

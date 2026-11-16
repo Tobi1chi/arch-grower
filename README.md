@@ -74,7 +74,8 @@ arch-grower/
 ├── MANIFESTO.md             # 架构演进哲学与核心设计原则
 ├── scripts/
 │   ├── arch_cli.py          # 纯标准库状态机、1-Hop 切片器与 Shadow Git 引擎
-│   └── arch_mcp.py          # 标准 Stdio MCP (Model Context Protocol) 服务端
+│   ├── arch_mcp.py          # 标准 Stdio MCP (Model Context Protocol) 服务端
+│   └── dashboard_template.html  # export-ui 使用的看板模板（自包含，离线可用）
 ├── tests/
 │   └── test_arch_cli.py     # 标准库 unittest 回归测试：python3 -m unittest discover -s tests
 └── references/
@@ -176,7 +177,8 @@ python3 scripts/arch_cli.py fold \
 
 # 6. 导出交互式阶段泳道看板 HTML
 python3 scripts/arch_cli.py export-ui
-# 浏览器打开 .arch/dashboard.html 即可查看全局泳道看板
+# 浏览器打开 .arch/dashboard.html 即可查看全局泳道看板（离线可用）：
+#   点击节点查看上下游与契约；/ 搜索，← → 沿连线走，↑ ↓ 同阶段切换，Esc 取消
 ```
 
 ---
@@ -201,7 +203,7 @@ python3 scripts/arch_cli.py export-ui
 | `arch_fold` | `fold` | 将已确定、彼此连通的子图折叠为一个超级节点（子节点与内部连线完整保存，对外连线与契约保留），降低认知负荷 |
 | `arch_unfold` | `unfold` | 展开超级节点并原样恢复；折叠期间新增的连线自动接到唯一的入口/出口子节点，无法判断时通过 `attach` 指定 |
 | `arch_fork` | `fork` | 分支回滚：从指定快照标签回滚架构状态，已绑定节点的代码文件随图一并回滚（保留避坑记录；存在未提交改动时拒绝执行） |
-| `arch_export_ui` | `export-ui` | 导出阶段泳道（Stage Swimlane）交互式看板 HTML |
+| `arch_export_ui` | `export-ui` | 导出阶段泳道（Stage Swimlane）交互式看板 HTML：连线与契约、骨架高亮、搜索与键盘导航，单文件离线可用 |
 
 ---
 

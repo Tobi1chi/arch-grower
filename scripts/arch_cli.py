@@ -5,6 +5,7 @@ for Autoregressive Architecture Co-Creation.
 """
 
 import argparse
+import html
 import json
 import os
 import re
@@ -22,6 +23,7 @@ GROUND_TRUTH_FILE = ARCH_DIR / "ground_truth.md"
 GRAVEYARD_FILE = ARCH_DIR / "graveyard.md"
 GROUNDING_FILE = ARCH_DIR / "grounding.json"
 SHADOW_GIT_DIR = ARCH_DIR / ".git"
+DASHBOARD_TEMPLATE = Path(__file__).resolve().parent / "dashboard_template.html"
 
 MAX_ACTIVE_HOLES = 3
 MAX_UNFOLDED_SOLID = 7
@@ -141,6 +143,15 @@ def _get_node(graph: Dict[str, Any], node_id: str, allow_super: bool = True) -> 
             f"JIT 指令：先调用 arch_unfold(node_id='{container['id']}') 展开后再操作。"
         )
     raise ArchEngineError(f"节点 '{node_id}' 不存在。")
+
+
+def _next_focus_hole(graph: Dict[str, Any]) -> Optional[str]:
+    """Cognitive serialization: the most upstream hole is settled first."""
+    holes = [n["id"] for n in graph["nodes"] if n["status"] == "hole"]
+    if not holes:
+        return None
+    hole_ids = set(holes)
+    return next((nid for nid in _topological_order(graph) if nid in hole_ids), holes[0])
 
 
 def _compact_node(node: Dict[str, Any]) -> Dict[str, Any]:
@@ -304,12 +315,7 @@ def op_focus(node_id: Optional[str] = None) -> str:
     if node_id:
         target = _get_node(graph, node_id)
     elif holes:
-        # Cognitive serialization: settle the most upstream hole first.
-        hole_ids = {n["id"] for n in holes}
-        target = next(
-            (nodes[nid] for nid in _topological_order(graph) if nid in hole_ids),
-            holes[0],
-        )
+        target = nodes[_next_focus_hole(graph)]
     elif settled:
         target = settled[-1]
 
@@ -886,205 +892,47 @@ def op_unfold(super_id: str, attach: Optional[Dict[str, str]] = None) -> str:
     )
 
 
+def _md_bullets(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+    return [ln[2:].strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.startswith("- ")]
+
+
 def op_export_ui(out_path: str = "") -> str:
+    """Render the stage-swimlane dashboard from dashboard_template.html.
+
+    The page is fully self-contained (no network). Graph data is embedded as
+    JSON inside <script type="application/json">, with <, > and & escaped so
+    node text can never close the script element.
+    """
     graph = _load_graph()
     target = Path(out_path).resolve() if out_path else (ARCH_DIR / "dashboard.html")
     target.parent.mkdir(parents=True, exist_ok=True)
-    seed = SEED_FILE.read_text(encoding="utf-8").strip() if SEED_FILE.exists() else "架构状态机"
 
-    graph_json_str = json.dumps(graph, ensure_ascii=False)
-    html_content = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{seed[:30]} - 架构阶段泳道看板</title>
-  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
-  <style>
-    /* Fallback theme for opening the file directly in a browser. :where() keeps
-       specificity at zero so a host that injects these variables still wins. */
-    :where(:root) {{
-      --background: #f8fafc; --foreground: #0f172a; --card: #ffffff;
-      --border: #e2e8f0; --muted-foreground: #64748b;
-    }}
-    @media (prefers-color-scheme: dark) {{
-      :where(:root) {{
-        --background: #0b1120; --foreground: #e2e8f0; --card: #111827;
-        --border: #1f2937; --muted-foreground: #94a3b8;
-      }}
-    }}
-    ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
-    ::-webkit-scrollbar-track {{ background: transparent; }}
-    ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 3px; }}
-    .stage-glow {{ box-shadow: 0 0 25px -5px rgba(16, 185, 129, 0.08); }}
-  </style>
-</head>
-<body class="bg-transparent text-[var(--foreground)] antialiased select-none p-2 h-screen flex flex-col box-border">
-  <div class="flex-1 bg-[var(--card)] border border-[var(--border)] rounded-2xl shadow-2xl flex flex-col overflow-hidden relative">
-    <header class="h-14 border-b border-[var(--border)] px-5 flex items-center justify-between bg-[var(--card)]/95 backdrop-blur z-20">
-      <div class="flex items-center gap-3">
-        <div class="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-500 font-bold text-sm">AG</div>
-        <div>
-          <div class="flex items-center gap-2">
-            <h1 class="text-sm font-semibold text-[var(--foreground)] truncate max-w-md">{seed[:40]}</h1>
-            <span class="px-2 py-0.5 text-xs rounded-full bg-emerald-500/15 text-emerald-500 font-medium border border-emerald-500/30">Step {graph.get('step', 1)}</span>
-          </div>
-          <p class="text-xs text-[var(--muted-foreground)]">阶段泳道看板 (Stage Swimlane View) · 主干实心 + 阶段迷雾储备</p>
-        </div>
-      </div>
-      <div class="flex items-center gap-4 text-xs">
-        <div class="flex items-center gap-3 bg-[var(--background)] px-3 py-1.5 rounded-lg border border-[var(--border)]">
-          <span class="flex items-center gap-1.5 text-emerald-500 font-semibold"><span class="w-2.5 h-2.5 rounded-sm bg-emerald-500"></span> 主干 (Trunk)</span>
-          <span class="flex items-center gap-1.5 text-amber-500 font-semibold"><span class="w-2.5 h-2.5 rounded-sm bg-amber-500"></span> 空洞 (Hole)</span>
-          <span class="flex items-center gap-1.5 text-[var(--muted-foreground)] font-medium"><span class="w-2.5 h-2.5 rounded-sm border border-dashed border-[var(--border)]"></span> 迷雾 (Fog)</span>
-        </div>
-      </div>
-    </header>
+    seed_raw = SEED_FILE.read_text(encoding="utf-8") if SEED_FILE.exists() else ""
+    seed = "\n".join(
+        ln for ln in seed_raw.splitlines() if ln.strip() and not ln.lstrip().startswith("#")
+    ).strip() or "架构图"
 
-    <div class="flex-1 flex overflow-hidden relative">
-      <main id="swimlaneContainer" class="flex-1 overflow-x-auto overflow-y-hidden p-6 flex gap-6 items-stretch bg-[var(--background)]/40"></main>
-      <aside id="inspector" class="w-84 border-l border-[var(--border)] bg-[var(--card)] flex flex-col z-20 shadow-2xl p-4 overflow-y-auto">
-        <h2 class="text-xs font-bold uppercase tracking-wider text-[var(--muted-foreground)] mb-3 flex items-center gap-1.5">契约与规范详情</h2>
-        <div id="inspectorContent" class="space-y-4 text-xs"></div>
-      </aside>
-    </div>
-  </div>
-
-  <script>
-    const rawGraph = {graph_json_str};
-    const stageMap = {{}};
-    const defaultStages = ["感知与接入", "安全与网关", "会话与中枢", "传输与分帧", "终端与呈现"];
-
-    const solidTrunk = rawGraph.nodes.filter(n => n.status !== "fog");
-    const fogNodes = rawGraph.nodes.filter(n => n.status === "fog");
-
-    solidTrunk.forEach((n, idx) => {{
-      const stName = n.stage || (idx < defaultStages.length ? defaultStages[idx] : `阶段 ${{idx + 1}}`);
-      if (!stageMap[stName]) {{
-        stageMap[stName] = {{ name: stName, trunk: [], fog: [] }};
-      }}
-      stageMap[stName].trunk.push(n);
-    }});
-
-    fogNodes.forEach((f, idx) => {{
-      const stName = f.stage || Object.keys(stageMap)[idx % Math.max(1, Object.keys(stageMap).length)] || "扩展储备";
-      if (!stageMap[stName]) {{
-        stageMap[stName] = {{ name: stName, trunk: [], fog: [] }};
-      }}
-      stageMap[stName].fog.push(f);
-    }});
-
-    const container = document.getElementById("swimlaneContainer");
-    const inspectorContent = document.getElementById("inspectorContent");
-    let selectedId = solidTrunk.length ? solidTrunk[0].id : (rawGraph.nodes.length ? rawGraph.nodes[0].id : "");
-
-    function render() {{
-      container.innerHTML = "";
-      let sNum = 1;
-      for (const [stName, stData] of Object.entries(stageMap)) {{
-        const col = document.createElement("div");
-        col.className = "w-80 flex-shrink-0 flex flex-col rounded-2xl border border-[var(--border)] bg-[var(--card)]/80 stage-glow overflow-hidden";
-        
-        let trunkHtml = stData.trunk.map(t => `
-          <div onclick="selectNode('${{t.id}}')" class="p-3 rounded-xl border cursor-pointer transition-all ${{selectedId === t.id ? 'border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-500/5' : 'border-emerald-500/30 bg-[var(--card)] hover:border-emerald-500'}}">
-            <div class="font-bold text-xs text-[var(--foreground)] mb-1">${{t.label}}</div>
-            <p class="text-[11px] text-[var(--muted-foreground)] line-clamp-2 leading-relaxed mb-2">${{t.spec || ''}}</p>
-            ${{t.children ? `<div class="mb-2 text-[11px] text-[var(--muted-foreground)]">⊞ 已折叠 ${{t.children.length}} 个节点</div>` : ''}}
-            <div class="pt-2 border-t border-[var(--border)]/60 flex items-center justify-between text-[11px] font-mono text-[var(--muted-foreground)]">
-              <span>${{t.id}}</span>
-              <span class="text-emerald-500 font-semibold">${{t.status.toUpperCase()}}</span>
-            </div>
-          </div>
-        `).join('');
-
-        let fogHtml = stData.fog.map(f => `
-          <div onclick="selectNode('${{f.id}}')" class="p-2.5 rounded-xl border border-dashed border-[var(--border)] bg-[var(--background)]/40 hover:bg-[var(--background)] cursor-pointer transition-all ${{selectedId === f.id ? 'border-amber-500 ring-2 ring-amber-500/20' : ''}}">
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-[10px] text-[var(--muted-foreground)] font-mono">⚪ FOG</span>
-            </div>
-            <div class="font-semibold text-xs text-[var(--foreground)] mb-1">${{f.label}}</div>
-            <p class="text-[11px] text-[var(--muted-foreground)] line-clamp-2 leading-relaxed">${{f.spec || ''}}</p>
-          </div>
-        `).join('');
-
-        col.innerHTML = `
-          <div class="p-3.5 border-b border-[var(--border)] bg-[var(--background)]/30">
-            <span class="text-[11px] font-mono font-bold text-emerald-500">STAGE 0${{sNum++}}</span>
-            <h3 class="text-sm font-bold text-[var(--foreground)] truncate">${{stName}}</h3>
-          </div>
-          <div class="flex-1 p-3 space-y-4 overflow-y-auto">
-            <div>
-              <div class="text-[11px] font-semibold text-emerald-500 mb-2">主干选定 (Trunk)</div>
-              <div class="space-y-2">${{trunkHtml || '<div class="text-[11px] text-[var(--muted-foreground)]">待决空洞</div>'}}</div>
-            </div>
-            ${{stData.fog.length ? `
-            <div class="pt-2 border-t border-dashed border-[var(--border)]">
-              <div class="text-[11px] font-semibold text-[var(--muted-foreground)] mb-2">同阶段迷雾储备 (Fog)</div>
-              <div class="space-y-2">${{fogHtml}}</div>
-            </div>` : ''}}
-          </div>
-        `;
-        container.appendChild(col);
-      }}
-      showInspector();
-    }}
-
-    window.selectNode = function(nid) {{
-      selectedId = nid;
-      render();
-    }};
-
-    function showInspector() {{
-      const n = rawGraph.nodes.find(x => x.id === selectedId);
-      if (!n) return;
-      const inEdges = rawGraph.edges.filter(e => e.to === n.id);
-      const outEdges = rawGraph.edges.filter(e => e.from === n.id);
-      
-      inspectorContent.innerHTML = `
-        <div class="space-y-4">
-          <div>
-            <span class="text-xs font-mono text-[var(--muted-foreground)]">ID: ${{n.id}}</span>
-            <h3 class="text-sm font-bold text-[var(--foreground)] mt-0.5">${{n.label}}</h3>
-          </div>
-          <div class="p-3 bg-[var(--background)] border border-[var(--border)] rounded-xl space-y-1">
-            <div class="font-semibold text-xs text-[var(--foreground)] flex justify-between">
-              <span>状态属性</span>
-              <span class="text-emerald-500 font-mono">${{n.status.toUpperCase()}}</span>
-            </div>
-            <p class="text-xs text-[var(--muted-foreground)] leading-relaxed">${{n.spec || '无描述'}}</p>
-          </div>
-          <div class="space-y-1">
-            <span class="text-xs font-semibold text-[var(--muted-foreground)]">📥 输入契约 (In)</span>
-            <div class="p-2 bg-[var(--background)] border border-[var(--border)] rounded-lg font-mono text-xs text-emerald-400 break-all">
-              ${{inEdges.map(e => e.contract).join('; ') || '无 / 起始边界'}}
-            </div>
-          </div>
-          <div class="space-y-1">
-            <span class="text-xs font-semibold text-[var(--muted-foreground)]">📤 输出契约 (Out)</span>
-            <div class="p-2 bg-[var(--background)] border border-[var(--border)] rounded-lg font-mono text-xs text-amber-400 break-all">
-              ${{outEdges.map(e => e.contract).join('; ') || '无 / 最终交付'}}
-            </div>
-          </div>
-          ${{n.file_path ? `
-          <div class="space-y-1">
-            <span class="text-xs font-semibold text-[var(--muted-foreground)]">📁 映射源码</span>
-            <div class="p-2 bg-[var(--background)] border border-[var(--border)] rounded-lg font-mono text-xs break-all">${{n.file_path}}</div>
-          </div>` : ''}}
-          ${{n.children ? `
-          <div class="space-y-1">
-            <span class="text-xs font-semibold text-[var(--muted-foreground)]">⊞ 折叠的子节点（arch_unfold 展开）</span>
-            <div class="p-2 bg-[var(--background)] border border-[var(--border)] rounded-lg text-xs space-y-1">
-              ${{n.children.map(c => `<div><span class="font-mono text-[var(--muted-foreground)]">${{c.id}}</span> · ${{c.label}}</div>`).join('')}}
-            </div>
-          </div>` : ''}}
-        </div>
-      `;
-    }}
-
-    render();
-  </script>
-</body>
-</html>"""
+    payload = {
+        "seed": seed,
+        "step": graph.get("step", 1),
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "graph": graph,
+        "topo_order": _topological_order(graph),
+        "skeleton": _find_walking_skeleton(graph),
+        "next_focus": _next_focus_hole(graph),
+        "limits": {"holes": MAX_ACTIVE_HOLES, "solids": MAX_UNFOLDED_SOLID},
+        "ground_truth": _md_bullets(GROUND_TRUTH_FILE),
+        "graveyard": _md_bullets(GRAVEYARD_FILE),
+    }
+    data = (
+        json.dumps(payload, ensure_ascii=False)
+        .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    )
+    template = DASHBOARD_TEMPLATE.read_text(encoding="utf-8")
+    tokens = {"__ARCH_TITLE__": html.escape(seed[:40]), "__ARCH_DATA__": data}
+    html_content = re.sub(r"__ARCH_(?:TITLE|DATA)__", lambda m: tokens[m.group(0)], template)
     target.write_text(html_content, encoding="utf-8")
     return f"已成功导出阶段泳道架构看板 HTML 至：{target}"
 
