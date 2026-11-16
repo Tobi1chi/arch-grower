@@ -32,9 +32,15 @@ MAX_UNFOLDED_SOLID = 7
 # (Python, JS/TS, Go, Rust, C#/Java-style modifiers). Anchored at the start of the
 # line so keywords inside strings or comments do not count.
 SIGNATURE_LINE = re.compile(
-    r"^[+-]\s*"
+    r"^[+-]\s*(?:"
+    # Declarations: def / class / function / fn / func / struct ...
     r"(?:(?:export|default|pub(?:\([^)]*\))?|public|private|protected|internal|static|abstract|async|unsafe)\s+)*"
     r"(?:def|class|function|interface|fn|func|struct|trait|enum|type|impl)\b"
+    # Exported bindings are public API too: `export const f = (x) => ...`,
+    # `export default (x) => ...`, and CommonJS `module.exports = ...`.
+    r"|export\s+(?:default\b|(?:const|let|var)\b)"
+    r"|(?:module\.)?exports(?:\.[\w$]+)?\s*="
+    r")"
 )
 
 
@@ -159,9 +165,16 @@ def _compact_node(node: Dict[str, Any]) -> Dict[str, Any]:
     if node["status"] != "super_node":
         return node
     view = {k: v for k, v in node.items()
-            if k not in ("children", "inner_edges", "boundary_edges", "folded_edges")}
+            if k not in ("children", "inner_edges")}
     view["folded_children"] = [{"id": c["id"], "label": c["label"]} for c in node["children"]]
     return view
+
+
+def _super_holds_skeleton(node: Dict[str, Any]) -> bool:
+    """A super node standing alone is a complete trunk if its interior is one."""
+    return node["status"] == "super_node" and _find_walking_skeleton(
+        {"nodes": node.get("children", []), "edges": node.get("inner_edges", [])}
+    ) is not None
 
 
 def _find_walking_skeleton(graph: Dict[str, Any]) -> Optional[List[str]]:
@@ -169,7 +182,9 @@ def _find_walking_skeleton(graph: Dict[str, Any]) -> Optional[List[str]]:
 
     Entries and exits are judged on the whole active graph (fog excluded), not on
     the solid sub-graph alone; otherwise a solid node whose successor is still a
-    hole would wrongly count as an exit.
+    hole would wrongly count as an exit. A single super node that is both entry
+    and exit counts when its own interior holds a complete path, so folding a
+    finished trunk does not hide it.
     """
     nodes = {n["id"]: n for n in graph["nodes"]}
     adj, in_deg, out_deg = _active_topology(graph)
@@ -188,7 +203,7 @@ def _find_walking_skeleton(graph: Dict[str, Any]) -> Optional[List[str]]:
         while queue:
             path = queue.popleft()
             curr = path[-1]
-            if curr in ends and len(path) >= 2:
+            if curr in ends and (len(path) >= 2 or _super_holds_skeleton(nodes[curr])):
                 return path
             for nxt in adj[curr]:
                 if nxt in solid_ids and nxt not in visited:
@@ -359,8 +374,8 @@ def op_focus(node_id: Optional[str] = None) -> str:
     slice_payload = {
         "current_step": graph["step"],
         "focus_node": _compact_node(target),
-        "upstream_edges": in_edges,
-        "downstream_edges": out_edges,
+        "upstream_edges": [_public_edge(e) for e in in_edges],
+        "downstream_edges": [_public_edge(e) for e in out_edges],
         "neighbors": [_compact_node(nodes[nid]) for nid in neighbor_ids if nid in nodes],
         "fog_backlog": [{"id": f["id"], "label": f["label"]} for f in fog_nodes],
     }
@@ -517,8 +532,8 @@ def op_export_task(node_id: str) -> str:
             "4) 完成后调用 commit-node 提交影子快照，并仅返回 <=3 行结果摘要。"
         ),
         "target_node": node,
-        "input_contracts": in_edges,
-        "output_contracts": out_edges,
+        "input_contracts": [_public_edge(e) for e in in_edges],
+        "output_contracts": [_public_edge(e) for e in out_edges],
         "global_ground_truth": gt_txt,
         "global_graveyard": gy_txt,
     }
@@ -702,6 +717,37 @@ def _merge_contracts(contracts: List[str]) -> str:
     return " | ".join(unique) if unique else "TBD"
 
 
+# Edge provenance for folding
+# ---------------------------
+# An edge that touches a super node may stand for several original edges. It
+# carries them in "members" (each a plain {from, to, contract}) together with
+# "auto_contract", the merged contract the engine wrote. Provenance lives on
+# the edge rather than inside the super node, so it travels with the edge when
+# the neighbour on the other side is folded or unfolded later, in any order.
+
+
+def _edge_members(e: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Original edges this edge stands for; a contract edited while folded wins."""
+    members = e.get("members")
+    if not members:
+        return [{"from": e["from"], "to": e["to"], "contract": e.get("contract", "")}]
+    if "auto_contract" in e and e.get("contract") != e["auto_contract"]:
+        return [{**m, "contract": e.get("contract", "")} for m in members]
+    return [dict(m) for m in members]
+
+
+def _edge_from_members(u: str, v: str, members: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(members) == 1 and (members[0]["from"], members[0]["to"]) == (u, v):
+        return {"from": u, "to": v, "contract": members[0].get("contract", "")}
+    contract = _merge_contracts([m.get("contract", "") for m in members])
+    return {"from": u, "to": v, "contract": contract, "auto_contract": contract, "members": members}
+
+
+def _public_edge(e: Dict[str, Any]) -> Dict[str, Any]:
+    """Edge as shown to the agent: provenance bookkeeping left out."""
+    return {k: v for k, v in e.items() if k not in ("members", "auto_contract")}
+
+
 def op_fold(
     node_ids: List[str],
     super_id: str,
@@ -711,10 +757,10 @@ def op_fold(
 ) -> str:
     """Fold a settled, connected, convex sub-graph into a single super node.
 
-    Children, inner edges and the original boundary edges are stored inside the
-    super node so arch_unfold can restore them exactly. Edges crossing the fold
-    boundary are re-pointed at the super node; parallel edges to the same
-    neighbour are merged and their contracts joined with " | ".
+    Children and inner edges are stored inside the super node. Edges crossing
+    the fold boundary are re-pointed at the super node; parallel edges to the
+    same neighbour are merged (contracts joined with " | ") and keep the
+    original edges as members, so arch_unfold can restore them exactly.
     """
     graph = _load_graph()
     ids = list(dict.fromkeys(i.strip() for i in node_ids if i and i.strip()))
@@ -773,14 +819,12 @@ def op_fold(
     entry_children = [nid for nid in ids if not any(e["to"] == nid for e in inner)]
     exit_children = [nid for nid in ids if not any(e["from"] == nid for e in inner)]
 
-    merged: Dict[Tuple[str, str], List[str]] = {}
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for e in incoming:
-        merged.setdefault((e["from"], super_id), []).append(e.get("contract", ""))
+        grouped.setdefault((e["from"], super_id), []).extend(_edge_members(e))
     for e in outgoing:
-        merged.setdefault((super_id, e["to"]), []).append(e.get("contract", ""))
-    folded_edges = [
-        {"from": u, "to": v, "contract": _merge_contracts(cs)} for (u, v), cs in merged.items()
-    ]
+        grouped.setdefault((super_id, e["to"]), []).extend(_edge_members(e))
+    folded_edges = [_edge_from_members(u, v, ms) for (u, v), ms in grouped.items()]
 
     child_stages = {members[nid].get("stage", "") for nid in ids}
     super_node = {
@@ -794,8 +838,6 @@ def op_fold(
         "last_tag": "",
         "children": [members[nid] for nid in ids],
         "inner_edges": inner,
-        "boundary_edges": incoming + outgoing,
-        "folded_edges": [dict(e) for e in folded_edges],
         "entry_children": entry_children,
         "exit_children": exit_children,
     }
@@ -822,10 +864,11 @@ def op_fold(
 def op_unfold(super_id: str, attach: Optional[Dict[str, str]] = None) -> str:
     """Restore a super node's children, inner edges and boundary edges.
 
-    Boundary edges keep their original contracts unless the contract on the
-    folded edge was changed while folded; then the new contract wins. Edges
-    attached to the super node after folding are re-attached to the unique
-    entry / exit child, or to the child named in `attach` (neighbour -> child).
+    Each edge on the super node is split back into the original edges it
+    stands for (its members), regrouped by the child that now holds each
+    endpoint. A contract edited while folded overrides the members' contracts.
+    Edges attached after folding go to the unique entry / exit child, or to the
+    child named in `attach` (neighbour -> child).
     """
     attach = attach or {}
     graph = _load_graph()
@@ -840,36 +883,34 @@ def op_unfold(super_id: str, attach: Optional[Dict[str, str]] = None) -> str:
             f"attach 指定的子节点不在 '{super_id}' 内：{bad}。可选子节点：{', '.join(sorted(child_ids))}。"
         )
 
-    folded = {(e["from"], e["to"]): e["contract"] for e in sn.get("folded_edges", [])}
+    # Which child of this super node holds a given node id (at any depth).
+    owner = {d["id"]: c["id"] for c in sn["children"] for d in _iter_all_nodes([c])}
 
-    def folded_key(b: Dict[str, Any]) -> Tuple[str, str]:
-        return (b["from"], super_id) if b["to"] in child_ids else (super_id, b["to"])
-
-    current = [e for e in graph["edges"] if super_id in (e["from"], e["to"])]
-    restored: List[Dict[str, Any]] = [dict(e) for e in sn["inner_edges"]]
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     unresolved: List[str] = []
-
-    for e in current:
-        key = (e["from"], e["to"])
-        if key in folded:
-            changed = e.get("contract") != folded[key]
-            for b in sn["boundary_edges"]:
-                if folded_key(b) == key:
-                    restored.append({**b, "contract": e["contract"] if changed else b["contract"]})
-            continue
-
-        # Edge added while folded: re-attach it to the right child.
+    for e in (e for e in graph["edges"] if super_id in (e["from"], e["to"])):
         inbound = e["to"] == super_id
         neighbour = e["from"] if inbound else e["to"]
-        candidates = sn["entry_children"] if inbound else sn["exit_children"]
-        child = attach.get(neighbour) or (candidates[0] if len(candidates) == 1 else "")
-        if not child:
-            arrow = f"{neighbour} -> {super_id}" if inbound else f"{super_id} -> {neighbour}"
-            unresolved.append(f"{arrow}（可选：{', '.join(candidates or sorted(child_ids))}）")
-            continue
-        restored.append(
-            {**e, "from": neighbour, "to": child} if inbound else {**e, "from": child, "to": neighbour}
-        )
+        inner_end = "to" if inbound else "from"
+        for m in _edge_members(e):
+            child = owner.get(m[inner_end])
+            if child is None:
+                # Attached while folded: route it to the right child and record
+                # that child as the real endpoint for any later unfold.
+                candidates = sn["entry_children"] if inbound else sn["exit_children"]
+                child = attach.get(neighbour) or (candidates[0] if len(candidates) == 1 else "")
+                if not child:
+                    arrow = f"{neighbour} -> {super_id}" if inbound else f"{super_id} -> {neighbour}"
+                    item = f"{arrow}（可选：{', '.join(candidates or sorted(child_ids))}）"
+                    if item not in unresolved:
+                        unresolved.append(item)
+                    continue
+                m = {**m, inner_end: child}
+            key = (neighbour, child) if inbound else (child, neighbour)
+            grouped.setdefault(key, []).append(m)
+
+    restored: List[Dict[str, Any]] = [dict(e) for e in sn["inner_edges"]]
+    restored += [_edge_from_members(u, v, ms) for (u, v), ms in grouped.items()]
 
     if unresolved:
         raise ArchEngineError(

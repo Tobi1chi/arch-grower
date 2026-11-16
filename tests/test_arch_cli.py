@@ -191,6 +191,91 @@ class FoldTest(EngineTestCase):
         self.assertIn('"folded_children"', out)
         self.assertNotIn('"inner_edges"', out)
 
+    def _adjacent_modules_graph(self):
+        """entry -> decoder -> core -> final, plus a skip edge decoder -> final."""
+        g = self.graph()
+        for e in g["edges"]:
+            if (e["from"], e["to"]) == ("decoder", "core_transform"):
+                e["contract"] = "decoder->core"
+        g["edges"].append({"from": "decoder", "to": "final_output", "contract": "decoder->final"})
+        arch_cli._save_graph(g)
+        return _snapshot(self.graph())
+
+    def _assert_plain_edges(self) -> None:
+        for e in self.graph()["edges"]:
+            self.assertNotIn("members", e)
+            self.assertNotIn("auto_contract", e)
+
+    def test_adjacent_folds_round_trip_in_every_order(self) -> None:
+        # Review finding: fold front, fold back, unfold front, unfold back lost
+        # decoder -> final and merged its contract into decoder -> core.
+        before = self._adjacent_modules_graph()
+        orders = [
+            (("front", "back"), ("front", "back")),
+            (("front", "back"), ("back", "front")),
+            (("back", "front"), ("front", "back")),
+            (("back", "front"), ("back", "front")),
+        ]
+        groups = {"front": ["entry_input", "decoder"], "back": ["core_transform", "final_output"]}
+        for fold_order, unfold_order in orders:
+            with self.subTest(fold=fold_order, unfold=unfold_order):
+                for sid in fold_order:
+                    arch_cli.op_fold(groups[sid], sid, sid, "spec")
+                for sid in unfold_order:
+                    arch_cli.op_unfold(sid)
+                self.assertEqual(_snapshot(self.graph()), before)
+                self._assert_plain_edges()
+
+    def test_contract_edited_between_two_modules_reaches_the_original_edges(self) -> None:
+        self._adjacent_modules_graph()
+        arch_cli.op_fold(["entry_input", "decoder"], "front", "前端", "spec")
+        arch_cli.op_fold(["core_transform", "final_output"], "back", "后端", "spec")
+        g = self.graph()
+        edge = next(e for e in g["edges"] if (e["from"], e["to"]) == ("front", "back"))
+        edge["contract"] = "Frame v2"  # edited while both sides are folded
+        arch_cli._save_graph(g)
+        arch_cli.op_unfold("front")
+        arch_cli.op_unfold("back")
+        edges = {(e["from"], e["to"]): e["contract"] for e in self.graph()["edges"]}
+        self.assertEqual(edges[("decoder", "core_transform")], "Frame v2")
+        self.assertEqual(edges[("decoder", "final_output")], "Frame v2")
+        self._assert_plain_edges()
+
+    def test_edge_attached_while_folded_survives_neighbour_folds(self) -> None:
+        arch_cli.op_fold(["decoder", "core_transform"], "proc", "处理", "spec")
+        arch_cli.op_add_node("logger", "日志", "spec", status="solid", after_node="proc")
+        arch_cli.op_add_node("sink", "落盘", "spec", status="solid", after_node="logger")
+        arch_cli.op_fold(["logger", "sink"], "obs", "观测", "spec")
+        arch_cli.op_unfold("proc")   # logger edge is routed to proc's only exit child
+        arch_cli.op_unfold("obs")
+        edges = {(e["from"], e["to"]) for e in self.graph()["edges"]}
+        self.assertIn(("core_transform", "logger"), edges)
+        self.assertIn(("logger", "sink"), edges)
+        self._assert_plain_edges()
+
+    def test_focus_hides_edge_bookkeeping(self) -> None:
+        arch_cli.op_fold(["decoder", "core_transform"], "proc", "处理模块", "spec")
+        out = arch_cli.op_focus("proc")
+        self.assertNotIn('"members"', out)
+        self.assertNotIn('"auto_contract"', out)
+
+    def test_folding_the_whole_trunk_keeps_the_skeleton(self) -> None:
+        # Review finding: folding a finished trunk into one module dropped
+        # WALKING_SKELETON_READY although nothing was undecided.
+        out = arch_cli.op_fold(
+            ["entry_input", "decoder", "core_transform", "final_output"], "all", "全部", "spec"
+        )
+        self.assertIn("[WALKING_SKELETON_READY] 检测到无空洞可运行主干: all", out)
+
+    def test_whole_trunk_with_a_hole_inside_is_not_a_skeleton(self) -> None:
+        g = self.graph()
+        g["nodes"].append({"id": "gap", "label": "? 缺口", "status": "hole", "type": "port",
+                           "spec": "", "file_path": "", "last_tag": ""})
+        g["edges"].append({"from": "final_output", "to": "gap", "contract": "TBD"})
+        arch_cli._save_graph(g)
+        arch_cli.op_fold(["entry_input", "decoder", "core_transform", "final_output"], "all", "全部", "spec")
+        self.assertIsNone(arch_cli._find_walking_skeleton(self.graph()))
+
     def test_super_type_cannot_be_set_by_hand(self) -> None:
         with self.assertRaisesRegex(arch_cli.ArchEngineError, "arch_fold"):
             arch_cli.op_add_node("fake", "假的", "spec", status="solid", node_type="super_node")
@@ -243,6 +328,13 @@ class SignatureDetectionTest(unittest.TestCase):
             "+pub(crate) struct Frame {",
             "+public interface Port {",
             "+type Frame = { ts: number }",
+            # Review finding: exported bindings are public API as well.
+            "+export const encode = (value: number) => value",
+            "-export const encode = (value: string) => value",
+            "+export let handler = async (req) => {",
+            "+export default (frame) => frame",
+            "+module.exports = { encode }",
+            "+exports.encode = function (v) {",
         ):
             self.assertTrue(self.check(line), line)
 
@@ -252,6 +344,8 @@ class SignatureDetectionTest(unittest.TestCase):
             "+    node_type = 'port'",
             "+    # refactor: function signature unchanged",
             "+    return classify(x)",
+            "+    const local = (x) => x * 2",
+            "+    exportedCount = 3",
         ):
             self.assertFalse(self.check(line), line)
 
