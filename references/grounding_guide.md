@@ -20,5 +20,7 @@
 
 ## 2\. 事实沉淀与设置器挂载
 
-* **记录用户验证结果**：收到回复后，立即调用 MCP 工具 `arch_verify`（或运行 `python3 scripts/arch_cli.py verify --fact "<客观现实结论>" --constraint "<推导出的硬约束>"`），将其永久写入 `.arch/ground_truth.md`，并据此分裂或调整当前节点（必要时插入 `reality_gate` 人工门禁节点）。  
-* **挂载外部资料/探针**：若用户提供了协议文档或可自动检测的命令行探针，调用 `arch_ground`（或运行 `python3 scripts/arch_cli.py ground --type <doc_ref|probe_cmd|human_verify|code_ref> --source "<路径或命令>"`）注册进 `.arch/grounding.json`。
+以下 `arch` 命令按 [CLI 入口](../SKILL.md#cli-入口) 执行。
+
+* **记录用户验证结果**：调用 MCP 工具 `arch_verify` 或执行 `arch verify --fact "$FACT" --constraint "$CONSTRAINT"`。结果写入 `.arch/ground_truth.md`，并用于调整相关节点。
+* **挂载外部资料或探针**：调用 `arch_ground`，或用 `arch ground --type doc_ref --source "$DOC_PATH"` 将协议文档登记进 `.arch/grounding.json`。其他类型为 `probe_cmd`、`human_verify` 和 `code_ref`。需要交给实现方的文档章节可以直接在节点 `spec` 或连线契约中引用。

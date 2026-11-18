@@ -49,7 +49,7 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "arch_collapse",
-        "description": "在用户确认后，将指定的 '?' 待定节点固化锁定为确定节点（solid），并自动生成 Shadow Git 快照。",
+        "description": "确定待定节点或更新已确定节点的规范，并生成 Shadow Git 快照。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -57,8 +57,8 @@ TOOLS: List[Dict[str, Any]] = [
                 "label": {"type": "string", "description": "锁定后的简洁业务/模块名称"},
                 "spec": {"type": "string", "description": "确定性的功能职责与技术原语描述"},
                 "file_path": {"type": "string", "description": "可选：预期落地的代码文件路径"},
-                "in_contract": {"type": "string", "description": "可选：上游输入数据结构契约"},
-                "out_contract": {"type": "string", "description": "可选：下游输出数据结构契约"},
+                "in_contract": {"type": "string", "description": "可选：覆盖全部入边的契约"},
+                "out_contract": {"type": "string", "description": "可选：覆盖全部出边的契约"},
                 "node_type": {
                     "type": "string",
                     "enum": ["port", "adapter", "reality_gate"],
@@ -67,6 +67,19 @@ TOOLS: List[Dict[str, Any]] = [
                 "stage": {"type": "string", "description": "可选：指定归属的生命周期 Stage 阶段名称"},
             },
             "required": ["node_id", "label", "spec"],
+        },
+    },
+    {
+        "name": "arch_set_edge_contract",
+        "description": "按起点和终点更新一条已有连线的契约，并生成 Shadow Git 快照。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "from_node": {"type": "string", "description": "起点节点 ID"},
+                "to_node": {"type": "string", "description": "终点节点 ID"},
+                "contract": {"type": "string", "description": "新契约"},
+            },
+            "required": ["from_node", "to_node", "contract"],
         },
     },
     {
@@ -255,7 +268,7 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "arch_export_ui",
-        "description": "一键编译并导出阶段泳道（Stage Swimlane）交互式架构看板 HTML 文件。",
+        "description": "导出单文件交互式架构看板 HTML（阶段分组、主干与分支连线、待定/储备节点、契约详情、搜索与深链），离线可用；图变更后需重新导出。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -282,6 +295,8 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             node_type=args.get("node_type", "port"),
             stage=args.get("stage", ""),
         )
+    if name == "arch_set_edge_contract":
+        return arch_cli.op_set_edge_contract(args["from_node"], args["to_node"], args["contract"])
     if name == "arch_add_node":
         return arch_cli.op_add_node(
             node_id=args["node_id"],

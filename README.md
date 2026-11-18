@@ -9,6 +9,13 @@
 [![Protocol: MCP](https://img.shields.io/badge/MCP-Compatible-purple.svg)](https://modelcontextprotocol.io/)
 [![Works With Antigravity / Claude Code / Cursor](https://img.shields.io/badge/AI%20Harness-Universal-orange.svg)](#)
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/dashboard-dark.png">
+  <img alt="arch-grower 导出的架构看板：一句话想法“拍照记账助手”推演 15 步后的架构图，包含 4 个阶段、5 节点最小闭环、2 个待定节点与 3 个储备需求" src="docs/images/dashboard-light.png">
+</picture>
+
+<sub>↑ 一句话想法“拍照记账助手”经过 15 步推演后，<code>arch export-ui</code> 导出的架构看板（<a href="#dashboard-example">示例详解</a>）。</sub>
+
 ---
 
 ## 💡 为什么需要 Arch-Grower？
@@ -25,7 +32,7 @@
 
 ### 破局思路
 在**人的直觉意图**与**AI 的代码执行**之间，引入一层**轻量级的图状态机（Graph IR）**。  
-用户无需手写长篇 PRD，AI 也无需在主对话里堆砌业务代码；只需针对**关键架构权衡（Trade-off）**做二选一确认，系统就会自顶向下、逐步把初始想法推演为可执行的工程架构。
+用户无需手写长篇 PRD，AI 也无需在主对话里堆砌业务代码；只需针对**关键架构权衡（Trade-off）**做二选一确认（当然也可以向Agent提出你自己的想法），系统就会自顶向下、逐步把初始想法推演为可执行的工程架构。
 
 ---
 
@@ -64,6 +71,79 @@ flowchart LR
 
 ---
 
+<a id="dashboard-example"></a>
+
+## 🖼️ 看板示例：从一句话到一张架构图
+
+以一个典型的 vibe coding 需求为例：
+
+> “我想做个**拍照记账助手**：拍下小票自动识别金额和商户，分类入账，每月生成消费报表，超支了提醒我。”
+
+纯聊天写代码时，这类需求很容易一口气堆成一团：OCR、LLM、数据库、推送、多人账本混在同一轮对话里。用 arch-grower 推演 15 步后，执行 `arch export-ui` 得到的就是页首那张图（另有[亮色](docs/images/dashboard-light.png) / [暗色](docs/images/dashboard-dark.png)原图，以及可交互的[示例 HTML](docs/examples/expense-tracker-dashboard.html)：下载后用浏览器打开，离线可用）。
+
+**怎么读这张图**
+
+| 图上元素 | 含义 | 本例中的内容 |
+| :--- | :--- | :--- |
+| 黄色 `IDEA` 卡片 | `SEED.md` 中的一句话初始意图 | 拍照记账助手 |
+| 白色实线卡片 | 已确定节点（`solid`），左上角标签是节点类型 | 拍照上传 → 云 OCR 识别 → LLM 结构化抽取 → 自动分类 → 月度报表 |
+| 虚线彩色框 + 底部标签 | 同一 `--stage` 的节点归为一组 | S1 采集 / S2 理解 / S3 账本 / S4 洞察 |
+| 黄色斜纹 `?` 卡片 | 待定节点（`hole`），等待下一轮二选一 | 超支提醒（订阅推送还是打开时提示？）、识别纠错（低置信度是否强制人工确认？） |
+| 紫色斜纹 `+` 卡片 | 储备需求（`fog`），虚线挂在所属阶段下 | 银行流水导入、多人共享账本、桌面小组件 |
+| 分支与下挂节点 | 主干之外的分支，叶子节点挂在上游正下方 | SQLite 账本挂在自动分类下 |
+| 左上角绿色徽章 | 引擎检测到 `[WALKING_SKELETON_READY]` | 5 节点最小闭环已贯通，可以交给子代理落地 |
+| 右侧面板 | 项目概览；点击节点后切换为该节点的规范、输入/输出契约、源码绑定 | 2 条已验证事实、1 条踩坑记录（本地 Tesseract 识别率不足，改用云 OCR） |
+
+画布支持拖拽平移、⌘/Ctrl + 滚轮缩放、`F` 适配视图，右上角可切换亮/暗主题（默认跟随系统）。看板是 `graph.json` 的只读快照，图变更后重新执行 `export-ui` 即可。
+
+<details>
+<summary>复现这张图的完整命令（15 步推演）</summary>
+
+```bash
+arch init --seed "拍照记账助手：拍下小票自动识别金额和商户，分类入账，每月生成消费报表并在超支时提醒"
+
+# 主干：每个 collapse 对应一轮二选一确认
+arch collapse --node entry_input --label "拍照上传" --spec "小程序拍照或相册选图，本地裁剪与对比度增强后上传" \
+  --type input --stage "S1 采集 · CAPTURE" --out-contract "JPEG 小票图 ≤ 2MB"
+arch collapse --node core_transform --label "本地 Tesseract OCR" --spec "端侧 Tesseract 识别小票文字" \
+  --type service --stage "S2 理解 · EXTRACT"
+arch reset-node --node core_transform --reason "热敏纸中文小票识别率不足 70%，改用云 OCR"   # 踩坑，写入 graveyard
+arch collapse --node core_transform --label "云 OCR 识别" --spec "调用云 OCR 返回文字与版面坐标" \
+  --type service --stage "S2 理解 · EXTRACT"
+arch add-node --node llm_extract --label "LLM 结构化抽取" --spec "从 OCR 原文抽取金额、商户、日期，JSON 模式输出并做金额校验" \
+  --status solid --type "llm · json-mode" --stage "S2 理解 · EXTRACT" \
+  --after core_transform --before final_output --contract "OCR 原文 + 版面坐标"
+arch add-node --node categorize --label "自动分类" --spec "规则优先、LLM 兜底，把交易归入餐饮/交通/日用等类别" \
+  --status solid --type service --stage "S3 账本 · LEDGER" \
+  --after llm_extract --before final_output --contract "{amount, merchant, date}"
+arch set-edge-contract --from categorize --to final_output --contract "带类别的交易记录"
+arch collapse --node final_output --label "月度报表" --spec "按月聚合分类支出，生成图表卡片" \
+  --type output --stage "S4 洞察 · INSIGHT"
+arch add-node --node ledger_db --label "SQLite 账本" --spec "单机 SQLite 存储交易与类别规则" \
+  --status solid --type storage --stage "S3 账本 · LEDGER" --after categorize --contract "交易记录行"
+
+# 还没想清的环节留成待定节点
+arch add-node --node budget_alert --label "超支提醒" --spec "待定：订阅消息推送还是打开小程序时提示？" \
+  --after final_output --contract "月度分类合计 vs 预算"
+arch add-node --node manual_fix --label "识别纠错" --spec "待定：低置信度结果是否强制人工确认" \
+  --after llm_extract --contract "置信度 < 0.8 的字段"
+
+# 发散想法放进储备区，不打断主线
+arch add-node --node fog_bank --label "银行流水导入" --spec "导入 CSV 账单自动对账" --status fog --stage "S1 采集 · CAPTURE"
+arch add-node --node fog_family --label "多人共享账本" --spec "家庭成员共同记账" --status fog --stage "S3 账本 · LEDGER"
+arch add-node --node fog_widget --label "桌面小组件" --spec "桌面显示本月剩余预算" --status fog
+
+# 现实约束沉淀为 Ground Truth
+arch verify --fact "热敏纸小票常褪色、反光" --constraint "上传前必须本地裁剪并增强对比度"
+arch verify --fact "单张小票 LLM 抽取约 1.5s" --constraint "抽取异步执行，前端先显示识别中"
+
+arch export-ui   # → .arch/dashboard.html
+```
+
+</details>
+
+---
+
 ## 📂 项目结构
 
 本项目保持**零第三方 Python 依赖（Zero External Dependencies）**，使用标准库即开即用：
@@ -75,13 +155,15 @@ arch-grower/
 ├── scripts/
 │   ├── arch_cli.py          # 纯标准库状态机、1-Hop 切片器与 Shadow Git 引擎
 │   ├── arch_mcp.py          # 标准 Stdio MCP (Model Context Protocol) 服务端
-│   └── dashboard_template.html  # export-ui 使用的看板模板（自包含，离线可用）
-├── tests/
-│   └── test_arch_cli.py     # 标准库 unittest 回归测试：python3 -m unittest discover -s tests
+│   └── templates/
+│       └── dashboard.html   # export-ui 使用的单文件看板模板（零外部依赖）
+├── docs/
+│   ├── images/              # README 中的看板截图（亮色 / 暗色）
+│   └── examples/            # 可直接打开的看板示例 HTML
 └── references/
     ├── onboarding_tutorial.md   # 5 分钟交互式新手演练剧本
     ├── stage_patterns.md        # 阶段内并发并行与多态设计模式
-    ├── execution_and_hotswap.md # Walking Skeleton 交付与单节点热替换规范
+    ├── execution_and_hotswap.md # 初次交付、已落地节点变更与热替换
     └── grounding_guide.md       # 现实世界黑盒约束与硬件边界确认指南
 ```
 
@@ -95,7 +177,7 @@ arch-grower/
 
 ```bash
 # 克隆仓库到个人技能目录（以 ~/.agents/skills 为例）
-git clone https://github.com/Tobi1chi/arch-grower.git ~/.agents/skills/arch-grower
+git clone https://github.com/<your-username>/arch-grower.git ~/.agents/skills/arch-grower
 
 # 若使用 Antigravity，可直接软链接至配置目录：
 mkdir -p ~/.gemini/config/skills
@@ -112,16 +194,13 @@ ln -s ~/.agents/skills/arch-grower ~/.gemini/config/skills/arch-grower
 
 `arch_mcp.py` 实现了无额外依赖的标准 JSON-RPC Stdio MCP 协议，可直接注册到支持 MCP 的宿主工具中。
 
-> **项目目录**：引擎把状态写在工作目录下的 `.arch/` 中。不同宿主启动 MCP 进程时的工作目录不一定是你的项目（Claude Desktop 与全局配置尤其如此），请用环境变量 `ARCH_ROOT` 指定项目根目录。
-
 #### 1. Claude Desktop / Claude Code 配置 (`claude_desktop_config.json`):
 ```json
 {
   "mcpServers": {
     "arch-grower": {
       "command": "python3",
-      "args": ["/path/to/arch-grower/scripts/arch_mcp.py"],
-      "env": { "ARCH_ROOT": "/path/to/your/project" }
+      "args": ["/path/to/arch-grower/scripts/arch_mcp.py"]
     }
   }
 }
@@ -133,8 +212,7 @@ ln -s ~/.agents/skills/arch-grower ~/.gemini/config/skills/arch-grower
   "mcpServers": {
     "arch-grower": {
       "command": "python3",
-      "args": ["/path/to/arch-grower/scripts/arch_mcp.py"],
-      "env": { "ARCH_ROOT": "/path/to/your/project" }
+      "args": ["/path/to/arch-grower/scripts/arch_mcp.py"]
     }
   }
 }
@@ -144,42 +222,40 @@ ln -s ~/.agents/skills/arch-grower ~/.gemini/config/skills/arch-grower
 
 ### 方式三：作为命令行 CLI 工具单机体验
 
-你也可以在终端中直接体验这套状态机引擎：
+从目标项目根目录运行以下命令。架构状态保存在该目录的 `.arch/`。将脚本路径替换为实际的技能安装路径。
 
 ```bash
-# 1. 用一句话想法初始化架构状态机（自动生成 entry_input / core_transform / final_output 三个待定节点）
-python3 scripts/arch_cli.py init --seed "实时多模态翻译耳机：BLE输入处理到骨传导输出"
+ARCH_GROWER_CLI="/实际安装路径/arch-grower/scripts/arch_cli.py"
+arch() { uv run --no-project "$ARCH_GROWER_CLI" "$@"; }
 
-# 2. 查看当前需要决策的局部切片（按依赖顺序挑选最上游的待定节点）
-python3 scripts/arch_cli.py focus
+# 1. 仅在尚未初始化架构图的项目中执行
+arch init --seed "实时多模态翻译耳机，BLE 输入到骨传导输出"
 
-# 3. 拍板某个节点，将其锁定为具体实现规范
-python3 scripts/arch_cli.py collapse \
-  --node "entry_input" \
+# 2. 查看已有节点的局部切片
+arch focus --node entry_input
+
+# 3. 确认初始图中的输入节点
+arch collapse \
+  --node entry_input \
   --label "BLE 音频接收器" \
   --spec "监听低功耗蓝牙音频流，按 200ms 分片压入内存队列" \
   --stage "S1-Ingestion"
 
 # 4. 把暂缓开发的发散想法放入储备区
-python3 scripts/arch_cli.py add-node \
-  --node "fog_cloud_backup" \
+arch add-node \
+  --node fog_cloud_backup \
   --label "云端录音备份" \
   --spec "异步上传分片至 S3" \
   --status "fog"
 
-# 5. 主干稳定后，把成熟子图折叠为一个超级节点（需要修改时用 unfold 展开）
-#    只能折叠已确定的节点：这里假设 core_transform 与 final_output 已经 collapse
-python3 scripts/arch_cli.py fold \
-  --nodes "core_transform,final_output" \
-  --id "translate_out" \
-  --label "翻译与输出模块" \
-  --spec "将音频分片翻译后经骨传导播放"
-
-# 6. 导出交互式阶段泳道看板 HTML
-python3 scripts/arch_cli.py export-ui
-# 浏览器打开 .arch/dashboard.html 即可查看全局泳道看板（离线可用）：
-#   点击节点查看上下游与契约；/ 搜索，← → 沿连线走，↑ ↓ 同阶段切换，Esc 取消
+# 5. 导出交互式阶段泳道看板 HTML
+arch export-ui
+# 浏览器打开 .arch/dashboard.html 即可查看全局架构看板（离线可用）
+# 看板展示阶段分组、主干与分支连线、待定/储备节点、最小闭环和各节点契约；
+# 它是 graph.json 的只读快照，图更新后重新执行 export-ui
 ```
+
+用 `arch <子命令> --help` 查询参数。已落地项目的修改流程见[执行与变更手册](references/execution_and_hotswap.md)。
 
 ---
 
@@ -189,21 +265,18 @@ python3 scripts/arch_cli.py export-ui
 | :--- | :--- | :--- |
 | `arch_init` | `init` | 初始化项目状态机，创建带待定节点的初始主干与 Shadow Git 仓库 |
 | `arch_focus` | `focus` | 获取当前待定节点的局部上下文、项目目标约束与切片视图 |
-| `arch_collapse` | `collapse` | 确认设计后，将待定节点固化为具体实现规范并记录快照 |
+| `arch_collapse` | `collapse` | 确定待定节点或更新已确定节点的规范并记录快照 |
+| `arch_set_edge_contract` | `set-edge-contract --from <起点> --to <终点> --contract <契约>` | 更新一条已有连线的契约 |
 | `arch_add_node` | `add-node` | 在图中增量插入新节点（可指定前驱/后继连线与生命周期 Stage） |
 | `arch_add_fog` | `add-node --status fog` | 快捷工具：将发散想法放入迷雾储备区，保持主干清晰聚焦 |
 | `arch_deactivate`| `deactivate` | 将活跃节点移入暂缓储备区，自动缝合上下游依赖连线 |
 | `arch_activate` | `activate` | 将储备区的节点重新激活为待定节点并接入主线 |
-| `arch_verify` | `verify` | 将用户实测确认的现实事实与推导出的硬约束写入 `ground_truth.md` |
-| `arch_ground` | `ground` | 挂载外部资料或探针（文档、命令、代码引用）到 `grounding.json` |
 | `arch_export_task`| `export-task` | 导出单节点的独立编码任务卡（专供临时子代理在沙箱中执行） |
-| `arch_commit_node`| `commit-node` | 子代理单测通过后提交快照并绑定实现代码路径 |
+| `arch_commit_node`| `commit-node --node <节点> --file-path <项目内源码路径>` | 验证后提交快照并绑定实现代码路径 |
 | `arch_sync_manual`| `sync-manual` | 感知人类在 IDE 中的手动修改，同步快照以解除防覆盖拦截 |
-| `arch_reset_node` | `reset-node` | 运行踩坑时将叶子节点重置为待定状态，并将失败教训记录进 `graveyard.md` |
-| `arch_fold` | `fold` | 将已确定、彼此连通的子图折叠为一个超级节点（子节点与内部连线完整保存，对外连线与契约保留），降低认知负荷 |
-| `arch_unfold` | `unfold` | 展开超级节点并原样恢复；折叠期间新增的连线自动接到唯一的入口/出口子节点，无法判断时通过 `attach` 指定 |
-| `arch_fork` | `fork` | 分支回滚：从指定快照标签回滚架构状态，已绑定节点的代码文件随图一并回滚（保留避坑记录；存在未提交改动时拒绝执行） |
-| `arch_export_ui` | `export-ui` | 导出阶段泳道（Stage Swimlane）交互式看板 HTML：连线与契约、骨架高亮、搜索与键盘导航，单文件离线可用 |
+| `arch_reset_node` | `reset-node` | 将节点重置为待定，保留连线并记录替换原因 |
+| `arch_fork` | `fork` | 从历史快照分叉，会切换工作区内受 Shadow Git 跟踪的文件 |
+| `arch_export_ui` | `export-ui` | 导出单文件交互式架构看板 HTML（阶段分组、连线拓扑、契约详情），默认 `.arch/dashboard.html` |
 
 ---
 

@@ -38,14 +38,21 @@ description: Progressive, autoregressive architecture facilitator. Use when star
 ## 一、 三项核心原则
 
 1. **主从职责解耦**：主对话窗口**专职负责架构推演与决策，不直接读业务源码、不写具体业务实现、不贴长篇报错日志**。所有编码、测试与排错统一由**独立的临时子代理（Sub-Agent）**在沙箱中完成。
-2. **增量状态管理**：严禁直接手动覆写 `.arch/graph.json`。每次对话开始、状态变更或上下文压缩后，调用 MCP 工具 `arch_focus`（或执行 `python3 scripts/arch_cli.py focus`），仅基于局部切片进行思考与回复；若引擎报错，严格按返回的指导执行。
+2. **增量状态管理**：通过 MCP 或 CLI 更新架构图。从目标项目根目录执行操作。已有图时，在任务开始、状态变更或上下文压缩后用 `arch_focus` 或 `focus` 获取切片。涉及多个耦合节点时按需读取相关切片，可只读查询图中的文件绑定。保留引擎返回的错误上下文。
 3. **人定策略，机定机制**：只向用户确认“业务策略方向与关键技术权衡”；底层依赖选型、重试参数、内部命名等工程细节默认由系统补齐，不拿琐碎细节干扰用户。
+
+### CLI 入口
+
+MCP 工具不可用时，用 `uv run --no-project "$ARCH_GROWER_CLI" <命令>`。将 `ARCH_GROWER_CLI` 设为本技能 `SKILL.md` 同目录下 `scripts/arch_cli.py` 的绝对路径，工作目录用目标项目根目录。手册中的 `arch <命令>` 指这条调用，`arch <命令> --help` 可查询当前版本的参数。
+
+- 新项目用 `arch init --seed "一句话意图"`。只在尚未初始化时执行，重复执行会覆盖图。
+- 继续现有项目用 `arch focus`。已知节点 ID 时用 `arch focus --node "$NODE_ID"`，并核对返回的焦点 ID。
 
 ## 二、 架构演进主循环
 
 1. **初始化骨架**：收到初始想法且 `.arch/` 不存在时，调用 `arch_init`（传入 `seed` 概括初始意图），生成带待定节点（`🟡 ?`）的基础主干。
 2. **局部切片与权衡提问**：每轮回复包含：
-   - **局部视图**：展示当前焦点的 1-Hop 切片（`🟢` 已确定、`🟡 ?` 当前待定、`⚪` 储备分支）；如需全局概览，调用 `arch_export_ui` 导出阶段泳道看板。
+   - **局部视图**：展示当前焦点的 1-Hop 切片（`🟢` 已确定、`🟡 ?` 当前待定、`⚪` 储备分支）；如需全局概览，调用 `arch_export_ui` 导出架构看板，并把生成的 `.arch/dashboard.html` 路径告诉用户。
    - **核心权衡二选一**：针对高亮的 `🟡 ?` 待定节点，**显式提取其核心架构权衡（Trade-off）**（如：`实时性(允许丢帧) vs 可靠性(确认重试)`），给出清晰的 **A / B 两个选项**与代价对比，帮助用户快速决策。
 3. **状态流转与阶段管理**：用户确认后，调用 `arch_collapse` 固化节点规范；发散想法存入储备区（调用 `arch_add_fog` 或 `arch_deactivate` 移入储备并自动缝合上下游依赖）；需要时调用 `arch_activate` 接入主线；新增节点支持 `--stage` 划分生命周期阶段；阶段内并发或多态按 `references/stage_patterns.md` 规范建模。
 4. **折叠成熟子图**：`arch_focus` 提示活跃实心节点过多时，挑一组已确定、彼此连通的节点调用 `arch_fold` 折叠为一个超级节点（只折叠已稳定的部分，待定与储备节点不纳入）；之后只把它当作一个模块讨论。需要修改其中某个子节点时，先 `arch_unfold` 展开；若展开时提示新增连线无法归位，向用户确认接到哪个子节点后带上 `attach` 重试。
@@ -55,4 +62,4 @@ description: Progressive, autoregressive architecture facilitator. Use when star
 * **用户想要系统学习 / 演练完整使用流程时** $\rightarrow$ 读取 `references/onboarding_tutorial.md` 开启新手教练模式
 * **Stage 阶段内部遇到并列 / 并发 / 多态路由需要建模时** $\rightarrow$ 读取 `references/stage_patterns.md` 
 * **遇到代码不可见的现实环境、硬件或黑盒约束需要向用户确认时** $\rightarrow$ 读取 `references/grounding_guide.md`  
-* **主线贯通准备写代码，或运行遇阻需要局部热替换/回滚时** $\rightarrow$ 读取 `references/execution_and_hotswap.md`
+* **主线贯通准备写代码，或修改已落地节点、处理运行故障及回滚时** $\rightarrow$ 读取 [执行与变更手册](references/execution_and_hotswap.md)。修改已落地决策时先定位上下游和共享实现的影响范围，再更新图、实现和文档。

@@ -469,6 +469,28 @@ def op_collapse(
     return f"已锁定节点 '{node_id}' ({label})，快照 {tag}。\n\n" + op_focus()
 
 
+def op_set_edge_contract(from_node: str, to_node: str, contract: str) -> str:
+    graph = _load_graph()
+    matches = [
+        edge for edge in graph["edges"]
+        if edge["from"] == from_node and edge["to"] == to_node
+    ]
+    edge_label = f"{from_node} -> {to_node}"
+    if len(matches) != 1:
+        raise ArchEngineError(f"需要唯一的连线 '{edge_label}'，找到 {len(matches)} 条。")
+
+    edge = matches[0]
+    if edge.get("contract") == contract:
+        return f"连线 '{edge_label}' 已使用该契约。"
+
+    edge["contract"] = contract
+    graph["step"] += 1
+    tag = f"arch-step-{graph['step']:02d}"
+    _save_graph(graph)
+    _shadow_commit(tag, f"set-edge-contract {edge_label}")
+    return f"已更新连线 '{edge_label}' 的契约，快照 {tag}。\n\n" + op_focus(from_node)
+
+
 def op_add_node(
     node_id: str,
     label: str,
@@ -571,9 +593,9 @@ def op_export_task(node_id: str) -> str:
         "worker_instruction": (
             "你是独立的实现子代理。严格仅实现以下单节点契约："
             "1) 采用 Port/Adapter 分离易变外部接口；"
-            "2) 编写上下游契约校验与单元测试；"
-            "3) 若 type=='reality_gate'，生成终端交互式测试桩；"
-            "4) 完成后调用 commit-node 提交影子快照，并仅返回 <=3 行结果摘要。"
+            "2) 按主代理给定的变更范围和项目规则验证上下游契约；"
+            "3) 若 type=='reality_gate'，按项目要求验证真实环境约束；"
+            "4) 按主代理给定的快照安排处理 commit-node，并返回 <=3 行结果摘要。"
         ),
         "target_node": node,
         "input_contracts": [_public_edge(e) for e in in_edges],
@@ -1062,6 +1084,11 @@ def main() -> None:
     p_col.add_argument("--type", default="port")
     p_col.add_argument("--stage", default="")
 
+    p_edge = sub.add_parser("set-edge-contract", help="更新指定连线的契约")
+    p_edge.add_argument("--from", dest="from_node", required=True)
+    p_edge.add_argument("--to", dest="to_node", required=True)
+    p_edge.add_argument("--contract", required=True)
+
     p_add = sub.add_parser("add-node")
     p_add.add_argument("--node", required=True)
     p_add.add_argument("--label", required=True)
@@ -1139,6 +1166,8 @@ def main() -> None:
                 args.node, args.label, args.spec,
                 args.file_path, args.in_contract, args.out_contract, args.type, args.stage
             ))
+        elif args.cmd == "set-edge-contract":
+            print(op_set_edge_contract(args.from_node, args.to_node, args.contract))
         elif args.cmd == "add-node":
             print(op_add_node(
                 args.node, args.label, args.spec,

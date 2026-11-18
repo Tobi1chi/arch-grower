@@ -345,6 +345,27 @@ class FoldTest(EngineTestCase):
             arch_cli.op_add_node("fake", "假的", "spec", status="solid", node_type="super_node")
 
 
+class EdgeContractTest(EngineTestCase):
+    def edge(self, u: str, v: str) -> dict:
+        graph = json.loads(Path(".arch/graph.json").read_text(encoding="utf-8"))
+        return next(e for e in graph["edges"] if (e["from"], e["to"]) == (u, v))
+
+    def test_updates_exactly_one_edge(self) -> None:
+        arch_cli.op_set_edge_contract("entry_input", "core_transform", "PCM 16k chunk")
+        self.assertEqual(self.edge("entry_input", "core_transform")["contract"], "PCM 16k chunk")
+        self.assertEqual(self.edge("core_transform", "final_output")["contract"], "TBD")
+
+    def test_same_contract_is_a_no_op(self) -> None:
+        arch_cli.op_set_edge_contract("entry_input", "core_transform", "x")
+        step = json.loads(Path(".arch/graph.json").read_text(encoding="utf-8"))["step"]
+        self.assertIn("已使用该契约", arch_cli.op_set_edge_contract("entry_input", "core_transform", "x"))
+        self.assertEqual(json.loads(Path(".arch/graph.json").read_text(encoding="utf-8"))["step"], step)
+
+    def test_missing_edge_is_rejected(self) -> None:
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "找到 0 条"):
+            arch_cli.op_set_edge_contract("final_output", "entry_input", "x")
+
+
 class ExportUiTest(EngineTestCase):
     def export(self) -> str:
         arch_cli.op_export_ui()
