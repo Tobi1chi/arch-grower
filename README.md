@@ -91,10 +91,12 @@ flowchart LR
 | 黄色斜纹 `?` 卡片 | 待定节点（`hole`），等待下一轮二选一 | 超支提醒（订阅推送还是打开时提示？）、识别纠错（低置信度是否强制人工确认？） |
 | 紫色斜纹 `+` 卡片 | 储备需求（`fog`），虚线挂在所属阶段下 | 银行流水导入、多人共享账本、桌面小组件 |
 | 分支与下挂节点 | 主干之外的分支，叶子节点挂在上游正下方 | SQLite 账本挂在自动分类下 |
-| 左上角绿色徽章 | 引擎检测到 `[WALKING_SKELETON_READY]` | 5 节点最小闭环已贯通，可以交给子代理落地 |
-| 右侧面板 | 项目概览；点击节点后切换为该节点的规范、输入/输出契约、源码绑定 | 2 条已验证事实、1 条踩坑记录（本地 Tesseract 识别率不足，改用云 OCR） |
+| 左上角绿色徽章 | 引擎找到的最小闭环（Walking Skeleton） | 拍照上传 → 云 OCR 识别 → LLM 结构化抽取 → 自动分类 → SQLite 账本，5 节点已贯通，可以交给子代理落地 |
+| 黄色“下一个决定”徽章 | 引擎建议下一轮先讨论的待定节点，点击跳转 | 超支提醒 |
+| 连线上的契约标签 | 选中节点时显示它上下游连线的契约；工具栏“契约”按钮可显示全部 | 自动分类 → 月度报表：带类别的交易记录 |
+| 右侧面板 | 项目概览；点击节点后切换为该节点的规范、输入/输出契约、源码绑定，以及可一键复制的下一步命令 | 2 条已验证事实、1 条踩坑记录（本地 Tesseract 识别率不足，改用云 OCR） |
 
-画布支持拖拽平移、⌘/Ctrl + 滚轮缩放、`F` 适配视图，右上角可切换亮/暗主题（默认跟随系统）。看板是 `graph.json` 的只读快照，图变更后重新执行 `export-ui` 即可。
+画布支持拖拽平移、⌘/Ctrl + 滚轮缩放、`F` 适配视图；`/` 搜索节点，`←` `→` 沿连线走到上下游，`↑` `↓` 在同一阶段内切换，`Esc` 取消选择。选中节点后地址栏会带上 `#节点ID`，可以直接分享到某个节点（例如 [`#categorize`](docs/examples/expense-tracker-dashboard.html#categorize)）。工具栏可隐藏储备区、切换亮/暗主题（默认跟随系统）。看板是 `graph.json` 的只读快照，图变更后重新执行 `export-ui` 即可。
 
 <details>
 <summary>复现这张图的完整命令（15 步推演）</summary>
@@ -155,8 +157,9 @@ arch-grower/
 ├── scripts/
 │   ├── arch_cli.py          # 纯标准库状态机、1-Hop 切片器与 Shadow Git 引擎
 │   ├── arch_mcp.py          # 标准 Stdio MCP (Model Context Protocol) 服务端
-│   └── templates/
-│       └── dashboard.html   # export-ui 使用的单文件看板模板（零外部依赖）
+│   └── dashboard_template.html  # export-ui 使用的单文件看板模板（零外部依赖，离线可用）
+├── tests/
+│   └── test_arch_cli.py     # 标准库 unittest 回归测试：python3 -m unittest discover -s tests
 ├── docs/
 │   ├── images/              # README 中的看板截图（亮色 / 暗色）
 │   └── examples/            # 可直接打开的看板示例 HTML
@@ -177,7 +180,7 @@ arch-grower/
 
 ```bash
 # 克隆仓库到个人技能目录（以 ~/.agents/skills 为例）
-git clone https://github.com/<your-username>/arch-grower.git ~/.agents/skills/arch-grower
+git clone https://github.com/Tobi1chi/arch-grower.git ~/.agents/skills/arch-grower
 
 # 若使用 Antigravity，可直接软链接至配置目录：
 mkdir -p ~/.gemini/config/skills
@@ -194,13 +197,16 @@ ln -s ~/.agents/skills/arch-grower ~/.gemini/config/skills/arch-grower
 
 `arch_mcp.py` 实现了无额外依赖的标准 JSON-RPC Stdio MCP 协议，可直接注册到支持 MCP 的宿主工具中。
 
+> **项目目录**：引擎把状态写在工作目录下的 `.arch/` 中。不同宿主启动 MCP 进程时的工作目录不一定是你的项目（Claude Desktop 与全局配置尤其如此），请用环境变量 `ARCH_ROOT` 指定项目根目录。
+
 #### 1. Claude Desktop / Claude Code 配置 (`claude_desktop_config.json`):
 ```json
 {
   "mcpServers": {
     "arch-grower": {
       "command": "python3",
-      "args": ["/path/to/arch-grower/scripts/arch_mcp.py"]
+      "args": ["/path/to/arch-grower/scripts/arch_mcp.py"],
+      "env": { "ARCH_ROOT": "/path/to/your/project" }
     }
   }
 }
@@ -212,7 +218,8 @@ ln -s ~/.agents/skills/arch-grower ~/.gemini/config/skills/arch-grower
   "mcpServers": {
     "arch-grower": {
       "command": "python3",
-      "args": ["/path/to/arch-grower/scripts/arch_mcp.py"]
+      "args": ["/path/to/arch-grower/scripts/arch_mcp.py"],
+      "env": { "ARCH_ROOT": "/path/to/your/project" }
     }
   }
 }
@@ -248,11 +255,19 @@ arch add-node \
   --spec "异步上传分片至 S3" \
   --status "fog"
 
-# 5. 导出交互式阶段泳道看板 HTML
+# 5. 主干稳定后，把成熟子图折叠为一个超级节点（需要修改时用 unfold 展开）
+#    只能折叠已确定的节点：这里假设 core_transform 与 final_output 已经 collapse
+arch fold \
+  --nodes "core_transform,final_output" \
+  --id translate_out \
+  --label "翻译与输出模块" \
+  --spec "将音频分片翻译后经骨传导播放"
+
+# 6. 导出交互式架构看板 HTML
 arch export-ui
-# 浏览器打开 .arch/dashboard.html 即可查看全局架构看板（离线可用）
-# 看板展示阶段分组、主干与分支连线、待定/储备节点、最小闭环和各节点契约；
-# 它是 graph.json 的只读快照，图更新后重新执行 export-ui
+# 浏览器打开 .arch/dashboard.html 即可查看全局架构看板（离线可用）：
+#   点击节点查看上下游与契约；/ 搜索，← → 沿连线走，↑ ↓ 同阶段切换，Esc 取消
+# 看板是 graph.json 的只读快照，图更新后重新执行 export-ui
 ```
 
 用 `arch <子命令> --help` 查询参数。已落地项目的修改流程见[执行与变更手册](references/execution_and_hotswap.md)。
@@ -271,12 +286,16 @@ arch export-ui
 | `arch_add_fog` | `add-node --status fog` | 快捷工具：将发散想法放入迷雾储备区，保持主干清晰聚焦 |
 | `arch_deactivate`| `deactivate` | 将活跃节点移入暂缓储备区，自动缝合上下游依赖连线 |
 | `arch_activate` | `activate` | 将储备区的节点重新激活为待定节点并接入主线 |
+| `arch_verify` | `verify` | 将用户实测确认的现实事实与推导出的硬约束写入 `ground_truth.md` |
+| `arch_ground` | `ground` | 挂载外部资料或探针（文档、命令、代码引用）到 `grounding.json` |
 | `arch_export_task`| `export-task` | 导出单节点的独立编码任务卡（专供临时子代理在沙箱中执行） |
 | `arch_commit_node`| `commit-node --node <节点> --file-path <项目内源码路径>` | 验证后提交快照并绑定实现代码路径 |
 | `arch_sync_manual`| `sync-manual` | 感知人类在 IDE 中的手动修改，同步快照以解除防覆盖拦截 |
 | `arch_reset_node` | `reset-node` | 将节点重置为待定，保留连线并记录替换原因 |
-| `arch_fork` | `fork` | 从历史快照分叉，会切换工作区内受 Shadow Git 跟踪的文件 |
-| `arch_export_ui` | `export-ui` | 导出单文件交互式架构看板 HTML（阶段分组、连线拓扑、契约详情），默认 `.arch/dashboard.html` |
+| `arch_fold` | `fold` | 将已确定、彼此连通的子图折叠为一个超级节点（子节点与内部连线完整保存，对外连线与契约保留），降低认知负荷 |
+| `arch_unfold` | `unfold` | 展开超级节点并原样恢复；折叠期间新增的连线自动接到唯一的入口/出口子节点，无法判断时通过 `attach` 指定 |
+| `arch_fork` | `fork` | 从历史快照分叉，已绑定节点的代码文件随图一并回滚（保留避坑记录；存在未提交改动时拒绝执行） |
+| `arch_export_ui` | `export-ui` | 导出单文件交互式架构看板 HTML（阶段分组、连线与契约、最小闭环、搜索、深链与键盘导航），默认 `.arch/dashboard.html` |
 
 ---
 
