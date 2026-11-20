@@ -397,6 +397,15 @@ class ExportUiTest(EngineTestCase):
         self.assertIsNone(data["skeleton"])
         self.assertEqual(data["seed"], "test seed")
 
+    def test_viewport_disables_text_selection(self) -> None:
+        # Drag-to-pan used to sweep a selection across the stage labels; that
+        # selection becomes an HTML5 drag source, so the next pan is taken over
+        # by the browser's "search for text" drop action instead of panning.
+        page = self.export()
+        start = page.index("#viewport {")
+        rule = page[start:page.index("}", start)]
+        self.assertIn("user-select: none", rule)
+
 
 class SignatureDetectionTest(unittest.TestCase):
     def check(self, line: str) -> bool:
