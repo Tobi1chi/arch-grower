@@ -47,7 +47,7 @@ MCP 工具不可用时，用 `uv run --no-project "$ARCH_GROWER_CLI" <命令>`�
 
 - 新项目用 `arch init --seed "一句话意图"`。只在尚未初始化时执行，重复执行会覆盖图。
 - 继续现有项目用 `arch focus`。已知节点 ID 时用 `arch focus --node "$NODE_ID"`，并核对返回的焦点 ID。全局进度用 `arch status`。
-- `focus` 返回 `[RECORDS_NOT_MIGRATED]` 时，项目的事实与墓志仍是旧格式、每次全文拼接。征得用户同意后运行 `arch migrate-records`，再按第四节处理迁移结果。
+- `focus` 返回 `[RECORDS_NOT_MIGRATED]` 时，项目的事实与墓志仍是旧格式、每次全文拼接。征得用户同意后运行 `arch migrate-records`，再按第五节「迁移旧项目」逐条处理迁移结果。
 
 ## 二、 架构演进主循环
 
@@ -74,7 +74,7 @@ MCP 工具不可用时，用 `uv run --no-project "$ARCH_GROWER_CLI" <命令>`�
 | 信息 | 记录方式 |
 | :--- | :--- |
 | 决策与硬约束 | `arch verify --fact --constraint --scope <节点/阶段>`，附 `--source` 证据路径。只在约束对所有节点都成立时用 `global`（默认）。旧结论变化时用 `--supersedes GT-xx` 取代，不要追加矛盾条目 |
-| 废弃方案 | `arch reset-node --reason`，自动以节点为作用域记入墓志 |
+| 废弃方案 | `arch reset-node --reason`，自动以节点为作用域记入墓志；补记历史上的废弃方案（不重置节点）用 `arch graveyard add --node --scheme --reason` |
 | 实现进度与验证程度 | `arch set-node-state --impl planned/building/built --verify none/unit/api/device`。`solid` 只表示决策已定，不表示已实现 |
 | 待验证的未知项 | `arch open add --question --kind device_test/research/decision --owner user/agent --scope ... [--blocking]`。用户真机实测的写 `--owner user`；代理能自己调研的写 `--owner agent` 并直接去做。有结论后用 `arch open resolve --id --resolution [--constraint]`，带约束时同时沉淀为事实 |
 | 参考合同文档 | 不抄进 spec，用 `arch set-node-state --add-ref docs/x.md#章节` 引用，`export-task` 会内联该章节原文 |
@@ -83,4 +83,20 @@ MCP 工具不可用时，用 `uv run --no-project "$ARCH_GROWER_CLI" <命令>`�
 
 `global` 事实超过字数上限（默认 3000 字符，`arch config --global-fact-limit` 调整）时会出现 `[GLOBAL_FACTS_OVER_BUDGET]`，用 `arch rescope --id GT-xx --scope <节点>` 收窄只与部分节点相关的事实。
 
-迁移后若出现 `[LEGACY_RECORDS]`，说明旧 md 中有非标准条目被原样保存为未分类遗留记录。和用户逐条处理：`arch legacy show --id LG-xx` 查看，把内容按上表拆分记录后，用 `arch legacy resolve --id LG-xx --note "拆为 GT-12、OI-03"` 关闭。迁移导入的事实默认都是 `global`，需逐条判断是否收窄。
+## 五、 迁移旧项目
+
+`arch migrate-records` 不解析旧 `ground_truth.md` / `graveyard.md` 的内容，而是把它们原样切成小块存为待处理的迁移原文（`legacy`）：每个列表条目连同缩进的续行是一块，其余段落（状态表、长段叙述、代码块）按所在标题各成一块，并记录来源文件和标题路径。迁移前自动打影子快照；重复运行不会重复导入。迁移后 `status` / `focus` 会提示 `[LEGACY_RECORDS]`，此时按以下步骤逐条处理，每次只看一块：
+
+1. `arch legacy show` 显示下一条待处理原文（也可 `--id LG-xx`）。
+2. 判断类型，用对应命令记录（一块可以拆成多条）：
+   - 决策与硬约束 → `arch verify --fact --constraint --scope <节点/阶段>`；只在约束对所有节点都成立时用 `global`。原文推翻了已有事实时加 `--supersedes GT-xx`。
+   - 废弃方案 → `arch graveyard add --node --scheme --reason`。
+   - 待实测 / 待调研 / 待决策 → `arch open add --question --kind --owner --scope [--blocking]`。
+   - 实现状态与验证程度 → `arch set-node-state --node --impl --verify [--verify-date]`；参考文档用 `--add-ref`，实现文件用 `--file-path`。
+   - 流程规则、发布运维 → 移到项目的 AGENTS.md，不进 arch 记录。
+   - 调查过程 → 只把结论写成事实，用 `--source` 指向证据路径。
+   - 已过时、重复或无用的内容 → 不记录。
+3. `arch legacy resolve --id LG-xx --note "拆为 GT-12、OI-03"`；没有记录任何内容时在 note 里写明原因（如“与 GT-04 重复”“流程规则，已移到 AGENTS.md”）。
+4. `arch legacy list` 为空才算迁移完成。
+
+改写用户确认过的约束时保持原意，不要增减条件；拿不准时按原文照录，或问用户。原文一直保存在 `records.json` 里（`arch legacy list --all`、`arch legacy show --id LG-xx` 可对照），处理完之前也会继续显示在生成的 md 里。

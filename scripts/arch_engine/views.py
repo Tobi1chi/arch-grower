@@ -16,7 +16,7 @@ from .graph import (
 from .records import (
     NOT_MIGRATED_HINT, _active_facts, _budget_warning, _context_keys, _fact_line,
     _global_fact_budget, _grave_line, _is_global, _load_records, _matches, _open_line,
-    _pending_md_edits, _read_records, _records_enabled, _scope_text, _superseded_ids,
+    _pending_md_edits, _read_records, _records_enabled, _scope_text, _superseded_ids, legacy_hint,
 )
 from .refs import _resolve_ref
 
@@ -146,7 +146,7 @@ def _related_records(rec: Dict[str, Any], keys: set, global_open: str = "blockin
         )
     legacy_open = sum(1 for lg in rec["legacy"] if lg.get("status") != "resolved")
     if legacy_open:
-        out.append(f"另有 {legacy_open} 条未分类遗留记录待人工处理（arch legacy list）。")
+        out.append(legacy_hint(legacy_open))
     return out
 
 
@@ -318,10 +318,8 @@ def op_status() -> str:
     out += [_open_line(o) for o in blocking]
     legacy = [lg for lg in rec["legacy"] if lg.get("status") != "resolved"]
     if legacy:
-        out.append(
-            f"[LEGACY_RECORDS] {len(legacy)} 条未分类遗留记录待人工处理（{', '.join(lg['id'] for lg in legacy)}）："
-            "arch legacy list / legacy show --id / legacy resolve --id"
-        )
+        ids_text = ", ".join(lg["id"] for lg in legacy[:10]) + ("…" if len(legacy) > 10 else "")
+        out.append(legacy_hint(len(legacy)) + f"（{ids_text}）")
     warning = _budget_warning(rec)
     if warning:
         out.append(warning)

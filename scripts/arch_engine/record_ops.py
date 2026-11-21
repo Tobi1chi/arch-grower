@@ -1,4 +1,4 @@
-"""Operations on facts, open items, legacy records and record settings."""
+"""Operations on facts, graveyard entries, open items, legacy records and record settings."""
 
 import json
 from datetime import datetime
@@ -10,9 +10,9 @@ from .common import (
 )
 from .graph import _find_any_node
 from .records import (
-    NOT_MIGRATED_HINT, OPEN_KINDS, OPEN_OWNERS, _budget_warning, _context_keys, _fact_line,
-    _global_fact_budget, _is_global, _load_records, _matches, _next_id, _normalize_scopes,
-    _open_line, _records_enabled, _save_records, _scope_text,
+    LEGACY_GUIDE, NOT_MIGRATED_HINT, OPEN_KINDS, OPEN_OWNERS, _budget_warning, _context_keys,
+    _fact_line, _global_fact_budget, _grave_line, _is_global, _load_records, _matches, _next_id,
+    _normalize_scopes, _open_line, _records_enabled, _save_records, _scope_text,
 )
 
 
@@ -215,25 +215,34 @@ def op_legacy(action: str = "list", record_id: str = "", note: str = "", include
         items = [lg for lg in rec["legacy"] if include_resolved or lg.get("status") != "resolved"]
         if not items:
             return "没有待处理的未分类遗留记录。"
-        out = [f"未分类遗留记录 {len(items)} 条（arch legacy show --id LG-xx 看全文）："]
+        out = [f"迁移原文 {len(items)} 条（arch legacy show 看下一条全文）："]
         for lg in items:
             first = next((ln.strip() for ln in lg["text"].splitlines() if ln.strip()), "")
             state = "已处理" if lg.get("status") == "resolved" else "待处理"
             where = lg["source"] + (f" · {lg['section']}" if lg.get("section") else "")
             out.append(f"- [{lg['id']}] {state} · {where} · {len(lg['text'])} 字符：{first[:60]}")
-        out.append(
-            "处理方式：把其中仍有用的内容拆成 verify --scope（决策与约束）、open add（待验证项）、"
-            "set-node-state（实现状态 / refs），调查过程只留结论和证据路径；然后 legacy resolve --id 关闭。"
-        )
+        if any(lg.get("status") != "resolved" for lg in items):
+            out.append(LEGACY_GUIDE)
         return "\n".join(out)
+    if action == "show" and not record_id:
+        pending = [lg for lg in rec["legacy"] if lg.get("status") != "resolved"]
+        if not pending:
+            return "没有待处理的迁移原文，迁移已完成。"
+        record_id = pending[0]["id"]
     item = next((lg for lg in rec["legacy"] if lg["id"] == record_id), None)
     if item is None:
         raise ArchEngineError(f"遗留记录 '{record_id}' 不存在。用 arch legacy list 查看编号。")
     if action == "show":
-        head = f"[{item['id']}] 来自 {item['source']}" + (f" · {item['section']}" if item.get("section") else "")
+        left = sum(1 for lg in rec["legacy"] if lg.get("status") != "resolved")
+        head = f"[{item['id']}] 来自 {item['source']}" + (f" · 标题：{item['section']}" if item.get("section") else "")
         if item.get("status") == "resolved":
-            head += f"（已处理：{item.get('note', '')}）"
-        return head + "\n\n" + item["text"]
+            return head + f"（已处理：{item.get('note', '')}）\n\n" + item["text"]
+        return (
+            f"{head}（待处理共 {left} 条）\n\n{item['text']}\n\n"
+            "处理：按类型用 verify --scope [--supersedes] / graveyard add / open add / set-node-state 记录，"
+            "流程规则移到项目 AGENTS.md，无用的不记；然后 "
+            f"arch legacy resolve --id {item['id']} --note \"拆为 ...\"（完整步骤：arch legacy list）。"
+        )
     if action == "resolve":
         if item.get("status") == "resolved":
             return f"{record_id} 已处理过。"
@@ -245,6 +254,28 @@ def op_legacy(action: str = "list", record_id: str = "", note: str = "", include
         left = sum(1 for lg in rec["legacy"] if lg.get("status") != "resolved")
         return (f"已将 {record_id} 标记为已处理（原文仍保存在 records.json）。剩余待处理 {left} 条。")
     raise ArchEngineError(f"legacy 的操作只能是 list / show / resolve，收到：{action}")
+
+
+def op_graveyard_add(node_id: str, scheme: str, reason: str) -> str:
+    """Record an abandoned scheme without resetting the node (reset-node does both)."""
+    if not scheme.strip() or not reason.strip():
+        raise ArchEngineError("墓志需要写明废弃的方案和原因。")
+    rec = _load_records(for_write=True)
+    graph = _graph_if_any()
+    if graph is not None and _find_any_node(graph, node_id) is None:
+        raise ArchEngineError(f"节点 '{node_id}' 不存在。墓志必须挂在图中的节点上。")
+    entry = {
+        "id": _next_id(rec["graveyard"], "GY"),
+        "node": node_id,
+        "scheme": scheme.strip(),
+        "reason": reason.strip(),
+        "date": _today(),
+        "detail": "",
+    }
+    rec["graveyard"].append(entry)
+    _save_records(rec)
+    _shadow_commit(f"grave-{entry['id']}", f"graveyard add {entry['id']} ({node_id})")
+    return f"已记入墓志：\n{_grave_line(entry)}"
 
 
 def op_config(global_fact_limit: Optional[int] = None) -> str:

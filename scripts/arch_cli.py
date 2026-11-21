@@ -14,7 +14,7 @@ import sys
 from arch_engine import (
     ArchEngineError, op_activate_node, op_add_node, op_collapse, op_commit_node, op_config,
     op_deactivate_node, op_export_task, op_export_ui, op_facts, op_focus, op_fold, op_fork,
-    op_ground, op_init, op_legacy, op_migrate_records, op_open_add, op_open_list,
+    op_graveyard_add, op_ground, op_init, op_legacy, op_migrate_records, op_open_add, op_open_list,
     op_open_resolve, op_rescope, op_reset_node, op_set_edge_contract, op_set_node_state,
     op_status, op_sync_manual, op_unfold, op_verify,
 )
@@ -24,7 +24,7 @@ from arch_engine.graph import (
     _node_state,
 )
 from arch_engine.records import (
-    DEFAULT_TITLES, GENERATED_MARKER, GT_LINE, GY_LINE, MD_HEADING, OPEN_KINDS, OPEN_OWNERS,
+    DEFAULT_TITLES, GENERATED_MARKER, MD_HEADING, OPEN_KINDS, OPEN_OWNERS,
     _global_fact_budget, _read_records, _save_records,
 )
 from arch_engine.refs import _extract_md_section
@@ -35,12 +35,12 @@ __all__ = [
     "main", "ArchEngineError",
     "op_activate_node", "op_add_node", "op_collapse", "op_commit_node", "op_config",
     "op_deactivate_node", "op_export_task", "op_export_ui", "op_facts", "op_focus", "op_fold",
-    "op_fork", "op_ground", "op_init", "op_legacy", "op_migrate_records", "op_open_add",
+    "op_fork", "op_graveyard_add", "op_ground", "op_init", "op_legacy", "op_migrate_records", "op_open_add",
     "op_open_list", "op_open_resolve", "op_rescope", "op_reset_node", "op_set_edge_contract",
     "op_set_node_state", "op_status", "op_sync_manual", "op_unfold", "op_verify",
     "REF_WHOLE_FILE_LIMIT", "_load_graph", "_save_graph", "_today",
     "SIGNATURE_LINE", "_find_any_node", "_find_walking_skeleton", "_node_state",
-    "DEFAULT_TITLES", "GENERATED_MARKER", "GT_LINE", "GY_LINE", "MD_HEADING",
+    "DEFAULT_TITLES", "GENERATED_MARKER", "MD_HEADING",
     "_global_fact_budget", "_read_records", "_save_records", "_extract_md_section",
 ]
 
@@ -154,7 +154,14 @@ def main() -> None:
     p_facts.add_argument("--with-superseded", action="store_true")
 
     sub.add_parser("status", help="项目进度总览：节点实现/验证、待办项、记录统计")
-    sub.add_parser("migrate-records", help="把旧格式 ground_truth.md / graveyard.md 导入 .arch/records.json（幂等）")
+    sub.add_parser("migrate-records", help="把旧格式 ground_truth.md / graveyard.md 原文切块存入 .arch/records.json 待处理（幂等）")
+
+    p_grave = sub.add_parser("graveyard", help="墓志：add 记录废弃方案（不重置节点）")
+    grave_sub = p_grave.add_subparsers(dest="grave_cmd", required=True)
+    p_gadd = grave_sub.add_parser("add")
+    p_gadd.add_argument("--node", required=True)
+    p_gadd.add_argument("--scheme", required=True, help="被废弃的方案")
+    p_gadd.add_argument("--reason", required=True)
 
     p_rescope = sub.add_parser("rescope", help="修改事实 (GT-xx) 或待办项 (OI-xx) 的作用域")
     p_rescope.add_argument("--id", required=True)
@@ -164,8 +171,8 @@ def main() -> None:
     legacy_sub = p_legacy.add_subparsers(dest="legacy_cmd", required=True)
     p_llist = legacy_sub.add_parser("list")
     p_llist.add_argument("--all", action="store_true", help="包括已处理的")
-    p_lshow = legacy_sub.add_parser("show")
-    p_lshow.add_argument("--id", required=True)
+    p_lshow = legacy_sub.add_parser("show", help="缺省显示下一条待处理记录")
+    p_lshow.add_argument("--id", default="")
     p_lres = legacy_sub.add_parser("resolve")
     p_lres.add_argument("--id", required=True)
     p_lres.add_argument("--note", default="", help="处理去向，如“拆为 GT-12、OI-03”")
@@ -250,6 +257,8 @@ def main() -> None:
             print(op_status())
         elif args.cmd == "migrate-records":
             print(op_migrate_records())
+        elif args.cmd == "graveyard":
+            print(op_graveyard_add(args.node, args.scheme, args.reason))
         elif args.cmd == "rescope":
             print(op_rescope(args.id, args.scope))
         elif args.cmd == "legacy":

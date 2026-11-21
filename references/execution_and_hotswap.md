@@ -4,7 +4,7 @@
 
 ## 1. 首次落地
 
-收到 `[WALKING_SKELETON_READY]` 后，核对本次交付通路和节点依赖。该提示表示引擎找到了至少一条无待定节点的路径。用户确认开写后，先用 `arch open list --blocking` 检查卡住开发的待办项，再按本次通路的依赖顺序使用 `arch export-task --node "$NODE_ID"` 导出单节点任务书。任务书只带 `global` 事实和该节点相关的事实、墓志、待办项，以及节点 `refs` 引用的文档章节原文；需要内联的协议章节先用 `arch set-node-state --node "$NODE_ID" --add-ref "docs/protocol.md#6"` 挂上（`#` 后写标题、章节号或 slug；JSON 文件写键路径）。开写时用 `--impl building` 标记进度。
+收到 `[WALKING_SKELETON_READY]` 后，核对本次交付通路和节点依赖。该提示表示引擎找到了至少一条无待定节点的路径。用户确认开写后，若 `status` 仍提示 `[LEGACY_RECORDS]`，先按 [SKILL.md「迁移旧项目」](../SKILL.md#五-迁移旧项目) 把迁移原文处理完，否则任务书会漏掉其中的约束；再用 `arch open list --blocking` 检查卡住开发的待办项，再按本次通路的依赖顺序使用 `arch export-task --node "$NODE_ID"` 导出单节点任务书。任务书只带 `global` 事实和该节点相关的事实、墓志、待办项，以及节点 `refs` 引用的文档章节原文；需要内联的协议章节先用 `arch set-node-state --node "$NODE_ID" --add-ref "docs/protocol.md#6"` 挂上（`#` 后写标题、章节号或 slug；JSON 文件写键路径）。开写时用 `--impl building` 标记进度。
 
 把任务书交给独立子代理，说明项目根目录、脚本绝对路径和验证范围。用端口与适配器隔离易变的外部接口，按用户和项目要求验证契约与现实环境约束。验证通过后用 `arch commit-node --node "$NODE_ID" --file-path "$IMPL_PATH"` 从目标项目根目录提交快照，`IMPL_PATH` 使用项目相对路径；节点由多个文件实现时重复 `--file-path`。提交后节点记为 `built`。按实际做过的验证用 `arch set-node-state --node "$NODE_ID" --verify unit|api|device` 记录验证程度（自动记日期，补记旧日期用 `--verify-date`）；还要用户真机实测的，用 `arch open add --kind device_test --owner user --scope "$NODE_ID"` 登记。若子代理在独立检出中实现，先将变更合入目标工作目录，再由持有目标 `.arch/` 的代理提交快照。子代理返回最多三行，说明完成项、验证结果和待处理事项。
 

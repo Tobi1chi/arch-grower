@@ -6,6 +6,7 @@ Run from the repository root:
 
 import json
 import os
+from collections import Counter
 import sys
 import tempfile
 import unittest
@@ -640,7 +641,9 @@ class FactsTest(EngineTestCase):
             arch_cli.op_verify("c", "d")
         self.assertIn("手写约束", gt.read_text(encoding="utf-8"))
         arch_cli.op_migrate_records()
-        self.assertEqual([f["constraint"] for f in _records()["facts"]], ["b", "手写约束"])
+        self.assertEqual([f["constraint"] for f in _records()["facts"]], ["b"])
+        self.assertEqual([lg["text"] for lg in _records()["legacy"]],
+                         ["- [GT-02] 手写事实 -> 架构约束：手写约束"])  # kept verbatim for the agent
         arch_cli.op_verify("c", "d")  # unblocked
         self.assertIn("记录已是最新", arch_cli.op_migrate_records())
 
@@ -762,12 +765,16 @@ class RefSectionTest(EngineTestCase):
         self.assertIn("#章节", ref["note"])
 
 
+# Shaped like a real project's records before migration: GT entries with and
+# without "-> 架构约束", a status table, nested headings, narrative with a code
+# fence that looks like list items and headings, and an empty heading.
 OLD_GROUND_TRUTH = """# 已验证现实事实与硬约束 (Ground Truth)
 
 - [GT-01] (已验证) 板子只有 2 路 UART -> 架构约束：日志走 RTT
-- [GT-02] (已验证) BLE MTU 185 -> 架构约束：分片 ≤ 180
+- [GT-02] BLE MTU 185 -> 架构约束：分片 ≤ 180
   补充：Android 12 以下默认 23
-  - 证据 analysis/mtu/case.json#mtu
+- [GT-03] 用户授权按已确认架构开发，不再逐项确认。
+- [GT-05] 原生“小雷小雷”连续交互复用本机Agent对话。
 
 ## 实现状态
 
@@ -775,12 +782,17 @@ OLD_GROUND_TRUTH = """# 已验证现实事实与硬约束 (Ground Truth)
 | --- | --- |
 | ble | 已实现，未实测 |
 
-## 硬件约束
-- [GT-03] (已验证) 电池 300mAh -> 架构约束：常驻功耗 < 5mA
+## 调查记录
+### 2026-10 延迟
+先试了 A，指标 X=3.2，
 
-2026-10 的长段调查：先试了 A，指标 X=3.2，
 又试了 B，指标 X=2.9。
-- [GT-01] (已验证) 编号重复但内容不同 -> 架构约束：另一条约束
+```text
+- 不是条目
+# 也不是标题
+```
+1. 结论：选 B
+## 空标题
 """
 
 OLD_GRAVEYARD = """# 踩坑记录
@@ -789,6 +801,21 @@ OLD_GRAVEYARD = """# 踩坑记录
 - ❌ [节点 entry_input / 经典蓝牙] 废弃原因：iOS 不支持
 随手记的一句话
 """
+
+EXPECTED_CHUNKS = [
+    ("ground_truth.md", "", "- [GT-01] (已验证) 板子只有 2 路 UART -> 架构约束：日志走 RTT"),
+    ("ground_truth.md", "", "- [GT-02] BLE MTU 185 -> 架构约束：分片 ≤ 180\n  补充：Android 12 以下默认 23"),
+    ("ground_truth.md", "", "- [GT-03] 用户授权按已确认架构开发，不再逐项确认。"),
+    ("ground_truth.md", "", "- [GT-05] 原生“小雷小雷”连续交互复用本机Agent对话。"),
+    ("ground_truth.md", "## 实现状态", "| 模块 | 状态 |\n| --- | --- |\n| ble | 已实现，未实测 |"),
+    ("ground_truth.md", "## 调查记录 / ### 2026-10 延迟",
+     "先试了 A，指标 X=3.2，\n\n又试了 B，指标 X=2.9。\n```text\n- 不是条目\n# 也不是标题\n```"),
+    ("ground_truth.md", "## 调查记录 / ### 2026-10 延迟", "1. 结论：选 B"),
+    ("ground_truth.md", "", "## 空标题"),
+    ("graveyard.md", "", "- ❌ [节点 core_transform / 本地 Tesseract / OCR] 废弃原因：识别率不足 70%"),
+    ("graveyard.md", "", "- ❌ [节点 entry_input / 经典蓝牙] 废弃原因：iOS 不支持"),
+    ("graveyard.md", "", "随手记的一句话"),
+]
 
 
 class MigrationTest(EngineTestCase):
@@ -800,62 +827,57 @@ class MigrationTest(EngineTestCase):
         Path(".arch/ground_truth.md").write_text(OLD_GROUND_TRUTH, encoding="utf-8")
         Path(".arch/graveyard.md").write_text(OLD_GRAVEYARD, encoding="utf-8")
 
+    def legacy(self) -> list:
+        return [(lg["source"], lg["section"], lg["text"]) for lg in _records()["legacy"]]
+
     def test_unmigrated_project_keeps_working_the_old_way(self) -> None:
         out = arch_cli.op_focus()
-        self.assertIn("长段调查", out)
+        self.assertIn("又试了 B", out)
         self.assertIn("随手记的一句话", out)
         self.assertIn("migrate-records", out)
         self.collapse("entry_input")
         task = json.loads(arch_cli.op_export_task("entry_input"))
-        self.assertIn("长段调查", task["global_ground_truth"])
+        self.assertIn("又试了 B", task["global_ground_truth"])
         self.assertIn("migrate-records", task["records_hint"])
         arch_cli.op_verify("新事实", "新约束")
         self.assertIn("新约束", Path(".arch/ground_truth.md").read_text(encoding="utf-8"))
         self.assertFalse(Path(".arch/records.json").exists())
         for call in (lambda: arch_cli.op_open_add("q", "research", "user"),
                      lambda: arch_cli.op_facts(),
+                     lambda: arch_cli.op_graveyard_add("entry_input", "s", "r"),
                      lambda: arch_cli.op_verify("x", "y", scope="entry_input")):
             with self.assertRaisesRegex(arch_cli.ArchEngineError, "migrate-records"):
                 call()
         self.assertIn("RECORDS_NOT_MIGRATED", arch_cli.op_status())
 
-    def test_migration_is_lossless(self) -> None:
+    def test_everything_becomes_small_legacy_chunks(self) -> None:
         out = arch_cli.op_migrate_records()
-        self.assertIn("事实 4 条", out)
-        self.assertIn("墓志 2 条", out)
-        self.assertIn("未分类遗留 3 条", out)
+        self.assertIn("原文切为 11 条待处理记录", out)
+        self.assertIn("legacy resolve --id LG-xx", out)       # the guide comes with the result
+        self.assertIn("--supersedes", out)
         rec = _records()
-        dump = json.dumps(rec, ensure_ascii=False)
-        for name, text in (("gt", OLD_GROUND_TRUTH), ("gy", OLD_GRAVEYARD)):
+        self.assertEqual((rec["facts"], rec["graveyard"]), ([], []))  # nothing is interpreted
+        self.assertEqual(self.legacy(), EXPECTED_CHUNKS)
+        self.assertTrue(all(lg["status"] == "open" for lg in rec["legacy"]))
+        self.assertTrue(Path(".arch/ground_truth.md").read_text(encoding="utf-8").startswith(arch_cli.GENERATED_MARKER))
+
+    def test_migration_is_lossless(self) -> None:
+        arch_cli.op_migrate_records()
+        chunks = _records()["legacy"]
+        chunk_lines = Counter(ln for lg in chunks for ln in lg["text"].splitlines() if ln.strip())
+        headings = {h for lg in chunks for h in lg["section"].split(" / ") if h}
+        original = Counter()
+        for text in (OLD_GROUND_TRUTH, OLD_GRAVEYARD):
+            in_fence = False
             for line in text.splitlines():
-                stripped = line.strip()
-                if not stripped or stripped in arch_cli.DEFAULT_TITLES:
+                if line.startswith("```"):
+                    in_fence = not in_fence
+                if not line.strip() or line.strip() in arch_cli.DEFAULT_TITLES:
                     continue
-                fm, gm = arch_cli.GT_LINE.match(line), arch_cli.GY_LINE.match(line)
-                heading = arch_cli.MD_HEADING.match(line)
-                pieces = (fm.groups()[1:] if fm else gm.groups() if gm
-                          else [heading.group(2)] if heading else [stripped])
-                for piece in [x for x in pieces if x]:
-                    with self.subTest(file=name, line=line, piece=piece):
-                        self.assertIn(json.dumps(piece, ensure_ascii=False)[1:-1], dump)
-
-        facts = {f["id"]: f for f in rec["facts"]}
-        self.assertEqual(facts["GT-02"]["detail"], "补充：Android 12 以下默认 23\n- 证据 analysis/mtu/case.json#mtu")
-        self.assertEqual(facts["GT-03"]["section"], "硬件约束")
-        self.assertEqual((facts["GT-04"]["legacy_id"], facts["GT-04"]["constraint"]), ("GT-01", "另一条约束"))
-        self.assertTrue(all(f["scope"] == ["global"] for f in facts.values()))
-        graves = rec["graveyard"]
-        self.assertEqual([(g["node"], g["scheme"]) for g in graves],
-                         [("core_transform", "本地 Tesseract / OCR"), ("entry_input", "经典蓝牙")])
-        legacy = rec["legacy"]
-        self.assertEqual([lg["source"] for lg in legacy], ["ground_truth.md", "ground_truth.md", "graveyard.md"])
-        self.assertTrue(legacy[0]["text"].startswith("## 实现状态\n\n| 模块 | 状态 |"))
-
-        # Rendered md still shows everything that has not been dealt with.
-        gt = Path(".arch/ground_truth.md").read_text(encoding="utf-8")
-        self.assertTrue(gt.startswith(arch_cli.GENERATED_MARKER))
-        self.assertIn("又试了 B", gt)
-        self.assertIn("| ble | 已实现，未实测 |", gt)
+                if not in_fence and arch_cli.MD_HEADING.match(line) and line in headings:
+                    continue  # kept as the section of the chunks below it
+                original[line] += 1
+        self.assertEqual(chunk_lines, original)
 
     def test_migration_is_idempotent(self) -> None:
         arch_cli.op_migrate_records()
@@ -864,123 +886,74 @@ class MigrationTest(EngineTestCase):
         self.assertIn("记录已是最新", arch_cli.op_migrate_records())
         self.assertEqual(Path(".arch/records.json").read_text(encoding="utf-8"), before)
         self.assertEqual(Path(".arch/ground_truth.md").read_text(encoding="utf-8"), md_before)
-        # An old md restored over the generated one imports nothing twice.
+        # An old md restored over the generated one imports nothing twice,
+        # including chunks that were already handled.
+        arch_cli.op_legacy("resolve", "LG-01", "拆为 GT-01")
         Path(".arch/ground_truth.md").write_text(OLD_GROUND_TRUTH, encoding="utf-8")
         out = arch_cli.op_migrate_records()
-        self.assertIn("跳过重复", out)
-        self.assertEqual(len(_records()["facts"]), 4)
-        self.assertEqual(len(_records()["legacy"]), 3)
+        self.assertIn("跳过重复 8 条", out)
+        self.assertEqual(len(_records()["legacy"]), 11)
+        # A line added to the generated md by hand becomes one more chunk.
+        gt = Path(".arch/ground_truth.md")
+        gt.write_text(gt.read_text(encoding="utf-8") + "- 手写的新条目\n", encoding="utf-8")
+        self.assertIn("原文切为 1 条", arch_cli.op_migrate_records())
+        self.assertEqual(self.legacy()[-1], ("ground_truth.md", "", "- 手写的新条目"))
 
-    def test_legacy_records_show_up_until_resolved(self) -> None:
+    def test_agent_works_through_the_chunks(self) -> None:
         arch_cli.op_migrate_records()
-        status = arch_cli.op_status()
-        self.assertIn("[LEGACY_RECORDS] 3 条", status)
-        self.assertIn("3 条未分类遗留记录", arch_cli.op_focus())
-        self.assertIn("LG-02", arch_cli.op_legacy("list"))
-        self.assertIn("又试了 B", arch_cli.op_legacy("show", "LG-02"))
-        arch_cli.op_verify("方案 B 指标 X=2.9", "选 B", scope="entry_input", source="legacy LG-02")
-        self.assertIn("剩余待处理 2 条", arch_cli.op_legacy("resolve", "LG-02", "拆为 GT-05"))
-        self.assertNotIn("又试了 B", Path(".arch/ground_truth.md").read_text(encoding="utf-8"))
-        self.assertIn("又试了 B", Path(".arch/records.json").read_text(encoding="utf-8"))
-        self.assertIn("[LEGACY_RECORDS] 2 条", arch_cli.op_status())
+        self.assertIn("[LEGACY_RECORDS] 还有 11 条", arch_cli.op_status())
+        self.assertIn("[LEGACY_RECORDS] 还有 11 条", arch_cli.op_focus())
+        shown = arch_cli.op_legacy("show")                      # next open chunk
+        self.assertIn("[LG-01] 来自 ground_truth.md", shown)
+        self.assertIn("日志走 RTT", shown)
+        self.assertIn("legacy resolve --id LG-01", shown)
+        self.assertIn("graveyard add", arch_cli.op_legacy("list"))
+
+        arch_cli.op_verify("板子只有 2 路 UART", "日志走 RTT", scope="entry_input", source="legacy LG-01")
+        self.assertIn("剩余待处理 10 条", arch_cli.op_legacy("resolve", "LG-01", "拆为 GT-01"))
+        self.assertIn("[LG-02]", arch_cli.op_legacy("show"))
+        arch_cli.op_graveyard_add("core_transform", "本地 Tesseract / OCR", "识别率不足 70%")
+        arch_cli.op_legacy("resolve", "LG-09", "拆为 GY-01")
+
+        gt = Path(".arch/ground_truth.md").read_text(encoding="utf-8")
+        self.assertIn("又试了 B", gt)                            # pending text stays visible
+        self.assertNotIn("- [GT-01] (已验证)", gt)                # handled chunk leaves the md
+        self.assertIn("- [GT-01] 板子只有 2 路 UART -> 架构约束：日志走 RTT", gt)
+        self.assertIn("(已验证) 板子只有 2 路 UART", Path(".arch/records.json").read_text(encoding="utf-8"))
+        self.assertIn("识别率不足", arch_cli.op_focus("core_transform"))
+
+        for lg in _records()["legacy"]:
+            if lg["status"] == "open":
+                arch_cli.op_legacy("resolve", lg["id"], "测试：无用")
+        self.assertIn("没有待处理", arch_cli.op_legacy("list"))
+        self.assertIn("迁移已完成", arch_cli.op_legacy("show"))
+        self.assertNotIn("LEGACY_RECORDS", arch_cli.op_status())
+        self.assertIn("LG-01", arch_cli.op_legacy("list", include_resolved=True))
 
     def test_after_migration_focus_slices(self) -> None:
         arch_cli.op_migrate_records()
         out = arch_cli.op_focus("final_output")
-        self.assertNotIn("长段调查", out)               # legacy text is no longer concatenated
-        self.assertIn("识别率不足", out)                # graveyard of the neighbour core_transform
-        self.assertNotIn("iOS 不支持", out)             # graveyard of a node two hops away
-        self.assertIn("日志走 RTT", out)                # migrated facts start global
+        self.assertNotIn("又试了 B", out)                # migrated text is no longer concatenated
+        self.assertNotIn("日志走 RTT", out)
         self.assertNotIn("RECORDS_NOT_MIGRATED", out)
+        self.assertIn("[LEGACY_RECORDS]", out)
 
     def test_reinit_over_old_md_does_not_migrate_silently(self) -> None:
         arch_cli.op_init("again")
         self.assertFalse(Path(".arch/records.json").exists())
-        self.assertIn("长段调查", Path(".arch/ground_truth.md").read_text(encoding="utf-8"))
+        self.assertIn("又试了 B", Path(".arch/ground_truth.md").read_text(encoding="utf-8"))
 
 
-GT_WITHOUT_ARROWS = """# 已验证现实事实与硬约束 (Ground Truth)
-
-- [GT-01] (已验证) 板子只有 2 路 UART -> 架构约束：日志走 RTT
-- [GT-02] BLE MTU 185 -> 架构约束：分片 ≤ 180
-- [GT-03] 用户授权按已确认架构开发，不再逐项确认。
-- [GT-04] (已验证) 唤醒词经真机验证可用
-- [GT-05] 原生“小雷小雷”连续交互复用本机Agent对话。
-- [GT-06]（已验证）全角括号也算已验证标记
-- [GT-07] 第七条
-  缩进的补充说明
-状态表之类的叙述
-"""
-
-
-class GtWithoutConstraintTest(EngineTestCase):
-    """Real projects carry GT entries without "-> 架构约束：" (OpenRayneo GT-03 / GT-05)."""
-
-    def setUp(self) -> None:
-        super().setUp()
-        Path(".arch/records.json").unlink()
-        Path(".arch/open_items.md").unlink()
-        Path(".arch/ground_truth.md").write_text(GT_WITHOUT_ARROWS, encoding="utf-8")
-
-    def test_every_gt_line_is_its_own_fact(self) -> None:
-        arch_cli.op_migrate_records()
-        rec = _records()
-        got = [(f["id"], f["text"], f["constraint"]) for f in rec["facts"]]
-        self.assertEqual(got, [
-            ("GT-01", "板子只有 2 路 UART", "日志走 RTT"),
-            ("GT-02", "BLE MTU 185", "分片 ≤ 180"),
-            ("GT-03", "用户授权按已确认架构开发，不再逐项确认。", ""),
-            ("GT-04", "唤醒词经真机验证可用", ""),
-            ("GT-05", "原生“小雷小雷”连续交互复用本机Agent对话。", ""),
-            ("GT-06", "全角括号也算已验证标记", ""),
-            ("GT-07", "第七条", ""),
-        ])
-        self.assertEqual(rec["facts"][6]["detail"], "缩进的补充说明")
-        self.assertEqual([lg["text"] for lg in rec["legacy"]], ["状态表之类的叙述"])
-
-    def test_facts_without_constraint_display_cleanly(self) -> None:
-        arch_cli.op_migrate_records()
-        arch_cli.op_rescope("GT-03", "entry_input")
-        focus = arch_cli.op_focus("entry_input")
-        self.assertIn("- [GT-03] 用户授权按已确认架构开发，不再逐项确认。（作用域 entry_input）", focus)
-        self.assertIn("- [GT-05] 原生“小雷小雷”连续交互复用本机Agent对话。\n", focus)
-        self.assertNotIn("架构约束：\n", focus)
-        self.assertNotIn("架构约束：（", focus)
-        self.assertIn("- [GT-04] 唤醒词经真机验证可用", arch_cli.op_facts())
-        md = Path(".arch/ground_truth.md").read_text(encoding="utf-8")
-        self.assertIn("- [GT-05] 原生“小雷小雷”连续交互复用本机Agent对话。\n", md)
-        self.assertIn("记录已是最新", arch_cli.op_migrate_records())
-        self.assertEqual(len(_records()["facts"]), 7)
-
-    def test_project_migrated_by_the_old_parser_recovers_its_facts(self) -> None:
-        # What the previous parser produced: GT-01/02 as facts, the rest as
-        # one legacy block that swallowed several adjacent GT lines.
-        arch_cli.op_migrate_records()
-        rec = _records()
-        merged = "\n".join(GT_WITHOUT_ARROWS.splitlines()[4:])  # GT-03 .. narrative
-        rec["facts"] = rec["facts"][:2]
-        rec["legacy"] = [{"id": "LG-01", "source": "ground_truth.md", "section": "", "text": merged,
-                          "status": "open", "note": "", "imported": "2026-11-20"}]
-        Path(".arch/records.json").write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        arch_cli._save_records(arch_cli._read_records())  # re-render the md as that version would
-
-        out = arch_cli.op_migrate_records()
-        self.assertIn("LG-01 → GT-03、GT-04、GT-05、GT-06、GT-07、LG-02", out)
-        rec = _records()
-        self.assertEqual([f["id"] for f in rec["facts"]], [f"GT-0{i}" for i in range(1, 8)])
-        self.assertTrue(all(f.get("from_legacy") == "LG-01" for f in rec["facts"][2:]))
-        lg1, lg2 = rec["legacy"]
-        self.assertEqual((lg1["status"], lg1["text"]), ("resolved", merged))   # original kept verbatim
-        self.assertEqual((lg2["status"], lg2["text"]), ("open", "状态表之类的叙述"))
-
-        before = Path(".arch/records.json").read_text(encoding="utf-8")
-        self.assertIn("记录已是最新", arch_cli.op_migrate_records())
-        self.assertEqual(Path(".arch/records.json").read_text(encoding="utf-8"), before)
-
-    def test_new_facts_with_constraints_are_unchanged(self) -> None:
-        arch_cli.op_migrate_records()
-        out = arch_cli.op_verify("新事实", "新约束", scope="entry_input")
-        self.assertIn("-> 架构约束：新约束", out)
+class GraveyardAddTest(EngineTestCase):
+    def test_records_without_resetting_the_node(self) -> None:
+        self.collapse("entry_input")
+        out = arch_cli.op_graveyard_add("entry_input", "经典蓝牙", "iOS 不支持")
+        self.assertIn("- ❌ [节点 entry_input / 经典蓝牙] 废弃原因：iOS 不支持", out)
+        self.assertEqual(_node("entry_input")["status"], "solid")
+        self.assertEqual(_records()["graveyard"][0]["id"], "GY-01")
+        self.assertIn("iOS 不支持", Path(".arch/graveyard.md").read_text(encoding="utf-8"))
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "不存在"):
+            arch_cli.op_graveyard_add("nope", "s", "r")
 
 
 class ForkKeepsRecordsTest(EngineTestCase):
@@ -999,7 +972,7 @@ class ForkKeepsRecordsTest(EngineTestCase):
 class McpToolsTest(EngineTestCase):
     def test_new_tools_are_listed_and_dispatch(self) -> None:
         names = {t["name"] for t in arch_mcp.TOOLS}
-        for name in ("arch_set_node_state", "arch_open", "arch_facts", "arch_status",
+        for name in ("arch_set_node_state", "arch_open", "arch_facts", "arch_status", "arch_graveyard_add",
                      "arch_migrate_records", "arch_rescope", "arch_legacy", "arch_config"):
             self.assertIn(name, names)
         arch_mcp._dispatch_tool("arch_set_node_state", {"node_id": "entry_input", "impl": "building"})

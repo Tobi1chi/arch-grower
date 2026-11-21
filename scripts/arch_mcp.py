@@ -270,10 +270,24 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "name": "arch_migrate_records",
         "description": (
-            "把旧格式 ground_truth.md / graveyard.md 导入 .arch/records.json（幂等）。标准条目转为事实 / 墓志，"
-            "其余段落原样保存为未分类遗留记录，需与用户逐条处理（arch_legacy）。"
+            "把旧格式 ground_truth.md / graveyard.md 原文按条目 / 标题切块，一字不改地存为待处理记录（幂等）。"
+            "引擎不做分类：之后逐条 arch_legacy show，按类型用 arch_verify / arch_graveyard_add / arch_open / "
+            "arch_set_node_state 记录，再 arch_legacy resolve；列表为空才算迁移完成。"
         ),
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "arch_graveyard_add",
+        "description": "记入一条墓志（被废弃的方案与原因），不重置节点。迁移旧墓志时使用；实现踩坑需要换方案时用 arch_reset_node。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string"},
+                "scheme": {"type": "string", "description": "被废弃的方案"},
+                "reason": {"type": "string", "description": "废弃原因"},
+            },
+            "required": ["node_id", "scheme", "reason"],
+        },
     },
     {
         "name": "arch_rescope",
@@ -289,12 +303,15 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "arch_legacy",
-        "description": "未分类遗留记录：action=list 列出，show 看全文，resolve 标记已处理（原文仍保留在 records.json）。",
+        "description": (
+            "迁移原文（LG-xx）：action=list 列出并给出处理步骤，show 看全文（不传 id 显示下一条待处理），"
+            "resolve 标记已处理并在 note 写明拆成了哪些记录（原文仍保留在 records.json）。"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["list", "show", "resolve"]},
-                "id": {"type": "string", "description": "show / resolve：LG-xx"},
+                "id": {"type": "string", "description": "show（可选）/ resolve：LG-xx"},
                 "note": {"type": "string", "description": "resolve：处理去向，如“拆为 GT-12、OI-03”"},
                 "include_resolved": {"type": "boolean", "description": "list：包括已处理的"},
             },
@@ -507,6 +524,8 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
         return engine.op_migrate_records()
     if name == "arch_rescope":
         return engine.op_rescope(args["id"], args["scope"])
+    if name == "arch_graveyard_add":
+        return engine.op_graveyard_add(args["node_id"], args["scheme"], args["reason"])
     if name == "arch_legacy":
         return engine.op_legacy(
             args.get("action", "list"), args.get("id", ""), args.get("note", ""), bool(args.get("include_resolved")),

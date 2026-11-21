@@ -35,15 +35,37 @@ OWNER_TEXT = {"user": "用户处理", "agent": "代理处理"}
 
 NOT_MIGRATED_HINT = (
     "[RECORDS_NOT_MIGRATED] 本项目的 ground_truth.md / graveyard.md 还是旧格式，focus 与 export-task "
-    "会全文拼接。运行 arch migrate-records 可转为结构化记录，之后按节点只带相关内容。"
+    "会全文拼接。征得用户同意后运行 arch migrate-records：原文会切块存为待处理记录，"
+    "再按 SKILL.md「迁移旧项目」逐条分类，之后 focus 只带与当前节点相关的内容。"
 )
 
-# A fact line: `- [GT-xx] (已验证) text -> 架构约束：constraint`. The "(已验证)"
-# tag and the constraint part are optional; group 3 is None without an arrow.
-GT_LINE = re.compile(
-    r"^[-*]\s+\[(GT-[^\]\s]+)\]\s*(?:[(（]已验证[)）]\s*)?(.*?)(?:\s*->\s*架构约束\s*[：:]\s*(.*))?$"
-)
-GY_LINE = re.compile(r"^[-*]\s+❌\s*\[节点\s+([^\s/\]]+)\s*/\s*(.*)\]\s*废弃原因\s*[：:]\s*(.*)$")
+# Shown after migrate-records and by `legacy list`; SKILL.md "迁移旧项目" says the same.
+LEGACY_GUIDE = """\
+迁移旧项目：逐条处理待处理记录（LG-xx），一次处理一条。
+1. arch legacy show 显示下一条原文、来源文件和所在标题（或 --id LG-xx 指定）。
+2. 判断内容类型并记录，一条原文可以拆成多条：
+   - 决策与硬约束 → arch verify --fact --constraint --scope <节点ID或阶段名> [--source 证据路径]
+     只有对所有节点都成立才省略 --scope（即 global）；与已有事实矛盾或更新它时加 --supersedes GT-xx。
+     改写用户确认过的约束时保持原意，不要加减条件。
+   - 废弃方案 → arch graveyard add --node <节点ID> --scheme <方案> --reason <原因>
+   - 待实测 / 待调研 / 待决策 → arch open add --question --kind device_test|research|decision --owner user|agent --scope <节点> [--blocking]
+   - 实现进度、验证程度、文档引用、实现文件 → arch set-node-state --node <节点ID> --impl/--verify/--add-ref/--file-path
+   - 流程规则（怎么提交、怎么评审等）→ 移到项目的 AGENTS.md，不进 arch 记录
+   - 调查过程 → 只把结论记为事实，用 --source 指向证据，不抄过程
+   - 过时、重复或无用 → 不记录
+3. arch legacy resolve --id LG-xx --note "拆为 GT-12、OI-03"（不记录的写明原因，如“过时：已被 GT-08 取代”）。
+4. arch legacy list 为空才算迁移完成。原文始终保留在 records.json，可用 legacy list --all / legacy show --id 对照。"""
+
+
+def legacy_hint(count: int) -> str:
+    """One line for focus / status while migrated text is still unprocessed."""
+    return (
+        f"[LEGACY_RECORDS] 还有 {count} 条迁移原文待处理：arch legacy show 读下一条，按类型用 "
+        "verify --scope / graveyard add / open add / set-node-state 记录（流程规则移到项目 AGENTS.md），"
+        "再 legacy resolve --id LG-xx --note \"拆为 ...\"；legacy list 为空才算迁移完成。"
+    )
+
+
 MD_HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 
 

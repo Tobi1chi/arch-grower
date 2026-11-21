@@ -1,19 +1,27 @@
-"""migrate-records: turn old-format md records into typed records, losslessly."""
+"""migrate-records: store old-format md records verbatim as legacy chunks.
 
-import textwrap
+The engine does not interpret old ground_truth.md / graveyard.md. Only the
+agent, having read a chunk, can tell its scope and type, so every chunk goes
+into `legacy` and the agent classifies it with the record commands
+(see LEGACY_GUIDE and SKILL.md "迁移旧项目").
+"""
+
+import re
 from collections import Counter
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Tuple
 
 from .common import (
     ARCH_DIR, ArchEngineError, GRAVEYARD_FILE, GROUND_TRUTH_FILE, OPEN_ITEMS_FILE, RECORDS_FILE,
     _shadow_commit, _today,
 )
 from .records import (
-    DEFAULT_TITLES, GENERATED_MARKER, GT_LINE, GY_LINE, MD_HEADING, _budget_warning,
-    _md_is_boilerplate, _new_records, _next_id, _pending_md_edits, _read_records,
-    _records_enabled, _rendered_files, _save_records,
+    DEFAULT_TITLES, GENERATED_MARKER, LEGACY_GUIDE, MD_HEADING, _md_is_boilerplate, _new_records,
+    _next_id, _pending_md_edits, _read_records, _records_enabled, _rendered_files, _save_records,
 )
+
+ITEM_LINE = re.compile(r"^(?:[-*+]|\d+[.)])\s+\S")
+FENCE = re.compile(r"^\s*(```|~~~)")
 
 
 def _strip_blank_edges(lines: List[str]) -> List[str]:
@@ -25,61 +33,85 @@ def _strip_blank_edges(lines: List[str]) -> List[str]:
     return lines[start:end]
 
 
-def _parse_md_records(text: str) -> Dict[str, List[Dict[str, Any]]]:
-    """Split an old-format md file into facts, graveyard entries and legacy blocks.
+def _chunk_md(text: str) -> List[Dict[str, str]]:
+    """Cut an md file into chunks small enough to classify one at a time.
 
-    Recognised entries take indented lines directly below them as `detail`.
-    Everything else is kept verbatim as legacy blocks, split at headings; a
-    heading followed straight by entries becomes their `section` instead.
-    Only the engine's own default titles and the generated-file marker are
-    dropped, so no content is lost.
+    Each top-level list item (with its indented continuation lines) is one
+    chunk; other content (tables, narrative, code) is one chunk per heading.
+    A chunk's `section` is the path of headings above it, kept verbatim
+    (e.g. "## 实现状态 / ### 硬件"); a heading with no content under it becomes
+    a chunk of its own. Only the engine's default titles and the generated
+    marker are dropped, so every other character ends up in a chunk.
     """
-    facts: List[Dict[str, Any]] = []
-    graves: List[Dict[str, Any]] = []
-    legacy: List[Dict[str, Any]] = []
+    chunks: List[Dict[str, str]] = []
+    stack: List[List[Any]] = []          # open headings: [level, raw line, used]
     block: List[str] = []
-    section = ""
-    last: Optional[Dict[str, Any]] = None
+    kind = ""                            # "", "item" or "para"
+    fence = ""
 
-    def flush(next_is_entry: bool) -> None:
+    def emit(lines: List[str]) -> None:
+        chunks.append({"text": "\n".join(lines), "section": " / ".join(h[1] for h in stack)})
+        for h in stack:
+            h[2] = True
+
+    def flush() -> None:
+        nonlocal kind
         lines = _strip_blank_edges(block)
         block.clear()
-        if not lines:
-            return
-        if next_is_entry and len(lines) == 1 and MD_HEADING.match(lines[0]):
-            return  # kept as the `section` of the entries that follow
-        legacy.append({"text": "\n".join(lines), "section": section})
+        kind = ""
+        if lines:
+            emit(lines)
+
+    def close_headings(level: int) -> None:
+        while stack and stack[-1][0] >= level:
+            level_, raw, used = stack.pop()
+            if not used:
+                emit([raw])
 
     for raw in text.splitlines():
         stripped = raw.strip()
+        if fence:
+            block.append(raw)
+            if stripped.startswith(fence):
+                fence = ""
+            continue
         if stripped == GENERATED_MARKER or stripped in DEFAULT_TITLES:
             continue
-        if last is not None and stripped and raw[:1] in (" ", "\t"):
-            last["_detail"].append(raw)
+        mark = FENCE.match(raw)
+        if mark and not (kind == "item" and raw[:1] in (" ", "\t")):
+            if kind != "para":
+                flush()
+                kind = "para"
+            block.append(raw)
+            fence = mark.group(1)
             continue
-        last = None
-        fm, gm = GT_LINE.match(raw), GY_LINE.match(raw)
-        if fm or gm:
-            flush(True)
-            if fm:
-                last = {"legacy_id": fm.group(1), "text": fm.group(2).strip(),
-                        "constraint": (fm.group(3) or "").strip(), "section": section, "_detail": []}
-                facts.append(last)
-            else:
-                last = {"node": gm.group(1), "scheme": gm.group(2).strip(),
-                        "reason": gm.group(3).strip(), "section": section, "_detail": []}
-                graves.append(last)
+        if mark:  # fence indented under a list item belongs to the item
+            block.append(raw)
+            fence = mark.group(1)
             continue
         heading = MD_HEADING.match(raw)
         if heading:
-            flush(False)
-            section = heading.group(2)
+            flush()
+            close_headings(len(heading.group(1)))
+            stack.append([len(heading.group(1)), stripped, False])
+            continue
+        if ITEM_LINE.match(raw):
+            flush()
+            kind = "item"
+            block.append(raw)
+            continue
+        if kind == "item" and (not stripped or raw[:1] in (" ", "\t")):
+            block.append(raw)
+            continue
+        if kind != "para":
+            if not stripped:
+                continue
+            flush()
+            kind = "para"
         block.append(raw)
-    flush(False)
-
-    for entry in facts + graves:
-        entry["detail"] = textwrap.dedent("\n".join(entry.pop("_detail"))).strip("\n")
-    return {"facts": facts, "graveyard": graves, "legacy": legacy}
+    flush()
+    close_headings(0)
+    return chunks
 
 
 def _added_lines(text: str, expected: str) -> str:
@@ -94,90 +126,28 @@ def _added_lines(text: str, expected: str) -> str:
     return "\n".join(kept)
 
 
-def _merge_parsed(rec: Dict[str, Any], parsed: Dict[str, List[Dict[str, Any]]],
-                  source: str, stats: Counter) -> None:
-    norm = lambda s: " ".join(str(s).split())
-    fact_keys = {(norm(f["text"]), norm(f["constraint"]), norm(f.get("detail", ""))) for f in rec["facts"]}
-    for f in parsed["facts"]:
-        key = (norm(f["text"]), norm(f["constraint"]), norm(f["detail"]))
-        if key in fact_keys:
+def _import_chunks(rec: Dict[str, Any], chunks: List[Dict[str, str]], source: str, stats: Counter) -> None:
+    """Append chunks as open legacy records; a chunk already stored (same file,
+    section and text, handled or not) is skipped, which keeps migration idempotent."""
+    known = {(lg.get("source"), lg.get("section", ""), lg["text"]) for lg in rec["legacy"]}
+    for chunk in chunks:
+        key: Tuple[str, str, str] = (source, chunk["section"], chunk["text"])
+        if key in known:
             stats["skipped"] += 1
             continue
-        fact_keys.add(key)
-        used = {x["id"] for x in rec["facts"]}
-        fid = f["legacy_id"] if f["legacy_id"] not in used else _next_id(rec["facts"], "GT")
-        entry = {"id": fid, "scope": ["global"], "text": f["text"], "constraint": f["constraint"],
-                 "source": "", "date": "", "supersedes": [], "detail": f["detail"], "imported_from": source}
-        if fid != f["legacy_id"]:
-            entry["legacy_id"] = f["legacy_id"]
-        if f["section"]:
-            entry["section"] = f["section"]
-        rec["facts"].append(entry)
-        stats["facts"] += 1
-
-    grave_keys = {(norm(g["node"]), norm(g["scheme"]), norm(g["reason"]), norm(g.get("detail", "")))
-                  for g in rec["graveyard"]}
-    for g in parsed["graveyard"]:
-        key = (norm(g["node"]), norm(g["scheme"]), norm(g["reason"]), norm(g["detail"]))
-        if key in grave_keys:
-            stats["skipped"] += 1
-            continue
-        grave_keys.add(key)
-        entry = {"id": _next_id(rec["graveyard"], "GY"), "node": g["node"], "scheme": g["scheme"],
-                 "reason": g["reason"], "date": "", "detail": g["detail"], "imported_from": source}
-        if g["section"]:
-            entry["section"] = g["section"]
-        rec["graveyard"].append(entry)
-        stats["graveyard"] += 1
-
-    legacy_keys = {(lg.get("source"), lg["text"]) for lg in rec["legacy"]}
-    for lg in parsed["legacy"]:
-        if (source, lg["text"]) in legacy_keys:
-            stats["skipped"] += 1
-            continue
-        legacy_keys.add((source, lg["text"]))
+        known.add(key)
         rec["legacy"].append({"id": _next_id(rec["legacy"], "LG"), "source": source,
-                              "section": lg["section"], "text": lg["text"], "status": "open",
+                              "section": chunk["section"], "text": chunk["text"], "status": "open",
                               "note": "", "imported": _today()})
         stats["legacy"] += 1
 
 
-def _reparse_legacy(rec: Dict[str, Any], stats: Counter) -> List[str]:
-    """Split open legacy records that the current parser now understands.
-
-    A legacy block holding entries (e.g. GT lines without "-> 架构约束", which
-    older versions did not recognise) becomes those entries plus whatever is
-    left as new legacy blocks; the original block is marked resolved and kept
-    verbatim. Blocks with no entries are left untouched, so this is idempotent.
-    """
-    notes = []
-    for lg in [x for x in rec["legacy"] if x.get("status") != "resolved"]:
-        parsed = _parse_md_records(lg["text"])
-        if not parsed["facts"] and not parsed["graveyard"]:
-            continue
-        for item in parsed["facts"] + parsed["graveyard"] + parsed["legacy"]:
-            item["section"] = item["section"] or lg.get("section", "")
-        known = {x["id"] for key in ("facts", "graveyard", "legacy") for x in rec[key]}
-        _merge_parsed(rec, parsed, lg["source"], stats)
-        new_ids = [x["id"] for key in ("facts", "graveyard", "legacy") for x in rec[key] if x["id"] not in known]
-        for key in ("facts", "graveyard", "legacy"):
-            for x in rec[key]:
-                if x["id"] in new_ids:
-                    x["from_legacy"] = lg["id"]
-        lg["status"] = "resolved"
-        lg["resolved_at"] = _today()
-        lg["note"] = "migrate-records 重新解析为 " + ("、".join(new_ids) or "已有条目（内容重复）")
-        notes.append(f"{lg['id']} → {'、'.join(new_ids) or '已有条目'}")
-    return notes
-
-
 def op_migrate_records() -> str:
-    """Convert md records into .arch/records.json, then render the md from it.
+    """Store old md records in .arch/records.json as legacy chunks, then render the md.
 
-    Idempotent: entries already present (same content) are skipped, and a
-    generated md that nobody edited contributes nothing. Lines added by hand
-    to a generated md are imported too. Open legacy records that contain
-    recognisable entries are split into them (see _reparse_legacy).
+    Idempotent: chunks already stored are skipped, and a generated md that
+    nobody edited contributes nothing. Lines added by hand to a generated md
+    are chunked and stored too.
     """
     if not ARCH_DIR.exists():
         raise ArchEngineError("未找到 .arch/ 目录。请在持有 .arch/ 的项目根目录执行。")
@@ -185,7 +155,6 @@ def op_migrate_records() -> str:
     rec = _new_records() if first_time else _read_records()
     expected = _rendered_files(rec)
     stats: Counter = Counter()
-    sources = []
     for path in (GROUND_TRUTH_FILE, GRAVEYARD_FILE, OPEN_ITEMS_FILE):
         if not path.exists():
             continue
@@ -194,13 +163,9 @@ def op_migrate_records() -> str:
             continue
         if GENERATED_MARKER in text:
             text = _added_lines(text, expected[path])
-        before = sum(stats[k] for k in ("facts", "graveyard", "legacy"))
-        _merge_parsed(rec, _parse_md_records(text), path.name, stats)
-        if sum(stats[k] for k in ("facts", "graveyard", "legacy")) > before:
-            sources.append(path.name)
-    reparsed = _reparse_legacy(rec, stats)
+        _import_chunks(rec, _chunk_md(text), path.name, stats)
 
-    if not first_time and not sources and not reparsed:
+    if not first_time and not stats["legacy"]:
         out = "记录已是最新：没有需要导入的新内容。" + (f"（跳过重复 {stats['skipped']} 条）" if stats["skipped"] else "")
         if _pending_md_edits(rec):
             # Only duplicates or deletions were made by hand: records.json wins.
@@ -212,22 +177,13 @@ def op_migrate_records() -> str:
     _shadow_commit(f"pre-migrate-records-{stamp}", "snapshot before migrate-records")
     _save_records(rec)
     _shadow_commit(f"migrate-records-{stamp}", "migrate-records")
+    pending = sum(1 for lg in rec["legacy"] if lg.get("status") != "resolved")
     out = [
-        f"已{'迁移' if first_time else '导入'}结构化记录到 {RECORDS_FILE}（迁移前快照：pre-migrate-records-{stamp}）：",
-        f"事实 {stats['facts']} 条（默认作用域 global）、墓志 {stats['graveyard']} 条、"
-        f"未分类遗留 {stats['legacy']} 条；跳过重复 {stats['skipped']} 条。",
+        f"已{'迁移' if first_time else '导入'}到 {RECORDS_FILE}（迁移前快照：pre-migrate-records-{stamp}）：",
+        f"原文切为 {stats['legacy']} 条待处理记录（跳过重复 {stats['skipped']} 条），现共 {pending} 条待处理。"
+        "原文一字不改地保存在 records.json，处理完前仍显示在生成的 md 里。",
         "ground_truth.md / graveyard.md / open_items.md 现由工具生成，不要再手改。",
     ]
-    if reparsed:
-        out.append("已把含标准条目的未分类遗留记录拆开（原文保留为已处理）：" + "；".join(reparsed))
-    if stats["legacy"]:
-        out.append(
-            f"[LEGACY_RECORDS] 有 {stats['legacy']} 段内容不是标准条目，已原样保存为未分类遗留记录。"
-            "JIT 指令：和用户逐条处理（arch legacy list / legacy show --id），拆成带作用域的事实、待办项或节点状态后 legacy resolve。"
-        )
-    if stats["facts"]:
-        out.append("导入的事实都是 global 作用域；只与部分节点相关的，用 arch rescope --id GT-xx --scope <节点> 收窄。")
-    warning = _budget_warning(rec)
-    if warning:
-        out.append(warning)
+    if pending:
+        out.append(f"[LEGACY_RECORDS] JIT 指令：现在逐条处理这 {pending} 条记录。\n{LEGACY_GUIDE}")
     return "\n".join(out)

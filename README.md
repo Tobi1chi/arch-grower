@@ -155,9 +155,9 @@ arch export-ui   # → .arch/dashboard.html
 | 类型 | 存放位置 | 字段 | 命令 |
 | :--- | :--- | :--- | :--- |
 | 事实（决策与硬约束） | `records.json` → `facts` | `id`、`scope`、`text`、`constraint`、`source`、`date`、`supersedes` | `verify`、`rescope`、`facts` |
-| 墓志（废弃方案） | `records.json` → `graveyard` | `id`、`node`、`scheme`、`reason`、`date` | `reset-node`（自动记录） |
+| 墓志（废弃方案） | `records.json` → `graveyard` | `id`、`node`、`scheme`、`reason`、`date` | `reset-node`（自动记录）、`graveyard add`（补记，不重置节点） |
 | 待办项（待验证的未知） | `records.json` → `open_items` | `id`、`scope`、`question`、`kind`（device_test / research / decision）、`owner`（user / agent）、`blocking`、`status`、`resolution` | `open add / resolve / list` |
-| 未分类遗留 | `records.json` → `legacy` | `id`、`source`、`section`、`text`（原文）、`status` | `legacy list / show / resolve` |
+| 迁移原文 | `records.json` → `legacy` | `id`、`source`、`section`（标题路径）、`text`（原文）、`status`、`note` | `legacy list / show / resolve` |
 | 节点状态 | `graph.json` 节点上 | `impl`（planned / building / built）、`verify`（`{level: none/unit/api/device, date}`）、`refs`、`file_path`（一个或多个） | `set-node-state`、`commit-node` |
 
 **作用域**：`scope` 是 `global`、节点 ID（含折叠在模块里的子节点）或阶段名（节点的 `stage`），可以有多个。`focus` 输出 = SEED + `global` 事实 + 当前节点、相邻节点、折叠在其中的子节点及当前节点所在阶段的事实、墓志、待办项和节点状态；卡住开发的 `global` 待办项也会带上；其余只给一行“另有 N 条未展开”。`export-task` 只带 `global` 事实、目标节点相关的记录，以及节点 `refs` 引用的文档章节原文（`docs/protocol.md#6` 按 `#` 后的标题、章节号或 slug 截取那一节；`case.json#a.b` 取该键的值）。`global` 事实超过字数上限（默认 3000 字符，`config --global-fact-limit` 调整）时，`verify` / `focus` / `status` 会给出 `[GLOBAL_FACTS_OVER_BUDGET]` 警告。
@@ -174,11 +174,10 @@ arch export-ui   # → .arch/dashboard.html
 
 **迁移旧项目**：没有 `records.json` 的 `.arch/` 继续按旧方式工作（`focus` / `export-task` 全文拼接 md），并提示 `[RECORDS_NOT_MIGRATED]`。运行 `arch migrate-records`：
 
-- `- [GT-xx] ... -> 架构约束：...` 转为事实，作用域默认 `global`；编号冲突时分配新编号并保留 `legacy_id`。
-- `- ❌ [节点 id / 方案] 废弃原因：...` 转为墓志，节点取方括号中的 id。
-- 条目下方紧跟的缩进行作为该条目的 `detail` 保存；条目上方的小标题记为 `section`。
-- 其余段落（状态表、长段叙述等）按标题切分，原样保存为未分类遗留记录，在 `status` 和 `focus` 中提示，并继续显示在生成的 md 里，直到用 `legacy resolve` 标记处理完成。只丢弃引擎自己写入的默认标题。
-- 迁移前先做一次影子快照（`pre-migrate-records-*` 标签）。迁移是幂等的：内容相同的条目不会重复导入，再次运行只导入新增内容。
+- 引擎不解析旧内容。旧 `ground_truth.md`、`graveyard.md` 原样切成小块存为待处理的迁移原文：每个列表条目（连同缩进的续行）一块，其余段落（状态表、长段叙述、代码块）按所在标题各成一块；每块记录来源文件和标题路径。只丢弃引擎自己写入的默认标题和生成标记，其余字符一个不丢。
+- 迁移前先做一次影子快照（`pre-migrate-records-*` 标签）。迁移是幂等的：来源、标题和原文都相同的块（无论是否已处理）不会重复导入，再次运行只导入新增内容。
+- 输出和之后的 `status` / `focus` 给出 `[LEGACY_RECORDS]` 操作指南，代理逐条处理：`legacy show` 读下一块 → 判断类型 → 约束用 `verify --scope`（推翻旧条目加 `--supersedes`）、废弃方案用 `graveyard add`、待验证项用 `open add`、实现状态用 `set-node-state`、流程规则移到项目 AGENTS.md、无用内容不记录 → `legacy resolve --id LG-xx --note "拆为 GT-12、OI-03"`。`legacy list` 为空才算完成，详见 SKILL.md「迁移旧项目」。
+- 处理完之前，待处理原文继续显示在生成的 `ground_truth.md` / `graveyard.md` 里；处理后原文仍保存在 `records.json`（`legacy list --all`、`legacy show --id`），可与改写后的记录对照。
 
 新建项目（`init`）直接使用结构化记录。
 
@@ -201,7 +200,7 @@ arch-grower/
 │       ├── graph.py         # 拓扑、折叠模块、最小闭环、连线溯源、节点状态、漂移检测
 │       ├── records.py       # records.json 存储、作用域、格式化与生成的 md
 │       ├── refs.py          # 解析 file.md#章节 / file.json#键 引用
-│       ├── migration.py     # migrate-records：旧 md 记录无损导入
+│       ├── migration.py     # migrate-records：旧 md 原样切块存为迁移原文
 │       ├── views.py         # 只读视图：focus 切片、export-task、facts、status
 │       ├── graph_ops.py     # 节点与连线操作（init / collapse / add-node / commit-node / reset-node 等）
 │       ├── fold_ops.py      # fold / unfold
@@ -220,7 +219,7 @@ arch-grower/
 └── （目标项目中）.arch/
     ├── SEED.md              # 一句话初始意图
     ├── graph.json           # 架构图：节点、连线、折叠模块、节点状态
-    ├── records.json         # 事实、墓志、待办项、未分类遗留（唯一数据源）
+    ├── records.json         # 事实、墓志、待办项、迁移原文（唯一数据源）
     ├── ground_truth.md      # 由 records.json 生成，只读
     ├── graveyard.md         # 由 records.json 生成，只读
     ├── open_items.md        # 由 records.json 生成，只读
@@ -358,8 +357,9 @@ arch status   # 全局进度：实现 / 验证、卡开发的待办项、记录�
 | `arch_open` | `open add / resolve / list` | 待办项登记：待验证的未知项，区分实测 / 调研 / 决策、用户 / 代理处理、是否卡开发 |
 | `arch_set_node_state` | `set-node-state --node <节点> [--impl] [--verify] [--ref/--add-ref/--drop-ref] [--file-path]` | 记录节点实现进度、验证程度（带日期）、文档引用与实现文件 |
 | `arch_status` | `status` | 项目进度总览：节点实现 / 验证、待办项、记录统计与迁移提示 |
-| `arch_migrate_records` | `migrate-records` | 把旧格式 md 记录导入 `records.json`（幂等，无法识别的段落原样保留为未分类遗留） |
-| `arch_legacy` | `legacy list / show / resolve` | 查看与关闭迁移时保留的未分类遗留记录 |
+| `arch_migrate_records` | `migrate-records` | 把旧格式 md 记录原样切块存入 `records.json` 待处理（幂等，迁移前快照） |
+| `arch_legacy` | `legacy list / show / resolve` | 逐条查看（`show` 缺省给下一条）并关闭迁移原文 |
+| `arch_graveyard_add` | `graveyard add --node --scheme --reason` | 补记废弃方案到墓志，不重置节点 |
 | `arch_config` | `config [--global-fact-limit N]` | 查看或设置 `global` 事实字数上限 |
 | `arch_ground` | `ground` | 挂载外部资料或探针（文档、命令、代码引用）到 `grounding.json` |
 | `arch_export_task`| `export-task` | 导出单节点的独立编码任务卡（只带相关记录与 `refs` 章节原文，专供临时子代理在沙箱中执行） |
