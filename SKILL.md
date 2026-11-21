@@ -46,7 +46,8 @@ description: Progressive, autoregressive architecture facilitator. Use when star
 MCP 工具不可用时，用 `uv run --no-project "$ARCH_GROWER_CLI" <命令>`。将 `ARCH_GROWER_CLI` 设为本技能 `SKILL.md` 同目录下 `scripts/arch_cli.py` 的绝对路径，工作目录用目标项目根目录。手册中的 `arch <命令>` 指这条调用，`arch <命令> --help` 可查询当前版本的参数。
 
 - 新项目用 `arch init --seed "一句话意图"`。只在尚未初始化时执行，重复执行会覆盖图。
-- 继续现有项目用 `arch focus`。已知节点 ID 时用 `arch focus --node "$NODE_ID"`，并核对返回的焦点 ID。
+- 继续现有项目用 `arch focus`。已知节点 ID 时用 `arch focus --node "$NODE_ID"`，并核对返回的焦点 ID。全局进度用 `arch status`。
+- `focus` 返回 `[RECORDS_NOT_MIGRATED]` 时，项目的事实与墓志仍是旧格式、每次全文拼接。征得用户同意后运行 `arch migrate-records`，再按第四节处理迁移结果。
 
 ## 二、 架构演进主循环
 
@@ -63,3 +64,23 @@ MCP 工具不可用时，用 `uv run --no-project "$ARCH_GROWER_CLI" <命令>`�
 * **Stage 阶段内部遇到并列 / 并发 / 多态路由需要建模时** $\rightarrow$ 读取 `references/stage_patterns.md` 
 * **遇到代码不可见的现实环境、硬件或黑盒约束需要向用户确认时** $\rightarrow$ 读取 `references/grounding_guide.md`  
 * **主线贯通准备写代码，或修改已落地节点、处理运行故障及回滚时** $\rightarrow$ 读取 [执行与变更手册](references/execution_and_hotswap.md)。修改已落地决策时先定位上下游和共享实现的影响范围，再更新图、实现和文档。
+
+## 四、 分类型记录
+
+`.arch/records.json` 存放事实、墓志、待办项和未分类遗留记录；`ground_truth.md`、`graveyard.md`、`open_items.md` 由工具生成，只供阅读，不要手改。所有记录只通过 CLI / MCP 读写。`focus` 只带 SEED、`global` 事实，以及当前节点、相邻节点和折叠在其中的子节点的事实、墓志、待办项和节点状态，其余部分只给一行“另有 N 条未展开”。
+
+按信息类型选择记录方式：
+
+| 信息 | 记录方式 |
+| :--- | :--- |
+| 决策与硬约束 | `arch verify --fact --constraint --scope <节点/阶段>`，附 `--source` 证据路径。只在约束对所有节点都成立时用 `global`（默认）。旧结论变化时用 `--supersedes GT-xx` 取代，不要追加矛盾条目 |
+| 废弃方案 | `arch reset-node --reason`，自动以节点为作用域记入墓志 |
+| 实现进度与验证程度 | `arch set-node-state --impl planned/building/built --verify none/unit/api/device`。`solid` 只表示决策已定，不表示已实现 |
+| 待验证的未知项 | `arch open add --question --kind device_test/research/decision --owner user/agent --scope ... [--blocking]`。用户真机实测的写 `--owner user`；代理能自己调研的写 `--owner agent` 并直接去做。有结论后用 `arch open resolve --id --resolution [--constraint]`，带约束时同时沉淀为事实 |
+| 参考合同文档 | 不抄进 spec，用 `arch set-node-state --add-ref docs/x.md#章节` 引用，`export-task` 会内联该章节原文 |
+| 调查过程 | 只把结论写成事实，长段过程留在原文件，用 `--source` 指向证据路径 |
+| 流程规则、发布运维 | 不进 arch 记录。流程规则写进项目的 AGENTS.md，代码索引由节点的实现文件给出 |
+
+`global` 事实超过字数上限（默认 3000 字符，`arch config --global-fact-limit` 调整）时会出现 `[GLOBAL_FACTS_OVER_BUDGET]`，用 `arch rescope --id GT-xx --scope <节点>` 收窄只与部分节点相关的事实。
+
+迁移后若出现 `[LEGACY_RECORDS]`，说明旧 md 中有非标准条目被原样保存为未分类遗留记录。和用户逐条处理：`arch legacy show --id LG-xx` 查看，把内容按上表拆分记录后，用 `arch legacy resolve --id LG-xx --note "拆为 GT-12、OI-03"` 关闭。迁移导入的事实默认都是 `global`，需逐条判断是否收窄。

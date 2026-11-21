@@ -407,6 +407,529 @@ class ExportUiTest(EngineTestCase):
         self.assertIn("user-select: none", rule)
 
 
+# ---------------------------------------------------------------------------
+# Typed records, node state and context slicing
+# ---------------------------------------------------------------------------
+
+import arch_mcp  # noqa: E402
+
+
+def _records() -> dict:
+    return json.loads(Path(".arch/records.json").read_text(encoding="utf-8"))
+
+
+def _node(node_id: str) -> dict:
+    return arch_cli._find_any_node(arch_cli._load_graph(), node_id)
+
+
+class NodeStateTest(EngineTestCase):
+    def test_old_nodes_get_default_state(self) -> None:
+        g = arch_cli._load_graph()
+        for n in g["nodes"]:
+            for key in ("impl", "verify", "refs"):
+                n.pop(key, None)
+        g["nodes"][0]["last_tag"] = "node-entry_input-s02"  # committed by an older version
+        arch_cli._save_graph(g)
+        self.assertEqual(arch_cli._node_state(_node("entry_input"))["impl"], "built")
+        state = arch_cli._node_state(_node("core_transform"))
+        self.assertEqual(state, {"impl": "planned", "verify": {"level": "none", "date": ""},
+                                 "refs": [], "files": []})
+        out = arch_cli.op_focus("core_transform")
+        self.assertIn('"impl": "planned"', out)
+        self.assertIn('"level": "none"', out)
+
+    def test_set_node_state_records_every_field(self) -> None:
+        self.collapse("entry_input")
+        out = arch_cli.op_set_node_state(
+            "entry_input", impl="built", verify="device", verify_date="2026-11-01",
+            refs=["docs/protocol.md#6"], add_refs=["analysis/x/case.json#key"],
+            file_paths=["src/ble.py", "src/ble_queue.py"],
+        )
+        self.assertIn("已实现 · 真机实测 2026-11-01", out)
+        node = _node("entry_input")
+        self.assertEqual(node["impl"], "built")
+        self.assertEqual(node["verify"], {"level": "device", "date": "2026-11-01"})
+        self.assertEqual(node["refs"], ["docs/protocol.md#6", "analysis/x/case.json#key"])
+        self.assertEqual(node["file_path"], ["src/ble.py", "src/ble_queue.py"])
+        arch_cli.op_set_node_state("entry_input", drop_refs=["docs/protocol.md#6"], file_paths=["src/ble.py"])
+        node = _node("entry_input")
+        self.assertEqual(node["refs"], ["analysis/x/case.json#key"])
+        self.assertEqual(node["file_path"], "src/ble.py")  # one file keeps the original string form
+
+    def test_verify_defaults_to_today_and_none_clears_date(self) -> None:
+        arch_cli.op_set_node_state("entry_input", verify="unit")
+        self.assertEqual(_node("entry_input")["verify"]["date"], arch_cli._today())
+        arch_cli.op_set_node_state("entry_input", verify="none")
+        self.assertEqual(_node("entry_input")["verify"], {"level": "none", "date": ""})
+
+    def test_rejects_bad_values(self) -> None:
+        for kwargs, msg in (
+            ({"impl": "done"}, "impl"),
+            ({"verify": "manual"}, "verify"),
+            ({"verify": "unit", "verify_date": "11/01"}, "YYYY-MM-DD"),
+            ({"drop_refs": ["nope.md"]}, "不存在"),
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(arch_cli.ArchEngineError, msg):
+                arch_cli.op_set_node_state("entry_input", **kwargs)
+
+    def test_unchanged_state_does_not_take_a_step(self) -> None:
+        arch_cli.op_set_node_state("entry_input", impl="building")
+        step = arch_cli._load_graph()["step"]
+        self.assertIn("没有变化", arch_cli.op_set_node_state("entry_input", impl="building"))
+        self.assertEqual(arch_cli._load_graph()["step"], step)
+
+    def test_folded_child_state_and_module_progress(self) -> None:
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+        arch_cli.op_fold(["entry_input", "core_transform"], "front", "前端", "spec")
+        arch_cli.op_set_node_state("entry_input", impl="built")  # no unfold needed
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "子节点"):
+            arch_cli.op_set_node_state("front", impl="built")
+        out = arch_cli.op_focus("front")
+        self.assertIn('"impl_progress": "1/2 built"', out)
+        self.assertIn("entry_input [solid] 已实现", arch_cli.op_status())
+
+    def test_commit_node_binds_several_files_and_detects_drift_in_any(self) -> None:
+        self.collapse("entry_input")
+        Path("a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+        Path("b.py").write_text("def b():\n    return 2\n", encoding="utf-8")
+        out = arch_cli.op_commit_node("entry_input", ["a.py", "b.py"])
+        self.assertIn("built", out)
+        node = _node("entry_input")
+        self.assertEqual((node["file_path"], node["impl"]), (["a.py", "b.py"], "built"))
+        arch_cli.op_export_task("entry_input")  # clean baseline
+        Path("b.py").write_text("def b():\n    return 3\n", encoding="utf-8")
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "ManualDriftError"):
+            arch_cli.op_export_task("entry_input")
+
+    def test_reset_node_starts_progress_over(self) -> None:
+        self.collapse("entry_input")
+        arch_cli.op_set_node_state("entry_input", impl="built", verify="api", refs=["docs/a.md#1"])
+        arch_cli.op_reset_node("entry_input", "接口不稳定")
+        state = arch_cli._node_state(_node("entry_input"))
+        self.assertEqual((state["impl"], state["verify"]["level"], state["refs"]),
+                         ("planned", "none", ["docs/a.md#1"]))
+
+    def test_dashboard_shows_progress(self) -> None:
+        self.collapse("entry_input")
+        arch_cli.op_set_node_state("entry_input", impl="built", verify="device")
+        arch_cli.op_open_add("丢包率？", "device_test", "user", scope="entry_input", blocking=True)
+        arch_cli.op_export_ui()
+        page = Path(".arch/dashboard.html").read_text(encoding="utf-8")
+        data = ExportUiTest.embedded(None, page)
+        self.assertEqual(data["node_state"]["entry_input"]["impl"], "built")
+        self.assertEqual(data["node_state"]["entry_input"]["verify"]["level"], "device")
+        self.assertTrue(data["records"]["enabled"])
+        self.assertEqual([o["id"] for o in data["records"]["open_items"]], ["OI-01"])
+        for snippet in ("impl-pill", "实现与验证", "实现进度"):
+            self.assertIn(snippet, page)
+
+
+class OpenItemsTest(EngineTestCase):
+    def test_add_list_resolve(self) -> None:
+        out = arch_cli.op_open_add("BLE 实际吞吐？", "device_test", "user", scope=["entry_input"], blocking=True)
+        self.assertIn("[OI-01]", out)
+        arch_cli.op_open_add("选哪个 ASR 服务", "research", "agent", scope="core_transform")
+        item = _records()["open_items"][0]
+        self.assertEqual(
+            {k: item[k] for k in ("id", "scope", "kind", "owner", "blocking", "status")},
+            {"id": "OI-01", "scope": ["entry_input"], "kind": "device_test", "owner": "user",
+             "blocking": True, "status": "open"},
+        )
+        self.assertIn("OI-02", arch_cli.op_open_list(owner="agent"))
+        self.assertNotIn("OI-02", arch_cli.op_open_list(blocking_only=True))
+        self.assertNotIn("OI-01", arch_cli.op_open_list(node_id="core_transform"))
+
+        out = arch_cli.op_open_resolve("OI-01", "实测 1.2 Mbps", constraint="单路 16k PCM 足够")
+        self.assertIn("沉淀为事实", out)
+        fact = _records()["facts"][-1]
+        self.assertEqual((fact["scope"], fact["source"], fact["text"]),
+                         (["entry_input"], "待办项 OI-01", "实测 1.2 Mbps"))
+        self.assertNotIn("OI-01", arch_cli.op_open_list())
+        self.assertIn("已解决", arch_cli.op_open_list(include_resolved=True))
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "已在"):
+            arch_cli.op_open_resolve("OI-01", "again")
+        md = Path(".arch/open_items.md").read_text(encoding="utf-8")
+        self.assertIn(arch_cli.GENERATED_MARKER, md)
+        self.assertIn("## 已解决", md)
+
+    def test_stage_scope_matches_nodes_of_that_stage(self) -> None:
+        arch_cli.op_collapse("entry_input", "输入", "spec", stage="S1 采集")
+        arch_cli.op_open_add("采样率？", "decision", "user", scope="S1 采集")
+        self.assertIn("采样率", arch_cli.op_open_list(node_id="entry_input"))
+        self.assertIn("采样率", arch_cli.op_focus("entry_input"))
+
+    def test_rejects_bad_input(self) -> None:
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "类型"):
+            arch_cli.op_open_add("q", "guess", "user")
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "处理方"):
+            arch_cli.op_open_add("q", "research", "bot")
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "未知作用域"):
+            arch_cli.op_open_add("q", "research", "user", scope="no_such_node")
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "混用"):
+            arch_cli.op_open_add("q", "research", "user", scope=["global", "entry_input"])
+
+
+class FactsTest(EngineTestCase):
+    def test_scope_source_and_date_are_stored(self) -> None:
+        arch_cli.op_verify("MTU 185", "分片 ≤ 180", scope="entry_input", source="analysis/mtu/case.json#mtu")
+        fact = _records()["facts"][0]
+        self.assertEqual((fact["id"], fact["scope"], fact["source"], fact["date"]),
+                         ("GT-01", ["entry_input"], "analysis/mtu/case.json#mtu", arch_cli._today()))
+        md = Path(".arch/ground_truth.md").read_text(encoding="utf-8")
+        self.assertTrue(md.startswith(arch_cli.GENERATED_MARKER))
+        self.assertIn("## 作用域 · entry_input", md)
+
+    def test_superseded_facts_are_hidden_by_default(self) -> None:
+        arch_cli.op_verify("旧板子 2 路 UART", "日志走 RTT", scope="entry_input")
+        arch_cli.op_verify("新板子 4 路 UART", "日志走 UART3", supersedes="GT-01")
+        facts = _records()["facts"]
+        self.assertEqual(facts[1]["scope"], ["entry_input"])  # inherited from GT-01
+        self.assertEqual(facts[1]["supersedes"], ["GT-01"])
+        focus = arch_cli.op_focus("entry_input")
+        self.assertIn("GT-02", focus)
+        self.assertNotIn("GT-01]", focus)
+        self.assertNotIn("GT-01]", arch_cli.op_facts(node_id="entry_input"))
+        self.assertIn("已被 GT-02 取代", arch_cli.op_facts(all_scopes=True, with_superseded=True))
+        md = Path(".arch/ground_truth.md").read_text(encoding="utf-8")
+        self.assertIn("## 已被取代", md)
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "不存在"):
+            arch_cli.op_verify("x", "y", supersedes="GT-99")
+
+    def test_facts_queries(self) -> None:
+        arch_cli.op_collapse("entry_input", "输入", "spec", stage="S1")
+        arch_cli.op_verify("全局", "约束 G")
+        arch_cli.op_verify("阶段事实", "约束 S", scope="S1")
+        arch_cli.op_verify("别的节点", "约束 C", scope="core_transform")
+        arch_cli.op_reset_node("entry_input", "方案不行")
+        by_node = arch_cli.op_facts(node_id="entry_input")
+        self.assertIn("阶段事实", by_node)
+        self.assertIn("方案不行", by_node)
+        self.assertNotIn("别的节点", by_node)
+        self.assertNotIn("约束 G", by_node)
+        self.assertIn("约束 G", arch_cli.op_facts())
+        everything = arch_cli.op_facts(all_scopes=True)
+        for text in ("约束 G", "约束 S", "约束 C", "方案不行"):
+            self.assertIn(text, everything)
+
+    def test_global_budget_warning(self) -> None:
+        self.assertIn("= 40", arch_cli.op_config(global_fact_limit=40))
+        out = arch_cli.op_verify("一条很长的全局事实" * 3, "一条很长的全局约束" * 3)
+        self.assertIn("GLOBAL_FACTS_OVER_BUDGET", out)
+        self.assertIn("GLOBAL_FACTS_OVER_BUDGET", arch_cli.op_focus())
+        self.assertIn("GLOBAL_FACTS_OVER_BUDGET", arch_cli.op_status())
+        arch_cli.op_rescope("GT-01", ["entry_input"])
+        self.assertNotIn("GLOBAL_FACTS_OVER_BUDGET", arch_cli.op_focus())
+        self.assertEqual(arch_cli._global_fact_budget(_records())[1], 40)
+
+    def test_rescope_moves_a_fact_out_of_every_focus(self) -> None:
+        arch_cli.op_verify("只和输入有关", "约束 X")
+        self.assertIn("约束 X", arch_cli.op_focus("final_output"))
+        arch_cli.op_rescope("GT-01", "entry_input")
+        self.assertNotIn("约束 X", arch_cli.op_focus("final_output"))
+        self.assertIn("约束 X", arch_cli.op_focus("entry_input"))
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "只适用于"):
+            arch_cli.op_rescope("GY-01", "entry_input")
+
+    def test_hand_edited_md_is_never_overwritten(self) -> None:
+        arch_cli.op_verify("a", "b")
+        gt = Path(".arch/ground_truth.md")
+        gt.write_text(gt.read_text(encoding="utf-8") + "- [GT-02] 手写事实 -> 架构约束：手写约束\n", encoding="utf-8")
+        self.assertIn("RECORDS_MD_EDITED", arch_cli.op_focus())
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "migrate-records"):
+            arch_cli.op_verify("c", "d")
+        self.assertIn("手写约束", gt.read_text(encoding="utf-8"))
+        arch_cli.op_migrate_records()
+        self.assertEqual([f["constraint"] for f in _records()["facts"]], ["b", "手写约束"])
+        arch_cli.op_verify("c", "d")  # unblocked
+        self.assertIn("记录已是最新", arch_cli.op_migrate_records())
+
+
+class FocusSliceTest(EngineTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+        arch_cli.op_add_node("decoder", "解码", "spec", status="solid",
+                             after_node="entry_input", before_node="core_transform")
+        # entry_input -> decoder -> core_transform -> final_output
+        arch_cli.op_verify("全局事实", "全局约束")
+        arch_cli.op_verify("输入事实", "输入约束", scope="entry_input")
+        arch_cli.op_verify("解码事实", "解码约束", scope="decoder")
+        arch_cli.op_verify("输出事实", "输出约束", scope="final_output")
+        arch_cli.op_open_add("全局卡点", "decision", "user", blocking=True)
+        arch_cli.op_open_add("全局闲事", "research", "agent")
+        arch_cli.op_open_add("输出问题", "research", "agent", scope="final_output")
+
+    def test_focus_carries_only_related_records(self) -> None:
+        out = arch_cli.op_focus("entry_input")
+        for text in ("全局约束", "输入约束", "解码约束", "全局卡点"):  # self, neighbour, blocking global
+            self.assertIn(text, out)
+        for text in ("输出约束", "输出问题", "全局闲事"):
+            self.assertNotIn(text, out)
+        self.assertIn("另有 1 条节点/阶段事实、2 条待办项 未展开", out)
+
+    def test_graveyard_follows_its_node(self) -> None:
+        arch_cli.op_reset_node("final_output", "播放延迟太高")
+        self.assertIn("播放延迟太高", arch_cli.op_focus("final_output"))
+        self.assertNotIn("播放延迟太高", arch_cli.op_focus("entry_input"))
+        self.assertIn("1 条墓志", arch_cli.op_focus("entry_input"))
+
+    def test_focus_on_a_module_includes_its_children(self) -> None:
+        arch_cli.op_fold(["decoder", "core_transform"], "proc", "处理", "spec")
+        out = arch_cli.op_focus("proc")
+        self.assertIn("解码约束", out)        # scoped to a folded child
+        self.assertIn("输入约束", out)        # neighbour
+        self.assertIn("输出约束", out)        # neighbour
+
+    def test_export_task_carries_only_the_target(self) -> None:
+        task = json.loads(arch_cli.op_export_task("entry_input"))
+        self.assertEqual(task["global_facts"], ["- [GT-01] 全局事实 -> 架构约束：全局约束"])
+        self.assertEqual(len(task["node_facts"]), 1)
+        self.assertIn("输入约束", task["node_facts"][0])
+        self.assertEqual(len(task["open_items"]), 1)
+        self.assertIn("全局卡点", task["open_items"][0])
+        self.assertNotIn("global_ground_truth", task)
+        self.assertEqual(task["target_node"]["impl"], "planned")
+
+
+PROTOCOL_MD = """# 协议
+
+## 5 概述
+概述正文
+
+## 6. 帧格式
+帧头 4 字节
+
+```
+## 不是标题
+```
+
+### 6.1 帧头
+magic 0xA5
+
+## 60 别的章节
+不该出现
+
+## 7 Error Codes
+E1
+"""
+
+
+class RefSectionTest(EngineTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        Path("docs").mkdir()
+        Path("docs/protocol.md").write_text(PROTOCOL_MD, encoding="utf-8")
+        Path("docs/small.md").write_text("# 小文件\n全文\n", encoding="utf-8")
+        Path("analysis").mkdir()
+        Path("src").mkdir()
+        Path("src/main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        Path("analysis/case.json").write_text(json.dumps({"mtu": {"android": 185}}), encoding="utf-8")
+        self.collapse("entry_input")
+
+    def test_section_matching(self) -> None:
+        section = arch_cli._extract_md_section(PROTOCOL_MD, "6")
+        self.assertTrue(section.startswith("## 6. 帧格式"))
+        self.assertIn("magic 0xA5", section)       # subsections belong to the section
+        self.assertIn("## 不是标题", section)       # code fences are not headings
+        self.assertNotIn("不该出现", section)        # 60 is not 6
+        self.assertEqual(arch_cli._extract_md_section(PROTOCOL_MD, "6.1"), "### 6.1 帧头\nmagic 0xA5")
+        self.assertTrue(arch_cli._extract_md_section(PROTOCOL_MD, "§7").startswith("## 7 Error Codes"))
+        self.assertTrue(arch_cli._extract_md_section(PROTOCOL_MD, "7-error-codes").startswith("## 7"))
+        self.assertTrue(arch_cli._extract_md_section(PROTOCOL_MD, "帧头").startswith("### 6.1"))
+        self.assertIsNone(arch_cli._extract_md_section(PROTOCOL_MD, "9"))
+
+    def test_export_task_inlines_referenced_sections(self) -> None:
+        arch_cli.op_set_node_state("entry_input", refs=[
+            "docs/protocol.md#6", "docs/small.md", "analysis/case.json#mtu.android",
+            "docs/protocol.md#99", "docs/missing.md#1", "src/main.c",
+        ])
+        refs = {r["ref"]: r for r in json.loads(arch_cli.op_export_task("entry_input"))["ref_sections"]}
+        self.assertIn("帧头 4 字节", refs["docs/protocol.md#6"]["content"])
+        self.assertNotIn("概述正文", refs["docs/protocol.md#6"]["content"])
+        self.assertIn("全文", refs["docs/small.md"]["content"])
+        self.assertEqual(refs["analysis/case.json#mtu.android"]["content"], "185")
+        self.assertIn("未找到章节", refs["docs/protocol.md#99"]["error"])
+        self.assertIn("不存在", refs["docs/missing.md#1"]["error"])
+        self.assertIn("note", refs["src/main.c"])
+
+    def test_large_file_without_anchor_is_not_inlined(self) -> None:
+        Path("docs/big.md").write_text("# 大\n" + "x" * (arch_cli.REF_WHOLE_FILE_LIMIT + 10), encoding="utf-8")
+        arch_cli.op_set_node_state("entry_input", refs=["docs/big.md"])
+        ref = json.loads(arch_cli.op_export_task("entry_input"))["ref_sections"][0]
+        self.assertNotIn("content", ref)
+        self.assertIn("#章节", ref["note"])
+
+
+OLD_GROUND_TRUTH = """# 已验证现实事实与硬约束 (Ground Truth)
+
+- [GT-01] (已验证) 板子只有 2 路 UART -> 架构约束：日志走 RTT
+- [GT-02] (已验证) BLE MTU 185 -> 架构约束：分片 ≤ 180
+  补充：Android 12 以下默认 23
+  - 证据 analysis/mtu/case.json#mtu
+
+## 实现状态
+
+| 模块 | 状态 |
+| --- | --- |
+| ble | 已实现，未实测 |
+
+## 硬件约束
+- [GT-03] (已验证) 电池 300mAh -> 架构约束：常驻功耗 < 5mA
+
+2026-10 的长段调查：先试了 A，指标 X=3.2，
+又试了 B，指标 X=2.9。
+- [GT-01] (已验证) 编号重复但内容不同 -> 架构约束：另一条约束
+"""
+
+OLD_GRAVEYARD = """# 踩坑记录
+
+- ❌ [节点 core_transform / 本地 Tesseract / OCR] 废弃原因：识别率不足 70%
+- ❌ [节点 entry_input / 经典蓝牙] 废弃原因：iOS 不支持
+随手记的一句话
+"""
+
+
+class MigrationTest(EngineTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # Turn the fresh project into one written by the previous version.
+        Path(".arch/records.json").unlink()
+        Path(".arch/open_items.md").unlink()
+        Path(".arch/ground_truth.md").write_text(OLD_GROUND_TRUTH, encoding="utf-8")
+        Path(".arch/graveyard.md").write_text(OLD_GRAVEYARD, encoding="utf-8")
+
+    def test_unmigrated_project_keeps_working_the_old_way(self) -> None:
+        out = arch_cli.op_focus()
+        self.assertIn("长段调查", out)
+        self.assertIn("随手记的一句话", out)
+        self.assertIn("migrate-records", out)
+        self.collapse("entry_input")
+        task = json.loads(arch_cli.op_export_task("entry_input"))
+        self.assertIn("长段调查", task["global_ground_truth"])
+        self.assertIn("migrate-records", task["records_hint"])
+        arch_cli.op_verify("新事实", "新约束")
+        self.assertIn("新约束", Path(".arch/ground_truth.md").read_text(encoding="utf-8"))
+        self.assertFalse(Path(".arch/records.json").exists())
+        for call in (lambda: arch_cli.op_open_add("q", "research", "user"),
+                     lambda: arch_cli.op_facts(),
+                     lambda: arch_cli.op_verify("x", "y", scope="entry_input")):
+            with self.assertRaisesRegex(arch_cli.ArchEngineError, "migrate-records"):
+                call()
+        self.assertIn("RECORDS_NOT_MIGRATED", arch_cli.op_status())
+
+    def test_migration_is_lossless(self) -> None:
+        out = arch_cli.op_migrate_records()
+        self.assertIn("事实 4 条", out)
+        self.assertIn("墓志 2 条", out)
+        self.assertIn("未分类遗留 3 条", out)
+        rec = _records()
+        dump = json.dumps(rec, ensure_ascii=False)
+        for name, text in (("gt", OLD_GROUND_TRUTH), ("gy", OLD_GRAVEYARD)):
+            for line in text.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped in arch_cli.DEFAULT_TITLES:
+                    continue
+                fm, gm = arch_cli.GT_LINE.match(line), arch_cli.GY_LINE.match(line)
+                heading = arch_cli.MD_HEADING.match(line)
+                pieces = (fm.groups()[1:] if fm else gm.groups() if gm
+                          else [heading.group(2)] if heading else [stripped])
+                for piece in pieces:
+                    with self.subTest(file=name, line=line, piece=piece):
+                        self.assertIn(json.dumps(piece, ensure_ascii=False)[1:-1], dump)
+
+        facts = {f["id"]: f for f in rec["facts"]}
+        self.assertEqual(facts["GT-02"]["detail"], "补充：Android 12 以下默认 23\n- 证据 analysis/mtu/case.json#mtu")
+        self.assertEqual(facts["GT-03"]["section"], "硬件约束")
+        self.assertEqual((facts["GT-04"]["legacy_id"], facts["GT-04"]["constraint"]), ("GT-01", "另一条约束"))
+        self.assertTrue(all(f["scope"] == ["global"] for f in facts.values()))
+        graves = rec["graveyard"]
+        self.assertEqual([(g["node"], g["scheme"]) for g in graves],
+                         [("core_transform", "本地 Tesseract / OCR"), ("entry_input", "经典蓝牙")])
+        legacy = rec["legacy"]
+        self.assertEqual([lg["source"] for lg in legacy], ["ground_truth.md", "ground_truth.md", "graveyard.md"])
+        self.assertTrue(legacy[0]["text"].startswith("## 实现状态\n\n| 模块 | 状态 |"))
+
+        # Rendered md still shows everything that has not been dealt with.
+        gt = Path(".arch/ground_truth.md").read_text(encoding="utf-8")
+        self.assertTrue(gt.startswith(arch_cli.GENERATED_MARKER))
+        self.assertIn("又试了 B", gt)
+        self.assertIn("| ble | 已实现，未实测 |", gt)
+
+    def test_migration_is_idempotent(self) -> None:
+        arch_cli.op_migrate_records()
+        before = Path(".arch/records.json").read_text(encoding="utf-8")
+        md_before = Path(".arch/ground_truth.md").read_text(encoding="utf-8")
+        self.assertIn("记录已是最新", arch_cli.op_migrate_records())
+        self.assertEqual(Path(".arch/records.json").read_text(encoding="utf-8"), before)
+        self.assertEqual(Path(".arch/ground_truth.md").read_text(encoding="utf-8"), md_before)
+        # An old md restored over the generated one imports nothing twice.
+        Path(".arch/ground_truth.md").write_text(OLD_GROUND_TRUTH, encoding="utf-8")
+        out = arch_cli.op_migrate_records()
+        self.assertIn("跳过重复", out)
+        self.assertEqual(len(_records()["facts"]), 4)
+        self.assertEqual(len(_records()["legacy"]), 3)
+
+    def test_legacy_records_show_up_until_resolved(self) -> None:
+        arch_cli.op_migrate_records()
+        status = arch_cli.op_status()
+        self.assertIn("[LEGACY_RECORDS] 3 条", status)
+        self.assertIn("3 条未分类遗留记录", arch_cli.op_focus())
+        self.assertIn("LG-02", arch_cli.op_legacy("list"))
+        self.assertIn("又试了 B", arch_cli.op_legacy("show", "LG-02"))
+        arch_cli.op_verify("方案 B 指标 X=2.9", "选 B", scope="entry_input", source="legacy LG-02")
+        self.assertIn("剩余待处理 2 条", arch_cli.op_legacy("resolve", "LG-02", "拆为 GT-05"))
+        self.assertNotIn("又试了 B", Path(".arch/ground_truth.md").read_text(encoding="utf-8"))
+        self.assertIn("又试了 B", Path(".arch/records.json").read_text(encoding="utf-8"))
+        self.assertIn("[LEGACY_RECORDS] 2 条", arch_cli.op_status())
+
+    def test_after_migration_focus_slices(self) -> None:
+        arch_cli.op_migrate_records()
+        out = arch_cli.op_focus("final_output")
+        self.assertNotIn("长段调查", out)               # legacy text is no longer concatenated
+        self.assertIn("识别率不足", out)                # graveyard of the neighbour core_transform
+        self.assertNotIn("iOS 不支持", out)             # graveyard of a node two hops away
+        self.assertIn("日志走 RTT", out)                # migrated facts start global
+        self.assertNotIn("RECORDS_NOT_MIGRATED", out)
+
+    def test_reinit_over_old_md_does_not_migrate_silently(self) -> None:
+        arch_cli.op_init("again")
+        self.assertFalse(Path(".arch/records.json").exists())
+        self.assertIn("长段调查", Path(".arch/ground_truth.md").read_text(encoding="utf-8"))
+
+
+class ForkKeepsRecordsTest(EngineTestCase):
+    def test_records_survive_fork(self) -> None:
+        self.collapse("entry_input")
+        arch_cli.op_verify("事实", "约束", scope="entry_input")
+        arch_cli.op_open_add("问题", "research", "agent")
+        arch_cli.op_fork("arch-step-01")
+        rec = _records()
+        self.assertEqual([f["id"] for f in rec["facts"]], ["GT-01"])
+        self.assertEqual([o["id"] for o in rec["open_items"]], ["OI-01"])
+        self.assertEqual(arch_cli._load_graph()["step"], 1)
+        self.assertIn("约束", Path(".arch/ground_truth.md").read_text(encoding="utf-8"))
+
+
+class McpToolsTest(EngineTestCase):
+    def test_new_tools_are_listed_and_dispatch(self) -> None:
+        names = {t["name"] for t in arch_mcp.TOOLS}
+        for name in ("arch_set_node_state", "arch_open", "arch_facts", "arch_status",
+                     "arch_migrate_records", "arch_rescope", "arch_legacy", "arch_config"):
+            self.assertIn(name, names)
+        arch_mcp._dispatch_tool("arch_set_node_state", {"node_id": "entry_input", "impl": "building"})
+        self.assertEqual(_node("entry_input")["impl"], "building")
+        arch_mcp._dispatch_tool("arch_open", {"action": "add", "question": "q", "kind": "research",
+                                             "owner": "agent", "scope": ["entry_input"]})
+        self.assertIn("OI-01", arch_mcp._dispatch_tool("arch_open", {"action": "list", "node_id": "entry_input"}))
+        arch_mcp._dispatch_tool("arch_verify", {"fact": "f", "constraint": "c", "scope": ["entry_input"]})
+        self.assertIn("f -> 架构约束：c", arch_mcp._dispatch_tool("arch_facts", {"node_id": "entry_input"}))
+        self.assertIn("项目状态", arch_mcp._dispatch_tool("arch_status", {}))
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "file-path"):
+            arch_mcp._dispatch_tool("arch_commit_node", {"node_id": "entry_input"})
+
+
 class SignatureDetectionTest(unittest.TestCase):
     def check(self, line: str) -> bool:
         return bool(arch_cli.SIGNATURE_LINE.match(line))

@@ -51,7 +51,7 @@
 **主对话专心负责架构推演与决策，不直接读业务源码、不写具体实现、不粘贴长报错日志**。所有编码与测试均导出为局部任务，委派给**独立的临时子代理（Ephemeral Worker）**在沙箱中完成，保证主对话上下文轻盈、无噪音。
 
 ### 5. 意图与实现分离，支持局部调整（Ports & Adapters）
-架构主干定义业务意图（Port），具体落地挂载实现适配器（Adapter）。现实运行踩坑时主干拓扑保持稳定，仅重置报错节点重新选择适配器，并将失败教训记录进踩坑备忘（`graveyard.md`），避免大模型重复踩坑。
+架构主干定义业务意图（Port），具体落地挂载实现适配器（Adapter）。现实运行踩坑时主干拓扑保持稳定，仅重置报错节点重新选择适配器，并将失败教训记录进踩坑备忘（墓志，`graveyard.md`），避免大模型重复踩坑。
 
 ### 6. 阶段泳道模型（Stage Swimlane）
 横向按生命周期划分阶段（Stage 1 ➔ Stage 2 ➔ Stage 3），纵向容纳阶段内的并发分支与特性储备。随时可一键导出交互式 HTML 看板。
@@ -146,6 +146,44 @@ arch export-ui   # → .arch/dashboard.html
 
 ---
 
+<a id="typed-records"></a>
+
+## 🗂️ 分类型记录与按需上下文
+
+项目推进久了，事实、踩坑、实现状态、待实测问题、调查过程会混在一起越积越长；如果每次 `focus` 都全文带上，上下文很快就被与当前节点无关的内容占满。arch-grower 把这些信息分类型存放，`focus` 和 `export-task` 只带与当前节点相关的部分。
+
+| 类型 | 存放位置 | 字段 | 命令 |
+| :--- | :--- | :--- | :--- |
+| 事实（决策与硬约束） | `records.json` → `facts` | `id`、`scope`、`text`、`constraint`、`source`、`date`、`supersedes` | `verify`、`rescope`、`facts` |
+| 墓志（废弃方案） | `records.json` → `graveyard` | `id`、`node`、`scheme`、`reason`、`date` | `reset-node`（自动记录） |
+| 待办项（待验证的未知） | `records.json` → `open_items` | `id`、`scope`、`question`、`kind`（device_test / research / decision）、`owner`（user / agent）、`blocking`、`status`、`resolution` | `open add / resolve / list` |
+| 未分类遗留 | `records.json` → `legacy` | `id`、`source`、`section`、`text`（原文）、`status` | `legacy list / show / resolve` |
+| 节点状态 | `graph.json` 节点上 | `impl`（planned / building / built）、`verify`（`{level: none/unit/api/device, date}`）、`refs`、`file_path`（一个或多个） | `set-node-state`、`commit-node` |
+
+**作用域**：`scope` 是 `global`、节点 ID（含折叠在模块里的子节点）或阶段名（节点的 `stage`），可以有多个。`focus` 输出 = SEED + `global` 事实 + 当前节点、相邻节点、折叠在其中的子节点及当前节点所在阶段的事实、墓志、待办项和节点状态；卡住开发的 `global` 待办项也会带上；其余只给一行“另有 N 条未展开”。`export-task` 只带 `global` 事实、目标节点相关的记录，以及节点 `refs` 引用的文档章节原文（`docs/protocol.md#6` 按 `#` 后的标题、章节号或 slug 截取那一节；`case.json#a.b` 取该键的值）。`global` 事实超过字数上限（默认 3000 字符，`config --global-fact-limit` 调整）时，`verify` / `focus` / `status` 会给出 `[GLOBAL_FACTS_OVER_BUDGET]` 警告。
+
+**取代关系**：事实只追加不修改。新结论推翻旧事实时用 `verify --supersedes GT-xx`，旧条目默认不再出现在 `focus`、`export-task` 和 `facts` 中（`facts --all --with-superseded` 仍可查看），作用域默认沿用被取代的条目。
+
+**为什么单独放在 `.arch/records.json`，而不是 `graph.json` 的新键**
+
+- 寿命不同：`graph.json` 是架构图状态，`fork` 回滚时随快照一起回退；事实、墓志和待办项是对现实的认识，回滚图时必须保留。分开存放后，`fork` 只需整体保留 `records.json`。
+- 读者和 diff 不同：图的每步变更与记录的增长各自成一份 diff，Git 历史里容易看清是改了架构还是多了一条事实。
+- 迁移状态清楚：有没有 `records.json` 就是“是否已迁移”，旧项目无需改动 `graph.json` 就能继续用。
+
+**只能通过 CLI / MCP 读写**：`records.json` 是唯一数据源。`ground_truth.md`、`graveyard.md`、`open_items.md` 每次写入记录时由工具重新生成（文件首行带生成标记），供人阅读和看 Git diff。生成的 md 若被手改，写入命令会拒绝执行并提示先运行 `migrate-records`（手动新增的行会被导入，删改不生效），不会静默覆盖。
+
+**迁移旧项目**：没有 `records.json` 的 `.arch/` 继续按旧方式工作（`focus` / `export-task` 全文拼接 md），并提示 `[RECORDS_NOT_MIGRATED]`。运行 `arch migrate-records`：
+
+- `- [GT-xx] ... -> 架构约束：...` 转为事实，作用域默认 `global`；编号冲突时分配新编号并保留 `legacy_id`。
+- `- ❌ [节点 id / 方案] 废弃原因：...` 转为墓志，节点取方括号中的 id。
+- 条目下方紧跟的缩进行作为该条目的 `detail` 保存；条目上方的小标题记为 `section`。
+- 其余段落（状态表、长段叙述等）按标题切分，原样保存为未分类遗留记录，在 `status` 和 `focus` 中提示，并继续显示在生成的 md 里，直到用 `legacy resolve` 标记处理完成。只丢弃引擎自己写入的默认标题。
+- 迁移前先做一次影子快照（`pre-migrate-records-*` 标签）。迁移是幂等的：内容相同的条目不会重复导入，再次运行只导入新增内容。
+
+新建项目（`init`）直接使用结构化记录。
+
+---
+
 ## 📂 项目结构
 
 本项目保持**零第三方 Python 依赖（Zero External Dependencies）**，使用标准库即开即用：
@@ -159,15 +197,24 @@ arch-grower/
 │   ├── arch_mcp.py          # 标准 Stdio MCP (Model Context Protocol) 服务端
 │   └── dashboard_template.html  # export-ui 使用的单文件看板模板（零外部依赖，离线可用）
 ├── tests/
-│   └── test_arch_cli.py     # 标准库 unittest 回归测试：python3 -m unittest discover -s tests
+│   └── test_arch_cli.py     # 标准库 unittest 回归测试：uv run --no-project python -m unittest discover -s tests
 ├── docs/
 │   ├── images/              # README 中的看板截图（亮色 / 暗色）
 │   └── examples/            # 可直接打开的看板示例 HTML
-└── references/
-    ├── onboarding_tutorial.md   # 5 分钟交互式新手演练剧本
-    ├── stage_patterns.md        # 阶段内并发并行与多态设计模式
-    ├── execution_and_hotswap.md # 初次交付、已落地节点变更与热替换
-    └── grounding_guide.md       # 现实世界黑盒约束与硬件边界确认指南
+├── references/
+│   ├── onboarding_tutorial.md   # 5 分钟交互式新手演练剧本
+│   ├── stage_patterns.md        # 阶段内并发并行与多态设计模式
+│   ├── execution_and_hotswap.md # 初次交付、已落地节点变更与热替换
+│   └── grounding_guide.md       # 现实世界黑盒约束与硬件边界确认指南
+└── （目标项目中）.arch/
+    ├── SEED.md              # 一句话初始意图
+    ├── graph.json           # 架构图：节点、连线、折叠模块、节点状态
+    ├── records.json         # 事实、墓志、待办项、未分类遗留（唯一数据源）
+    ├── ground_truth.md      # 由 records.json 生成，只读
+    ├── graveyard.md         # 由 records.json 生成，只读
+    ├── open_items.md        # 由 records.json 生成，只读
+    ├── grounding.json       # 挂载的文档、探针与人工验证源
+    └── .git/                # Shadow Git 快照
 ```
 
 ---
@@ -268,6 +315,14 @@ arch export-ui
 # 浏览器打开 .arch/dashboard.html 即可查看全局架构看板（离线可用）：
 #   点击节点查看上下游与契约；/ 搜索，← → 沿连线走，↑ ↓ 同阶段切换，Esc 取消
 # 看板是 graph.json 的只读快照，图更新后重新执行 export-ui
+
+# 7. 记录只与某个节点相关的事实、待实测问题和实现进度
+arch verify --fact "BLE MTU 实测 185" --constraint "音频分片 ≤ 180 字节" \
+  --scope entry_input --source "analysis/ble/mtu.json#android"
+arch open add --question "骨传导延迟是否 < 150ms？" --kind device_test --owner user \
+  --scope translate_out --blocking
+arch set-node-state --node entry_input --impl built --verify device --add-ref "docs/protocol.md#6"
+arch status   # 全局进度：实现 / 验证、卡开发的待办项、记录统计
 ```
 
 用 `arch <子命令> --help` 查询参数。已落地项目的修改流程见[执行与变更手册](references/execution_and_hotswap.md)。
@@ -279,19 +334,27 @@ arch export-ui
 | 原生 MCP 工具名 | CLI 命令 | 作用说明 |
 | :--- | :--- | :--- |
 | `arch_init` | `init` | 初始化项目状态机，创建带待定节点的初始主干与 Shadow Git 仓库 |
-| `arch_focus` | `focus` | 获取当前待定节点的局部上下文、项目目标约束与切片视图 |
+| `arch_focus` | `focus` | 获取当前节点的 1-Hop 切片、`global` 事实与相关记录（其余只给未展开计数） |
 | `arch_collapse` | `collapse` | 确定待定节点或更新已确定节点的规范并记录快照 |
 | `arch_set_edge_contract` | `set-edge-contract --from <起点> --to <终点> --contract <契约>` | 更新一条已有连线的契约 |
 | `arch_add_node` | `add-node` | 在图中增量插入新节点（可指定前驱/后继连线与生命周期 Stage） |
 | `arch_add_fog` | `add-node --status fog` | 快捷工具：将发散想法放入迷雾储备区，保持主干清晰聚焦 |
 | `arch_deactivate`| `deactivate` | 将活跃节点移入暂缓储备区，自动缝合上下游依赖连线 |
 | `arch_activate` | `activate` | 将储备区的节点重新激活为待定节点并接入主线 |
-| `arch_verify` | `verify` | 将用户实测确认的现实事实与推导出的硬约束写入 `ground_truth.md` |
+| `arch_verify` | `verify --fact --constraint [--scope] [--source] [--supersedes GT-xx]` | 沉淀已验证事实与硬约束，可指定作用域、证据来源和取代的旧事实 |
+| `arch_facts` | `facts [--node <节点> \| --all] [--with-superseded]` | 查询事实：缺省列 `global`，`--node` 列节点相关事实与墓志，`--all` 按作用域列全部 |
+| `arch_rescope` | `rescope --id <GT-xx/OI-xx> --scope <作用域>` | 修改事实或待办项的作用域，内容不变 |
+| `arch_open` | `open add / resolve / list` | 待办项登记：待验证的未知项，区分实测 / 调研 / 决策、用户 / 代理处理、是否卡开发 |
+| `arch_set_node_state` | `set-node-state --node <节点> [--impl] [--verify] [--ref/--add-ref/--drop-ref] [--file-path]` | 记录节点实现进度、验证程度（带日期）、文档引用与实现文件 |
+| `arch_status` | `status` | 项目进度总览：节点实现 / 验证、待办项、记录统计与迁移提示 |
+| `arch_migrate_records` | `migrate-records` | 把旧格式 md 记录导入 `records.json`（幂等，无法识别的段落原样保留为未分类遗留） |
+| `arch_legacy` | `legacy list / show / resolve` | 查看与关闭迁移时保留的未分类遗留记录 |
+| `arch_config` | `config [--global-fact-limit N]` | 查看或设置 `global` 事实字数上限 |
 | `arch_ground` | `ground` | 挂载外部资料或探针（文档、命令、代码引用）到 `grounding.json` |
-| `arch_export_task`| `export-task` | 导出单节点的独立编码任务卡（专供临时子代理在沙箱中执行） |
-| `arch_commit_node`| `commit-node --node <节点> --file-path <项目内源码路径>` | 验证后提交快照并绑定实现代码路径 |
+| `arch_export_task`| `export-task` | 导出单节点的独立编码任务卡（只带相关记录与 `refs` 章节原文，专供临时子代理在沙箱中执行） |
+| `arch_commit_node`| `commit-node --node <节点> --file-path <项目内源码路径>`（可重复） | 验证后提交快照、绑定一个或多个实现文件，并把节点记为 `built` |
 | `arch_sync_manual`| `sync-manual` | 感知人类在 IDE 中的手动修改，同步快照以解除防覆盖拦截 |
-| `arch_reset_node` | `reset-node` | 将节点重置为待定，保留连线并记录替换原因 |
+| `arch_reset_node` | `reset-node` | 将节点重置为待定，保留连线，把旧方案记入墓志，实现进度清回 `planned` |
 | `arch_fold` | `fold` | 将已确定、彼此连通的子图折叠为一个超级节点（子节点与内部连线完整保存，对外连线与契约保留），降低认知负荷 |
 | `arch_unfold` | `unfold` | 展开超级节点并原样恢复；折叠期间新增的连线自动接到唯一的入口/出口子节点，无法判断时通过 `attach` 指定 |
 | `arch_fork` | `fork` | 从历史快照分叉，已绑定节点的代码文件随图一并回滚（保留避坑记录；存在未提交改动时拒绝执行） |
@@ -304,7 +367,7 @@ arch export-ui
 在二次开发或接入本引擎时，建议遵循以下准则：
 
 1. **专注状态流转与切片推演，避免重型可视化**：图形看板只是状态的可视化投影，核心价值在于人机对话驱动的状态流转。
-2. **禁止大模型全量覆盖状态文件**：大模型不得直接覆写 `graph.json`，必须通过 CLI / MCP 提供的原子命令进行增量变更，保证图状态的一致性。
+2. **禁止大模型全量覆盖状态文件**：大模型不得直接覆写 `graph.json`、`records.json` 或生成的 md，必须通过 CLI / MCP 提供的原子命令进行增量变更，保证图状态与记录的一致性。
 3. **主对话与代码实现严格解耦**：主对话专注于架构推演与设计决策；具体业务代码编写与单元测试交由独立子代理完成，避免长对话被实现细节与报错日志污染。
 4. **未明确接口定义前不盲目编码**：只有当节点的输入输出契约与依赖明确时，才交由子代理落地代码，拒绝凭空臆造。
 

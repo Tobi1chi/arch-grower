@@ -4,19 +4,19 @@
 
 ## 1. 首次落地
 
-收到 `[WALKING_SKELETON_READY]` 后，核对本次交付通路和节点依赖。该提示表示引擎找到了至少一条无待定节点的路径。用户确认开写后，按本次通路的依赖顺序使用 `arch export-task --node "$NODE_ID"` 导出单节点任务书。
+收到 `[WALKING_SKELETON_READY]` 后，核对本次交付通路和节点依赖。该提示表示引擎找到了至少一条无待定节点的路径。用户确认开写后，先用 `arch open list --blocking` 检查卡住开发的待办项，再按本次通路的依赖顺序使用 `arch export-task --node "$NODE_ID"` 导出单节点任务书。任务书只带 `global` 事实和该节点相关的事实、墓志、待办项，以及节点 `refs` 引用的文档章节原文；需要内联的协议章节先用 `arch set-node-state --node "$NODE_ID" --add-ref "docs/protocol.md#6"` 挂上（`#` 后写标题、章节号或 slug；JSON 文件写键路径）。开写时用 `--impl building` 标记进度。
 
-把任务书交给独立子代理，说明项目根目录、脚本绝对路径和验证范围。用端口与适配器隔离易变的外部接口，按用户和项目要求验证契约与现实环境约束。验证通过后用 `arch commit-node --node "$NODE_ID" --file-path "$IMPL_PATH"` 从目标项目根目录提交快照，`IMPL_PATH` 使用项目相对路径。若子代理在独立检出中实现，先将变更合入目标工作目录，再由持有目标 `.arch/` 的代理提交快照。子代理返回最多三行，说明完成项、验证结果和待处理事项。
+把任务书交给独立子代理，说明项目根目录、脚本绝对路径和验证范围。用端口与适配器隔离易变的外部接口，按用户和项目要求验证契约与现实环境约束。验证通过后用 `arch commit-node --node "$NODE_ID" --file-path "$IMPL_PATH"` 从目标项目根目录提交快照，`IMPL_PATH` 使用项目相对路径；节点由多个文件实现时重复 `--file-path`。提交后节点记为 `built`。按实际做过的验证用 `arch set-node-state --node "$NODE_ID" --verify unit|api|device` 记录验证程度（自动记日期，补记旧日期用 `--verify-date`）；还要用户真机实测的，用 `arch open add --kind device_test --owner user --scope "$NODE_ID"` 登记。若子代理在独立检出中实现，先将变更合入目标工作目录，再由持有目标 `.arch/` 的代理提交快照。子代理返回最多三行，说明完成项、验证结果和待处理事项。
 
 ## 2. 修改已落地的节点
 
 1. **确定影响范围。** 用 `arch focus --node "$NODE_ID"` 读取现有规范、实现路径、快照与 1-Hop 契约。让子代理核对实际调用方、相关接口文档，以及绑定同一实现文件的其他节点。只有接口或行为变化继续影响到下一层时，才沿依赖扩展检查。按需记录受影响的节点、具体连线、代码、现有调用方与文档。
 2. **确认方案和基线。** 仅实现细节变化且原规范仍准确时，沿用现有图。若业务行为、接口或数据语义变化，明确新的契约及旧调用方或既有数据的处理方式。执行 `reset-node` 或编辑源码前，先对本次要修改实现的已落地节点运行 `export-task` 检查基线，发现漂移按下节处理。重置会清空节点的 `last_tag`，因此基线检查需先于重置。
-3. **更新受影响的图。** 已明确的新方案可直接对实心节点再次 `collapse`。传齐 `--node`、`--label`、`--spec` 和当前 `--type`，否则类型默认为 `port`。新方案还要讨论时，用 `arch reset-node --node "$NODE_ID" --reason "$REASON"` 保留连线并记录旧方案的替换原因，确认后再 `collapse`。只有整组入边或出边都要使用同一契约时才使用 `--in-contract` 或 `--out-contract`。单条连线用 `arch set-edge-contract --from "$UPSTREAM_ID" --to "$DOWNSTREAM_ID" --contract "$CONTRACT"`。如果邻居节点的 `spec` 也记载了同一行为，同步修改受影响的条目，并用 `focus` 核对更新后的切片。
+3. **更新受影响的图。** 已明确的新方案可直接对实心节点再次 `collapse`。传齐 `--node`、`--label`、`--spec` 和当前 `--type`，否则类型默认为 `port`。新方案还要讨论时，用 `arch reset-node --node "$NODE_ID" --reason "$REASON"` 保留连线并记录旧方案的替换原因，确认后再 `collapse`。只有整组入边或出边都要使用同一契约时才使用 `--in-contract` 或 `--out-contract`。单条连线用 `arch set-edge-contract --from "$UPSTREAM_ID" --to "$DOWNSTREAM_ID" --contract "$CONTRACT"`。如果邻居节点的 `spec` 也记载了同一行为，同步修改受影响的条目，并用 `focus` 核对更新后的切片。变更推翻了已有事实时，用 `arch verify --supersedes GT-xx` 写入新事实，旧条目自动隐藏；已实现的节点改了方案后，用 `arch set-node-state --impl building` 标回实现中。
 4. **一起实现并验证耦合的改动。** 从更新后的图导出受影响节点的任务书，把实际调用方、共享文件、文档章节和兼容要求随任务交给子代理。图上的 `spec` 或连线摘要可引用仓库相对文档路径及章节。本次契约有变化时，同步修改提供方、受影响的消费方和文档。共用同一文件或需协同迁移的节点交给同一子代理，或按依赖顺序串行修改。按项目要求验证受影响的调用路径、共享文件中涉及的原有行为和现有数据兼容性。
 5. **更新实现快照。** Shadow Git 按整个文件比对和提交。验证完成后，检查绑定文件的完整差异，确认要纳入快照的修改都已核实，再在目标项目逐个执行 `commit-node`。对绑定同一改动文件的其他已落地节点，在核实其契约与实现一致后，同步更新快照，避免后续把已核实的改动识别成漂移。
 
-实现或验证中断时，记录图、代码和文档在哪一步，恢复后先对照该记录再继续。如果取消本次变更，用 `collapse` 和 `set-edge-contract` 恢复受影响条目，并由实现子代理撤回本次代码和文档改动。若节点经过 `reset-node`，恢复并验证实现后再用 `commit-node` 重新建立基线。
+实现或验证中断时，记录图、代码和文档在哪一步，恢复后先对照该记录再继续。如果取消本次变更，用 `collapse` 和 `set-edge-contract` 恢复受影响条目，并由实现子代理撤回本次代码和文档改动。若节点经过 `reset-node`，恢复并验证实现后再用 `commit-node` 重新建立基线。`reset-node` 会把节点的实现进度和验证程度清回 `planned` / `none`，引用和实现文件保留。
 
 ## 3. 处理 Shadow Git 漂移
 

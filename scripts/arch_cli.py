@@ -11,22 +11,28 @@ import os
 import re
 import subprocess
 import sys
-from collections import deque
+import textwrap
+from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 ARCH_DIR = Path(".arch")
 GRAPH_FILE = ARCH_DIR / "graph.json"
 SEED_FILE = ARCH_DIR / "SEED.md"
 GROUND_TRUTH_FILE = ARCH_DIR / "ground_truth.md"
 GRAVEYARD_FILE = ARCH_DIR / "graveyard.md"
+OPEN_ITEMS_FILE = ARCH_DIR / "open_items.md"
+RECORDS_FILE = ARCH_DIR / "records.json"
 GROUNDING_FILE = ARCH_DIR / "grounding.json"
 SHADOW_GIT_DIR = ARCH_DIR / ".git"
 DASHBOARD_TEMPLATE = Path(__file__).resolve().parent / "dashboard_template.html"
 
 MAX_ACTIVE_HOLES = 3
 MAX_UNFOLDED_SOLID = 7
+DEFAULT_GLOBAL_FACT_LIMIT = 3000   # characters of active `global` facts before warning
+REF_WHOLE_FILE_LIMIT = 4000        # a ref without '#section' is inlined only when this small
+REF_SECTION_LIMIT = 20000          # longest inlined ref section in an export-task
 
 # A changed diff line that declares a function / type, across common languages
 # (Python, JS/TS, Go, Rust, C#/Java-style modifiers). Anchored at the start of the
@@ -167,7 +173,27 @@ def _compact_node(node: Dict[str, Any]) -> Dict[str, Any]:
         return node
     view = {k: v for k, v in node.items()
             if k not in ("children", "inner_edges")}
-    view["folded_children"] = [{"id": c["id"], "label": c["label"]} for c in node["children"]]
+    view["folded_children"] = [
+        {"id": c["id"], "label": c["label"]}
+        if c["status"] == "super_node" else
+        {"id": c["id"], "label": c["label"], "impl": _node_state(c)["impl"]}
+        for c in node["children"]
+    ]
+    leaves = [c for c in _iter_all_nodes(node["children"]) if c["status"] != "super_node"]
+    built = sum(1 for c in leaves if _node_state(c)["impl"] == "built")
+    view["impl_progress"] = f"{built}/{len(leaves)} built"
+    return view
+
+
+def _node_view(node: Dict[str, Any]) -> Dict[str, Any]:
+    """A node as shown in slices and task cards: state fields filled with defaults."""
+    if node["status"] == "super_node":
+        return _compact_node(node)
+    state = _node_state(node)
+    view = dict(node)
+    view["impl"] = state["impl"]
+    view["verify"] = state["verify"]
+    view["refs"] = state["refs"]
     return view
 
 
@@ -277,12 +303,13 @@ def _topological_order(graph: Dict[str, Any]) -> List[str]:
 
 
 def _check_node_drift(node: Dict[str, Any]) -> None:
-    file_path = node.get("file_path")
+    files = [f for f in _node_files(node) if Path(f).exists()]
     last_tag = node.get("last_tag")
-    if not file_path or not last_tag or not Path(file_path).exists() or not SHADOW_GIT_DIR.exists():
+    if not files or not last_tag or not SHADOW_GIT_DIR.exists():
         return
+    file_path = ", ".join(files)
 
-    diff_res = _run_shadow_git(["diff", last_tag, "--", file_path], check=False)
+    diff_res = _run_shadow_git(["diff", last_tag, "--"] + files, check=False)
     if diff_res.stdout.strip():
         sig_changed = any(
             not line.startswith(("+++", "---")) and SIGNATURE_LINE.match(line)
@@ -306,6 +333,635 @@ def _check_node_drift(node: Dict[str, Any]) -> None:
 
 
 # =====================================================================
+# Node state: implementation progress, verification depth, references
+# =====================================================================
+#
+# `status` (hole / solid / fog / super_node) says whether a decision is made.
+# The fields below say how far the decided node has got in reality. Graphs
+# written before they existed have none of them; _node_state fills defaults.
+
+IMPL_LEVELS = ("planned", "building", "built")
+VERIFY_LEVELS = ("none", "unit", "api", "device")
+IMPL_TEXT = {"planned": "未实现", "building": "实现中", "built": "已实现"}
+VERIFY_TEXT = {"none": "未验证", "unit": "单测", "api": "接口实测", "device": "真机实测"}
+
+
+def _today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _node_files(node: Dict[str, Any]) -> List[str]:
+    """`file_path` holds one path (string, the original format) or several (list)."""
+    raw = node.get("file_path") or ""
+    items = raw if isinstance(raw, list) else [raw]
+    return [str(p).strip() for p in items if str(p).strip()]
+
+
+def _store_files(node: Dict[str, Any], files: Iterable[str]) -> None:
+    unique = list(dict.fromkeys(f.strip() for f in files if f and f.strip()))
+    node["file_path"] = unique[0] if len(unique) == 1 else (unique if unique else "")
+
+
+def _node_state(node: Dict[str, Any]) -> Dict[str, Any]:
+    """impl / verify / refs / files with defaults for graphs that predate them.
+
+    A node without `impl` counts as built when it has an implementation
+    snapshot (commit-node / sync-manual set `last_tag`), otherwise planned.
+    """
+    impl = node.get("impl")
+    if impl not in IMPL_LEVELS:
+        impl = "built" if node.get("last_tag") else "planned"
+    verify = node.get("verify")
+    if isinstance(verify, str):
+        verify = {"level": verify, "date": ""}
+    if not isinstance(verify, dict) or verify.get("level") not in VERIFY_LEVELS:
+        verify = {"level": "none", "date": ""}
+    refs = [str(r).strip() for r in (node.get("refs") or []) if str(r).strip()]
+    return {
+        "impl": impl,
+        "verify": {"level": verify["level"], "date": verify.get("date") or ""},
+        "refs": refs,
+        "files": _node_files(node),
+    }
+
+
+def _state_text(node: Dict[str, Any]) -> str:
+    st = _node_state(node)
+    verify = VERIFY_TEXT[st["verify"]["level"]]
+    if st["verify"]["date"]:
+        verify += f" {st['verify']['date']}"
+    return f"{IMPL_TEXT[st['impl']]} · {verify}"
+
+
+def _find_any_node(graph: Dict[str, Any], node_id: str) -> Optional[Dict[str, Any]]:
+    """Find a node at any depth, folded children included."""
+    return next((n for n in _iter_all_nodes(graph["nodes"]) if n["id"] == node_id), None)
+
+
+# =====================================================================
+# Typed records: facts, graveyard, open items, legacy (.arch/records.json)
+# =====================================================================
+#
+# records.json is the source of truth once a project is migrated; the md files
+# are rendered from it for people and Git diffs. A project without records.json
+# keeps the original behaviour (md files appended to and concatenated whole).
+
+GENERATED_MARKER = (
+    "<!-- arch-grower：本文件由 .arch/records.json 生成，请勿手改；"
+    "用 arch verify / open / rescope / legacy 等命令维护 -->"
+)
+GT_TITLE = "# 已验证现实事实与硬约束 (Ground Truth)"
+GY_TITLE = "# 废弃分支与踩坑记录 (Graveyard)"
+OPEN_TITLE = "# 待办项 (Open Items)"
+DEFAULT_TITLES = {GT_TITLE, GY_TITLE, OPEN_TITLE, "# 踩坑记录"}
+RECORD_LISTS = ("facts", "graveyard", "open_items", "legacy")
+
+OPEN_KINDS = ("device_test", "research", "decision")
+OPEN_OWNERS = ("user", "agent")
+KIND_TEXT = {"device_test": "真机实测", "research": "调研", "decision": "待决策"}
+OWNER_TEXT = {"user": "用户处理", "agent": "代理处理"}
+
+NOT_MIGRATED_HINT = (
+    "[RECORDS_NOT_MIGRATED] 本项目的 ground_truth.md / graveyard.md 还是旧格式，focus 与 export-task "
+    "会全文拼接。运行 arch migrate-records 可转为结构化记录，之后按节点只带相关内容。"
+)
+
+GT_LINE = re.compile(
+    r"^[-*]\s+\[(GT-[^\]\s]+)\]\s*(?:[(（]已验证[)）]\s*)?(.*?)\s*->\s*架构约束\s*[：:]\s*(.*)$"
+)
+GY_LINE = re.compile(r"^[-*]\s+❌\s*\[节点\s+([^\s/\]]+)\s*/\s*(.*)\]\s*废弃原因\s*[：:]\s*(.*)$")
+MD_HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+
+
+def _records_enabled() -> bool:
+    return RECORDS_FILE.exists()
+
+
+def _new_records() -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "settings": {"global_fact_char_limit": DEFAULT_GLOBAL_FACT_LIMIT},
+        "facts": [],
+        "graveyard": [],
+        "open_items": [],
+        "legacy": [],
+    }
+
+
+def _read_records() -> Dict[str, Any]:
+    data = json.loads(RECORDS_FILE.read_text(encoding="utf-8"))
+    base = _new_records()
+    data.setdefault("version", base["version"])
+    settings = data.setdefault("settings", {})
+    for key, value in base["settings"].items():
+        settings.setdefault(key, value)
+    for key in RECORD_LISTS:
+        data.setdefault(key, [])
+    return data
+
+
+def _load_records(for_write: bool = False) -> Dict[str, Any]:
+    if not _records_enabled():
+        raise ArchEngineError(
+            "本项目还没有结构化记录 (.arch/records.json)。\n"
+            "JIT 指令：先运行 arch migrate-records（MCP: arch_migrate_records）把现有 md 记录导入，再重试本命令。"
+        )
+    rec = _read_records()
+    if for_write:
+        _guard_rendered_md(rec)
+    return rec
+
+
+def _save_records(rec: Dict[str, Any]) -> None:
+    RECORDS_FILE.write_text(json.dumps(rec, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    for path, text in _rendered_files(rec).items():
+        path.write_text(text, encoding="utf-8")
+
+
+def _next_id(items: List[Dict[str, Any]], prefix: str) -> str:
+    pattern = re.compile(rf"^{prefix}-(\d+)$")
+    nums = [int(m.group(1)) for m in (pattern.match(str(i.get("id", ""))) for i in items) if m]
+    return f"{prefix}-{(max(nums) if nums else 0) + 1:02d}"
+
+
+def _superseded_ids(rec: Dict[str, Any]) -> Dict[str, str]:
+    """Superseded fact id -> id of the fact that replaced it."""
+    out: Dict[str, str] = {}
+    for f in rec["facts"]:
+        for old in f.get("supersedes") or []:
+            out.setdefault(old, f["id"])
+    return out
+
+
+def _active_facts(rec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    gone = _superseded_ids(rec)
+    return [f for f in rec["facts"] if f["id"] not in gone]
+
+
+def _is_global(record: Dict[str, Any]) -> bool:
+    return "global" in (record.get("scope") or ["global"])
+
+
+def _fact_chars(f: Dict[str, Any]) -> int:
+    return len(f.get("text", "")) + len(f.get("constraint", "")) + len(f.get("detail", ""))
+
+
+def _global_fact_budget(rec: Dict[str, Any]) -> Tuple[int, int]:
+    used = sum(_fact_chars(f) for f in _active_facts(rec) if _is_global(f))
+    return used, int(rec["settings"].get("global_fact_char_limit") or DEFAULT_GLOBAL_FACT_LIMIT)
+
+
+def _budget_warning(rec: Dict[str, Any]) -> str:
+    used, limit = _global_fact_budget(rec)
+    if used <= limit:
+        return ""
+    return (
+        f"[GLOBAL_FACTS_OVER_BUDGET] global 事实共 {used} 字符，超过上限 {limit}（每次 focus 都会带上）。"
+        "把只与部分节点或阶段相关的事实改成对应作用域：arch rescope --id GT-xx --scope <节点或阶段>；"
+        "已过时的用 arch verify --supersedes 取代。上限可用 arch config --global-fact-limit 调整。"
+    )
+
+
+def _scope_text(scopes: List[str]) -> str:
+    return ", ".join(scopes or ["global"])
+
+
+def _normalize_scopes(raw: Union[None, str, Iterable[str]], graph: Optional[Dict[str, Any]]) -> List[str]:
+    if isinstance(raw, str):
+        raw = [raw]
+    scopes = list(dict.fromkeys(s.strip() for s in (raw or []) if s and s.strip())) or ["global"]
+    if "global" in scopes and len(scopes) > 1:
+        raise ArchEngineError("作用域 global 不能和节点 / 阶段作用域混用。")
+    if graph is not None:
+        all_nodes = list(_iter_all_nodes(graph["nodes"]))
+        ids = {n["id"] for n in all_nodes}
+        stages = {n.get("stage") for n in all_nodes if n.get("stage")}
+        bad = [s for s in scopes if s != "global" and s not in ids and s not in stages]
+        if bad:
+            raise ArchEngineError(
+                f"未知作用域：{', '.join(bad)}。作用域只能是 global、节点 ID（含折叠在模块内的子节点）"
+                f"或阶段名（节点的 stage）。现有阶段：{', '.join(sorted(stages)) or '无'}。"
+            )
+    return scopes
+
+
+def _context_keys(graph: Dict[str, Any], target_id: str, neighbor_ids: Iterable[str] = ()) -> set:
+    """Scopes that count as related to a focus target.
+
+    The target, its neighbours, every node folded inside any of them, and the
+    target's stage.
+    """
+    keys = {target_id}
+    target = _find_any_node(graph, target_id)
+    if target and target.get("stage"):
+        keys.add(target["stage"])
+    for nid in [target_id, *neighbor_ids]:
+        keys.add(nid)
+        node = _find_any_node(graph, nid)
+        if node:
+            keys.update(c["id"] for c in _iter_all_nodes(node.get("children", [])))
+    return keys
+
+
+def _matches(record: Dict[str, Any], keys: set) -> bool:
+    return any(s in keys for s in (record.get("scope") or ["global"]))
+
+
+# ---------------------------------------------------------------- formatting
+
+def _fact_line(f: Dict[str, Any], show_scope: bool = True, superseded_by: str = "") -> str:
+    line = f"- [{f['id']}] {f['text']} -> 架构约束：{f['constraint']}"
+    meta = []
+    if show_scope and not _is_global(f):
+        meta.append(f"作用域 {_scope_text(f['scope'])}")
+    if f.get("source"):
+        meta.append(f"来源 {f['source']}")
+    if f.get("supersedes"):
+        meta.append(f"取代 {', '.join(f['supersedes'])}")
+    if superseded_by:
+        meta.append(f"已被 {superseded_by} 取代")
+    if meta:
+        line += "（" + "；".join(meta) + "）"
+    if f.get("detail"):
+        line += "\n" + textwrap.indent(f["detail"], "  ")
+    return line
+
+
+def _grave_line(g: Dict[str, Any]) -> str:
+    line = f"- ❌ [节点 {g['node']} / {g['scheme']}] 废弃原因：{g['reason']}"
+    if g.get("detail"):
+        line += "\n" + textwrap.indent(g["detail"], "  ")
+    return line
+
+
+def _open_line(o: Dict[str, Any]) -> str:
+    meta = [_scope_text(o["scope"]), KIND_TEXT.get(o["kind"], o["kind"]), OWNER_TEXT.get(o["owner"], o["owner"])]
+    if o.get("blocking"):
+        meta.append("卡开发")
+    line = f"- [{o['id']}] {o['question']}（{' · '.join(meta)}）"
+    if o.get("status") == "resolved":
+        line += f"\n  → 已解决 {o.get('resolved_at', '')}：{o.get('resolution', '')}".rstrip("：")
+    return line
+
+
+# ----------------------------------------------------------------- rendering
+
+def _render_legacy(rec: Dict[str, Any], source: str) -> List[str]:
+    items = [lg for lg in rec["legacy"] if lg.get("source") == source and lg.get("status") != "resolved"]
+    if not items:
+        return []
+    out = ["## 未分类遗留记录（待人工处理：arch legacy list / legacy show / legacy resolve）", ""]
+    for lg in items:
+        out += [f"### {lg['id']}", "", lg["text"], ""]
+    return out
+
+
+def _render_ground_truth(rec: Dict[str, Any]) -> str:
+    lines = [GENERATED_MARKER, GT_TITLE, ""]
+    gone = _superseded_ids(rec)
+    active = [f for f in rec["facts"] if f["id"] not in gone]
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for f in sorted(active, key=lambda f: not _is_global(f)):
+        groups.setdefault(_scope_text(f.get("scope") or ["global"]), []).append(f)
+    if not active:
+        lines += ["暂无记录。", ""]
+    for scope, facts in groups.items():
+        lines += [f"## 作用域 · {scope}", ""]
+        for f in facts:
+            lines.append(f"- [{f['id']}] {f['text']} -> 架构约束：{f['constraint']}")
+            meta = [x for x in (
+                f"来源：{f['source']}" if f.get("source") else "",
+                f"日期：{f['date']}" if f.get("date") else "",
+                f"取代：{', '.join(f['supersedes'])}" if f.get("supersedes") else "",
+            ) if x]
+            if meta:
+                lines.append("  - " + " · ".join(meta))
+            if f.get("detail"):
+                lines.append(textwrap.indent(f["detail"], "  "))
+        lines.append("")
+    old = [f for f in rec["facts"] if f["id"] in gone]
+    if old:
+        lines += ["## 已被取代（focus / export-task 默认不展示）", ""]
+        for f in old:
+            lines.append(f"- [{f['id']}] {f['text']} -> 架构约束：{f['constraint']}")
+            lines.append(f"  - 作用域：{_scope_text(f.get('scope'))} · 由 {gone[f['id']]} 取代")
+            if f.get("detail"):
+                lines.append(textwrap.indent(f["detail"], "  "))
+        lines.append("")
+    lines += _render_legacy(rec, GROUND_TRUTH_FILE.name)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_graveyard(rec: Dict[str, Any]) -> str:
+    lines = [GENERATED_MARKER, GY_TITLE, ""]
+    if not rec["graveyard"]:
+        lines += ["暂无记录。", ""]
+    for g in rec["graveyard"]:
+        lines.append(f"- ❌ [节点 {g['node']} / {g['scheme']}] 废弃原因：{g['reason']}")
+        lines.append("  - " + " · ".join(x for x in (g["id"], g.get("date", "")) if x))
+        if g.get("detail"):
+            lines.append(textwrap.indent(g["detail"], "  "))
+    if rec["graveyard"]:
+        lines.append("")
+    lines += _render_legacy(rec, GRAVEYARD_FILE.name)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_open_items(rec: Dict[str, Any]) -> str:
+    lines = [GENERATED_MARKER, OPEN_TITLE, ""]
+    open_items = [o for o in rec["open_items"] if o.get("status") != "resolved"]
+    done = [o for o in rec["open_items"] if o.get("status") == "resolved"]
+    lines += ["## 未关闭", ""]
+    if not open_items:
+        lines += ["暂无。", ""]
+    for o in sorted(open_items, key=lambda o: not o.get("blocking")):
+        lines.append(f"- [{o['id']}] {o['question']}")
+        meta = [f"作用域：{_scope_text(o['scope'])}", KIND_TEXT.get(o["kind"], o["kind"]),
+                OWNER_TEXT.get(o["owner"], o["owner"])]
+        if o.get("blocking"):
+            meta.append("卡开发")
+        if o.get("created"):
+            meta.append(f"登记：{o['created']}")
+        lines.append("  - " + " · ".join(meta))
+    if open_items:
+        lines.append("")
+    if done:
+        lines += ["## 已解决", ""]
+        for o in done:
+            lines.append(f"- [{o['id']}] {o['question']}")
+            lines.append(f"  - 作用域：{_scope_text(o['scope'])} · 解决：{o.get('resolved_at', '')}")
+            lines.append(f"  - 结论：{o.get('resolution', '')}")
+        lines.append("")
+    lines += _render_legacy(rec, OPEN_ITEMS_FILE.name)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _rendered_files(rec: Dict[str, Any]) -> Dict[Path, str]:
+    return {
+        GROUND_TRUTH_FILE: _render_ground_truth(rec),
+        GRAVEYARD_FILE: _render_graveyard(rec),
+        OPEN_ITEMS_FILE: _render_open_items(rec),
+    }
+
+
+def _md_is_boilerplate(text: str) -> bool:
+    return all(ln.strip() in DEFAULT_TITLES for ln in text.splitlines() if ln.strip())
+
+
+def _pending_md_edits(rec: Dict[str, Any]) -> List[Path]:
+    """Rendered md files whose content is not what records.json renders to."""
+    out = []
+    for path, expected in _rendered_files(rec).items():
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if text != expected and not _md_is_boilerplate(text):
+            out.append(path)
+    return out
+
+
+def _guard_rendered_md(rec: Dict[str, Any]) -> None:
+    pending = _pending_md_edits(rec)
+    if pending:
+        raise ArchEngineError(
+            f"{'、'.join(p.name for p in pending)} 里有 records.json 之外的内容（手改或旧格式）。"
+            "这些 md 由工具从 .arch/records.json 生成，继续写入会覆盖它们。\n"
+            "JIT 指令：先运行 arch migrate-records 导入这些内容，再重试本命令；之后用 CLI / MCP 命令维护记录，不要手改 md。"
+        )
+
+
+# ----------------------------------------------------------------- migration
+
+def _strip_blank_edges(lines: List[str]) -> List[str]:
+    start, end = 0, len(lines)
+    while start < end and not lines[start].strip():
+        start += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    return lines[start:end]
+
+
+def _parse_md_records(text: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Split an old-format md file into facts, graveyard entries and legacy blocks.
+
+    Recognised entries take indented lines directly below them as `detail`.
+    Everything else is kept verbatim as legacy blocks, split at headings; a
+    heading followed straight by entries becomes their `section` instead.
+    Only the engine's own default titles and the generated-file marker are
+    dropped, so no content is lost.
+    """
+    facts: List[Dict[str, Any]] = []
+    graves: List[Dict[str, Any]] = []
+    legacy: List[Dict[str, Any]] = []
+    block: List[str] = []
+    section = ""
+    last: Optional[Dict[str, Any]] = None
+
+    def flush(next_is_entry: bool) -> None:
+        lines = _strip_blank_edges(block)
+        block.clear()
+        if not lines:
+            return
+        if next_is_entry and len(lines) == 1 and MD_HEADING.match(lines[0]):
+            return  # kept as the `section` of the entries that follow
+        legacy.append({"text": "\n".join(lines), "section": section})
+
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped == GENERATED_MARKER or stripped in DEFAULT_TITLES:
+            continue
+        if last is not None and stripped and raw[:1] in (" ", "\t"):
+            last["_detail"].append(raw)
+            continue
+        last = None
+        fm, gm = GT_LINE.match(raw), GY_LINE.match(raw)
+        if fm or gm:
+            flush(True)
+            if fm:
+                last = {"legacy_id": fm.group(1), "text": fm.group(2).strip(),
+                        "constraint": fm.group(3).strip(), "section": section, "_detail": []}
+                facts.append(last)
+            else:
+                last = {"node": gm.group(1), "scheme": gm.group(2).strip(),
+                        "reason": gm.group(3).strip(), "section": section, "_detail": []}
+                graves.append(last)
+            continue
+        heading = MD_HEADING.match(raw)
+        if heading:
+            flush(False)
+            section = heading.group(2)
+        block.append(raw)
+    flush(False)
+
+    for entry in facts + graves:
+        entry["detail"] = textwrap.dedent("\n".join(entry.pop("_detail"))).strip("\n")
+    return {"facts": facts, "graveyard": graves, "legacy": legacy}
+
+
+def _added_lines(text: str, expected: str) -> str:
+    """Lines of `text` that the rendered `expected` does not account for, in order."""
+    budget = Counter(expected.splitlines())
+    kept = []
+    for line in text.splitlines():
+        if budget[line] > 0:
+            budget[line] -= 1
+        else:
+            kept.append(line)
+    return "\n".join(kept)
+
+
+def _merge_parsed(rec: Dict[str, Any], parsed: Dict[str, List[Dict[str, Any]]],
+                  source: str, stats: Counter) -> None:
+    norm = lambda s: " ".join(str(s).split())
+    fact_keys = {(norm(f["text"]), norm(f["constraint"]), norm(f.get("detail", ""))) for f in rec["facts"]}
+    for f in parsed["facts"]:
+        key = (norm(f["text"]), norm(f["constraint"]), norm(f["detail"]))
+        if key in fact_keys:
+            stats["skipped"] += 1
+            continue
+        fact_keys.add(key)
+        used = {x["id"] for x in rec["facts"]}
+        fid = f["legacy_id"] if f["legacy_id"] not in used else _next_id(rec["facts"], "GT")
+        entry = {"id": fid, "scope": ["global"], "text": f["text"], "constraint": f["constraint"],
+                 "source": "", "date": "", "supersedes": [], "detail": f["detail"], "imported_from": source}
+        if fid != f["legacy_id"]:
+            entry["legacy_id"] = f["legacy_id"]
+        if f["section"]:
+            entry["section"] = f["section"]
+        rec["facts"].append(entry)
+        stats["facts"] += 1
+
+    grave_keys = {(norm(g["node"]), norm(g["scheme"]), norm(g["reason"]), norm(g.get("detail", "")))
+                  for g in rec["graveyard"]}
+    for g in parsed["graveyard"]:
+        key = (norm(g["node"]), norm(g["scheme"]), norm(g["reason"]), norm(g["detail"]))
+        if key in grave_keys:
+            stats["skipped"] += 1
+            continue
+        grave_keys.add(key)
+        entry = {"id": _next_id(rec["graveyard"], "GY"), "node": g["node"], "scheme": g["scheme"],
+                 "reason": g["reason"], "date": "", "detail": g["detail"], "imported_from": source}
+        if g["section"]:
+            entry["section"] = g["section"]
+        rec["graveyard"].append(entry)
+        stats["graveyard"] += 1
+
+    legacy_keys = {(lg.get("source"), lg["text"]) for lg in rec["legacy"]}
+    for lg in parsed["legacy"]:
+        if (source, lg["text"]) in legacy_keys:
+            stats["skipped"] += 1
+            continue
+        legacy_keys.add((source, lg["text"]))
+        rec["legacy"].append({"id": _next_id(rec["legacy"], "LG"), "source": source,
+                              "section": lg["section"], "text": lg["text"], "status": "open",
+                              "note": "", "imported": _today()})
+        stats["legacy"] += 1
+
+
+# ------------------------------------------------------------ ref extraction
+
+def _md_headings(lines: List[str]) -> List[Tuple[int, int, str]]:
+    """(line index, level, title) of every heading outside fenced code blocks."""
+    out, fence = [], ""
+    for i, line in enumerate(lines):
+        mark = re.match(r"^\s*(```|~~~)", line)
+        if mark:
+            fence = "" if fence == mark.group(1) else (fence or mark.group(1))
+            continue
+        if fence:
+            continue
+        m = MD_HEADING.match(line)
+        if m:
+            out.append((i, len(m.group(1)), m.group(2).strip()))
+    return out
+
+
+def _slug(text: str) -> str:
+    text = re.sub(r"[^\w\s-]", "", text.strip().lower())
+    return re.sub(r"\s+", "-", text)
+
+
+def _extract_md_section(text: str, anchor: str) -> Optional[str]:
+    """The section a `file.md#anchor` ref points at, heading line included.
+
+    The anchor may be a heading title, a section number (`6`, `6.2`, `§6`)
+    or a GitHub-style slug; the first heading matching, in that order, wins.
+    """
+    lines = text.splitlines()
+    heads = _md_headings(lines)
+    want = anchor.strip()
+    number = re.sub(r"^§\s*", "", want)
+
+    def strip_prefix(title: str) -> str:
+        return re.sub(r"^(?:§|第)\s*", "", title)
+
+    tests = [
+        lambda t: t.lower() == want.lower(),
+        lambda t: bool(re.fullmatch(r"\d+(?:\.\d+)*", number))
+        and bool(re.match(rf"{re.escape(number)}(?!\d)(?!\.\d)", strip_prefix(t))),
+        lambda t: _slug(t) == _slug(want),
+        lambda t: want.lower() in t.lower(),
+    ]
+    for test in tests:
+        for idx, (line_no, level, title) in enumerate(heads):
+            if test(title):
+                end = next((ln for ln, lv, _ in heads[idx + 1:] if lv <= level), len(lines))
+                return "\n".join(lines[line_no:end]).rstrip()
+    return None
+
+
+def _json_pointer(data: Any, anchor: str) -> Any:
+    if isinstance(data, dict) and anchor in data:
+        return data[anchor]
+    cur = data
+    for part in anchor.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+            cur = cur[int(part)]
+        else:
+            raise KeyError(anchor)
+    return cur
+
+
+def _resolve_ref(ref: str) -> Dict[str, Any]:
+    path_text, _, anchor = ref.partition("#")
+    path = Path(path_text)
+    item: Dict[str, Any] = {"ref": ref}
+    if not path_text or not path.is_file():
+        item["error"] = "文件不存在（路径相对于项目根目录）"
+        return item
+    suffix = path.suffix.lower()
+    try:
+        if suffix in (".md", ".markdown"):
+            text = path.read_text(encoding="utf-8")
+            if not anchor:
+                if len(text) > REF_WHOLE_FILE_LIMIT:
+                    item["note"] = f"整篇 {len(text)} 字符，未内联；请在引用里加 #章节 或让子代理自行查阅"
+                    return item
+                content = text.strip()
+            else:
+                content = _extract_md_section(text, anchor)
+                if content is None:
+                    titles = [t for _, _, t in _md_headings(text.splitlines())][:30]
+                    item["error"] = f"未找到章节 '{anchor}'。可用标题：{' | '.join(titles) or '无'}"
+                    return item
+        elif suffix == ".json" and anchor:
+            value = _json_pointer(json.loads(path.read_text(encoding="utf-8")), anchor)
+            content = json.dumps(value, indent=2, ensure_ascii=False)
+        else:
+            item["note"] = "非 Markdown 章节引用，内容未内联；请子代理按路径自行读取"
+            return item
+    except (KeyError, ValueError, UnicodeDecodeError) as exc:
+        item["error"] = f"无法读取引用：{type(exc).__name__} {exc}"
+        return item
+    if len(content) > REF_SECTION_LIMIT:
+        content = content[:REF_SECTION_LIMIT] + f"\n…（已截断，原文 {len(content)} 字符）"
+    item["content"] = content
+    return item
+
+
+# =====================================================================
 # Core Operations (Shared by CLI and MCP Server)
 # =====================================================================
 
@@ -314,10 +970,16 @@ def op_init(seed: str) -> str:
     _init_shadow_git()
 
     SEED_FILE.write_text(f"# 项目初始意图 (SEED)\n\n{seed.strip()}\n", encoding="utf-8")
+    old_md = [p for p in (GROUND_TRUTH_FILE, GRAVEYARD_FILE)
+              if p.exists() and not _md_is_boilerplate(p.read_text(encoding="utf-8"))]
+    if not _records_enabled() and not old_md:
+        # New projects start with typed records. A re-init over old-format md
+        # leaves them alone; migrate-records converts them explicitly.
+        _save_records(_new_records())
     if not GROUND_TRUTH_FILE.exists():
-        GROUND_TRUTH_FILE.write_text("# 已验证现实事实与硬约束 (Ground Truth)\n\n", encoding="utf-8")
+        GROUND_TRUTH_FILE.write_text(f"{GT_TITLE}\n\n", encoding="utf-8")
     if not GRAVEYARD_FILE.exists():
-        GRAVEYARD_FILE.write_text("# 废弃分支与踩坑记录 (Graveyard)\n\n", encoding="utf-8")
+        GRAVEYARD_FILE.write_text(f"{GY_TITLE}\n\n", encoding="utf-8")
     if not GROUNDING_FILE.exists():
         GROUNDING_FILE.write_text(json.dumps({"sources": []}, indent=2) + "\n", encoding="utf-8")
 
@@ -379,16 +1041,32 @@ def op_focus(node_id: Optional[str] = None) -> str:
         target = settled[-1]
 
     seed_txt = SEED_FILE.read_text(encoding="utf-8").strip() if SEED_FILE.exists() else ""
-    gt_txt = GROUND_TRUTH_FILE.read_text(encoding="utf-8").strip() if GROUND_TRUTH_FILE.exists() else ""
-    gy_txt = GRAVEYARD_FILE.read_text(encoding="utf-8").strip() if GRAVEYARD_FILE.exists() else ""
+    rec = _read_records() if _records_enabled() else None
 
-    out: List[str] = [
-        "=== 北极星锚点与硬约束 ===",
-        seed_txt,
-        gt_txt,
-        gy_txt,
-        "========================",
-    ]
+    if rec is None:
+        gt_txt = GROUND_TRUTH_FILE.read_text(encoding="utf-8").strip() if GROUND_TRUTH_FILE.exists() else ""
+        gy_txt = GRAVEYARD_FILE.read_text(encoding="utf-8").strip() if GRAVEYARD_FILE.exists() else ""
+        out: List[str] = [
+            "=== 北极星锚点与硬约束 ===",
+            seed_txt,
+            gt_txt,
+            gy_txt,
+            "========================",
+            NOT_MIGRATED_HINT,
+        ]
+    else:
+        global_facts = [f for f in _active_facts(rec) if _is_global(f)]
+        out = ["=== 北极星锚点与硬约束 ===", seed_txt, "--- 全局事实 (global) ---"]
+        out += [_fact_line(f, show_scope=False) for f in global_facts] or ["（无）"]
+        out.append("========================")
+        warning = _budget_warning(rec)
+        if warning:
+            out.append(warning)
+        if _pending_md_edits(rec):
+            out.append(
+                "[RECORDS_MD_EDITED] 生成的 md 里有 records.json 之外的内容，"
+                "运行 arch migrate-records 导入，否则下次写入记录时会被拒绝。"
+            )
 
     if len(holes) > MAX_ACTIVE_HOLES:
         out.append(
@@ -417,15 +1095,62 @@ def op_focus(node_id: Optional[str] = None) -> str:
 
     slice_payload = {
         "current_step": graph["step"],
-        "focus_node": _compact_node(target),
+        "focus_node": _node_view(target),
         "upstream_edges": [_public_edge(e) for e in in_edges],
         "downstream_edges": [_public_edge(e) for e in out_edges],
-        "neighbors": [_compact_node(nodes[nid]) for nid in neighbor_ids if nid in nodes],
+        "neighbors": [_node_view(nodes[nid]) for nid in neighbor_ids if nid in nodes],
         "fog_backlog": [{"id": f["id"], "label": f["label"]} for f in fog_nodes],
     }
     out.append("=== 当前焦点 1-Hop 切片 ===")
     out.append(json.dumps(slice_payload, indent=2, ensure_ascii=False))
+    if rec is not None:
+        keys = _context_keys(graph, tid, neighbor_ids)
+        out.append(f"=== 相关记录（作用域：{', '.join(sorted(keys))}）===")
+        out += _related_records(rec, keys)
     return "\n".join(out)
+
+
+def _related_records(rec: Dict[str, Any], keys: set, global_open: str = "blocking") -> List[str]:
+    """Facts, graveyard entries and open items scoped to `keys`, plus a hidden-count line.
+
+    Global facts are shown separately by the callers. Global open items are
+    included when `global_open` is "blocking" (only those that block work).
+    """
+    active = _active_facts(rec)
+    facts = [f for f in active if not _is_global(f) and _matches(f, keys)]
+    graves = [g for g in rec["graveyard"] if g["node"] in keys]
+    open_all = [o for o in rec["open_items"] if o.get("status") != "resolved"]
+    opens = [o for o in open_all if _matches(o, keys)
+             or (global_open == "blocking" and _is_global(o) and o.get("blocking"))]
+
+    out: List[str] = []
+    if facts:
+        out.append("事实：")
+        out += [_fact_line(f) for f in facts]
+    if graves:
+        out.append("墓志（已废弃方案）：")
+        out += [_grave_line(g) for g in graves]
+    if opens:
+        out.append("待办项：")
+        out += [_open_line(o) for o in sorted(opens, key=lambda o: not o.get("blocking"))]
+    if not out:
+        out.append("（没有与当前节点相关的事实、墓志或待办项）")
+
+    hidden = [
+        (sum(1 for f in active if not _is_global(f)) - len(facts), "条节点/阶段事实", "arch facts --all"),
+        (len(rec["graveyard"]) - len(graves), "条墓志", "arch facts --all"),
+        (len(open_all) - len(opens), "条待办项", "arch open list"),
+    ]
+    hidden = [h for h in hidden if h[0] > 0]
+    if hidden:
+        out.append(
+            "另有 " + "、".join(f"{n} {what}" for n, what, _ in hidden) + " 未展开（"
+            + " / ".join(dict.fromkeys(cmd for _, _, cmd in hidden)) + " 查看）。"
+        )
+    legacy_open = sum(1 for lg in rec["legacy"] if lg.get("status") != "resolved")
+    if legacy_open:
+        out.append(f"另有 {legacy_open} 条未分类遗留记录待人工处理（arch legacy list）。")
+    return out
 
 
 def op_collapse(
@@ -547,7 +1272,24 @@ def op_add_node(
     return f"已添加节点 '{node_id}' ({status})。\n\n" + op_focus(node_id if status == "hole" else None)
 
 
-def op_verify(fact: str, constraint: str) -> str:
+def op_verify(
+    fact: str,
+    constraint: str,
+    scope: Union[None, str, List[str]] = None,
+    source: str = "",
+    supersedes: Union[None, str, List[str]] = None,
+) -> str:
+    if isinstance(supersedes, str):
+        supersedes = [supersedes]
+    supersedes = [s.strip() for s in (supersedes or []) if s and s.strip()]
+    if _records_enabled():
+        return _verify_record(fact, constraint, scope, source, supersedes)
+    if scope or source or supersedes:
+        raise ArchEngineError(
+            "作用域 / 来源 / 取代关系需要结构化记录。\n"
+            "JIT 指令：先运行 arch migrate-records，再带这些参数重试。"
+        )
+
     ARCH_DIR.mkdir(parents=True, exist_ok=True)
     if not GROUND_TRUTH_FILE.exists():
         GROUND_TRUTH_FILE.write_text("# 已验证现实事实与硬约束 (Ground Truth)\n\n", encoding="utf-8")
@@ -557,7 +1299,44 @@ def op_verify(fact: str, constraint: str) -> str:
     entry = f"- [GT-{idx:02d}] (已验证) {fact.strip()} -> 架构约束：{constraint.strip()}\n"
     GROUND_TRUTH_FILE.write_text(existing + entry, encoding="utf-8")
     _shadow_commit(f"gt-{idx:02d}", f"verify GT-{idx:02d}")
-    return f"已永久沉淀现实事实：\n{entry}"
+    return f"已永久沉淀现实事实：\n{entry}\n{NOT_MIGRATED_HINT}"
+
+
+def _graph_if_any() -> Optional[Dict[str, Any]]:
+    return _load_graph() if GRAPH_FILE.exists() else None
+
+
+def _verify_record(fact: str, constraint: str, scope: Union[None, str, List[str]],
+                   source: str, supersedes: List[str]) -> str:
+    rec = _load_records(for_write=True)
+    by_id = {f["id"]: f for f in rec["facts"]}
+    missing = [s for s in supersedes if s not in by_id]
+    if missing:
+        raise ArchEngineError(f"要取代的事实不存在：{', '.join(missing)}。用 arch facts --all 查看现有编号。")
+    if not scope and supersedes:
+        # A replacement keeps the scope of what it replaces unless told otherwise.
+        scope = list(dict.fromkeys(s for old in supersedes for s in by_id[old].get("scope") or ["global"]))
+        if "global" in scope:
+            scope = ["global"]
+    scopes = _normalize_scopes(scope, _graph_if_any())
+
+    fid = _next_id(rec["facts"], "GT")
+    entry = {
+        "id": fid,
+        "scope": scopes,
+        "text": fact.strip(),
+        "constraint": constraint.strip(),
+        "source": source.strip(),
+        "date": _today(),
+        "supersedes": supersedes,
+        "detail": "",
+    }
+    rec["facts"].append(entry)
+    _save_records(rec)
+    _shadow_commit(f"gt-{fid[3:]}", f"verify {fid}")
+    out = f"已永久沉淀现实事实：\n{_fact_line(entry)}"
+    warning = _budget_warning(rec) if "global" in scopes else ""
+    return out + (f"\n{warning}" if warning else "")
 
 
 def op_ground(source_type: str, source: str, note: str = "") -> str:
@@ -586,10 +1365,8 @@ def op_export_task(node_id: str) -> str:
 
     in_edges = [e for e in graph["edges"] if e["to"] == node_id]
     out_edges = [e for e in graph["edges"] if e["from"] == node_id]
-    gt_txt = GROUND_TRUTH_FILE.read_text(encoding="utf-8").strip() if GROUND_TRUTH_FILE.exists() else ""
-    gy_txt = GRAVEYARD_FILE.read_text(encoding="utf-8").strip() if GRAVEYARD_FILE.exists() else ""
 
-    task = {
+    task: Dict[str, Any] = {
         "worker_instruction": (
             "你是独立的实现子代理。严格仅实现以下单节点契约："
             "1) 采用 Port/Adapter 分离易变外部接口；"
@@ -597,27 +1374,59 @@ def op_export_task(node_id: str) -> str:
             "3) 若 type=='reality_gate'，按项目要求验证真实环境约束；"
             "4) 按主代理给定的快照安排处理 commit-node，并返回 <=3 行结果摘要。"
         ),
-        "target_node": node,
+        "target_node": _node_view(node),
         "input_contracts": [_public_edge(e) for e in in_edges],
         "output_contracts": [_public_edge(e) for e in out_edges],
-        "global_ground_truth": gt_txt,
-        "global_graveyard": gy_txt,
     }
+    if _records_enabled():
+        rec = _read_records()
+        keys = _context_keys(graph, node_id)
+        active = _active_facts(rec)
+        task["global_facts"] = [_fact_line(f, show_scope=False) for f in active if _is_global(f)]
+        task["node_facts"] = [_fact_line(f) for f in active if not _is_global(f) and _matches(f, keys)]
+        task["graveyard"] = [_grave_line(g) for g in rec["graveyard"] if g["node"] == node_id]
+        task["open_items"] = [
+            _open_line(o) for o in rec["open_items"]
+            if o.get("status") != "resolved"
+            and (_matches(o, keys) or (_is_global(o) and o.get("blocking")))
+        ]
+    else:
+        task["global_ground_truth"] = (
+            GROUND_TRUTH_FILE.read_text(encoding="utf-8").strip() if GROUND_TRUTH_FILE.exists() else ""
+        )
+        task["global_graveyard"] = (
+            GRAVEYARD_FILE.read_text(encoding="utf-8").strip() if GRAVEYARD_FILE.exists() else ""
+        )
+        task["records_hint"] = NOT_MIGRATED_HINT
+    refs = _node_state(node)["refs"]
+    if refs:
+        task["ref_sections"] = [_resolve_ref(r) for r in refs]
     return json.dumps(task, indent=2, ensure_ascii=False)
 
 
-def op_commit_node(node_id: str, file_path: str) -> str:
+def op_commit_node(node_id: str, file_path: Union[str, List[str]]) -> str:
     graph = _load_graph()
     nodes = {n["id"]: n for n in graph["nodes"]}
     _get_node(graph, node_id, allow_super=False)
+    files = [file_path] if isinstance(file_path, str) else list(file_path)
+    files = [f.strip() for f in files if f and f.strip()]
+    if not files:
+        raise ArchEngineError("commit-node 至少需要一个 --file-path。")
 
     graph["step"] += 1
     tag = f"node-{node_id}-s{graph['step']:02d}"
-    nodes[node_id]["file_path"] = file_path
-    nodes[node_id]["last_tag"] = tag
+    node = nodes[node_id]
+    _store_files(node, files)
+    node["last_tag"] = tag
+    node["impl"] = "built"
     _save_graph(graph)
-    _shadow_commit(tag, f"implement {node_id} -> {file_path}", paths=[str(ARCH_DIR), file_path])
-    return f"节点 '{node_id}' 代码已锚定至 {file_path}，影子快照 {tag} 已生成。"
+    shown = ", ".join(files)
+    _shadow_commit(tag, f"implement {node_id} -> {shown}", paths=[str(ARCH_DIR)] + files)
+    return (
+        f"节点 '{node_id}' 代码已锚定至 {shown}，影子快照 {tag} 已生成，实现进度记为 built。\n"
+        f"验证程度仍为 {VERIFY_TEXT[_node_state(node)['verify']['level']]}；"
+        "测过后用 arch set-node-state --verify unit|api|device 记录。"
+    )
 
 
 def op_sync_manual(node_id: str, summary: str) -> str:
@@ -626,13 +1435,12 @@ def op_sync_manual(node_id: str, summary: str) -> str:
     _get_node(graph, node_id, allow_super=False)
 
     node = nodes[node_id]
-    file_path = node.get("file_path", "")
     node["spec"] = f"{node['spec']} | [人工微调: {summary.strip()}]"
     graph["step"] += 1
     tag = f"manual-{node_id}-s{graph['step']:02d}"
     node["last_tag"] = tag
     _save_graph(graph)
-    paths = [str(ARCH_DIR)] + ([file_path] if file_path else [])
+    paths = [str(ARCH_DIR)] + _node_files(node)
     _shadow_commit(tag, f"sync-manual {node_id}: {summary[:40]}", paths=paths)
     return f"已同步人工修改摘要并更新快照 {tag}。"
 
@@ -644,15 +1452,30 @@ def op_reset_node(node_id: str, reason: str) -> str:
 
     node = nodes[node_id]
     old_label = node["label"]
+    rec = _load_records(for_write=True) if _records_enabled() else None
     node["status"] = "hole"
     node["label"] = f"? 待替换: {old_label}"
     node["last_tag"] = ""
+    # The replacement scheme starts from scratch; references and files stay.
+    node["impl"] = "planned"
+    node["verify"] = {"level": "none", "date": ""}
 
-    existing_gy = GRAVEYARD_FILE.read_text(encoding="utf-8") if GRAVEYARD_FILE.exists() else "# 踩坑记录\n\n"
-    GRAVEYARD_FILE.write_text(
-        existing_gy + f"- ❌ [节点 {node_id} / {old_label}] 废弃原因：{reason.strip()}\n",
-        encoding="utf-8",
-    )
+    if rec is not None:
+        rec["graveyard"].append({
+            "id": _next_id(rec["graveyard"], "GY"),
+            "node": node_id,
+            "scheme": old_label,
+            "reason": reason.strip(),
+            "date": _today(),
+            "detail": "",
+        })
+        _save_records(rec)
+    else:
+        existing_gy = GRAVEYARD_FILE.read_text(encoding="utf-8") if GRAVEYARD_FILE.exists() else "# 踩坑记录\n\n"
+        GRAVEYARD_FILE.write_text(
+            existing_gy + f"- ❌ [节点 {node_id} / {old_label}] 废弃原因：{reason.strip()}\n",
+            encoding="utf-8",
+        )
 
     graph["step"] += 1
     tag = f"reset-{node_id}-s{graph['step']:02d}"
@@ -663,18 +1486,18 @@ def op_reset_node(node_id: str, reason: str) -> str:
 
 def op_fork(from_tag: str) -> str:
     _init_shadow_git()
-    gy_backup = GRAVEYARD_FILE.read_text(encoding="utf-8") if GRAVEYARD_FILE.exists() else ""
-    gt_backup = GROUND_TRUTH_FILE.read_text(encoding="utf-8") if GROUND_TRUTH_FILE.exists() else ""
+    # Records are knowledge about reality, not graph state: they survive a fork.
+    kept = (GRAVEYARD_FILE, GROUND_TRUTH_FILE, OPEN_ITEMS_FILE, RECORDS_FILE)
+    backups = {p: p.read_text(encoding="utf-8") for p in kept if p.exists()}
 
     branch_name = f"fork-{from_tag}-{datetime.now().strftime('%H%M%S')}"
     res = _run_shadow_git(["checkout", "-b", branch_name, from_tag], check=False)
     if res.returncode != 0:
         raise ArchEngineError(f"无法从快照 '{from_tag}' 分叉：{res.stderr.strip()}")
 
-    if gy_backup:
-        GRAVEYARD_FILE.write_text(gy_backup, encoding="utf-8")
-    if gt_backup:
-        GROUND_TRUTH_FILE.write_text(gt_backup, encoding="utf-8")
+    for path, text in backups.items():
+        if text:
+            path.write_text(text, encoding="utf-8")
     _shadow_commit(f"{branch_name}-start", f"fork from {from_tag}")
     return f"已成功安全回滚至 {from_tag} 并开启新分支 {branch_name}（已保留所有避坑记录）。\n\n" + op_focus()
 
@@ -1015,6 +1838,434 @@ def op_unfold(super_id: str, attach: Optional[Dict[str, str]] = None) -> str:
     )
 
 
+def op_set_node_state(
+    node_id: str,
+    impl: str = "",
+    verify: str = "",
+    verify_date: str = "",
+    refs: Optional[List[str]] = None,
+    add_refs: Optional[List[str]] = None,
+    drop_refs: Optional[List[str]] = None,
+    file_paths: Optional[List[str]] = None,
+) -> str:
+    """Record implementation progress, verification depth, references and files.
+
+    Works on folded children too: these fields are bookkeeping, not topology.
+    `refs` / `file_paths` replace the whole list; add_refs / drop_refs edit it.
+    """
+    graph = _load_graph()
+    node = _find_any_node(graph, node_id)
+    if node is None:
+        raise ArchEngineError(f"节点 '{node_id}' 不存在。")
+    if node["status"] == "super_node":
+        raise ArchEngineError(
+            f"'{node_id}' 是折叠模块，它的进度由子节点汇总。请对其中的子节点调用 set-node-state。"
+        )
+    if impl and impl not in IMPL_LEVELS:
+        raise ArchEngineError(f"impl 只能是 {' / '.join(IMPL_LEVELS)}，收到：{impl}")
+    if verify and verify not in VERIFY_LEVELS:
+        raise ArchEngineError(f"verify 只能是 {' / '.join(VERIFY_LEVELS)}，收到：{verify}")
+    if verify_date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", verify_date):
+        raise ArchEngineError(f"verify_date 需为 YYYY-MM-DD，收到：{verify_date}")
+
+    before = json.dumps(_node_state(node), sort_keys=True)
+    state = _node_state(node)
+    if impl:
+        node["impl"] = impl
+    if verify or verify_date:
+        level = verify or state["verify"]["level"]
+        if level == "none" and verify_date:
+            raise ArchEngineError("验证程度为 none 时不能设置验证日期，请同时给出 --verify。")
+        node["verify"] = {"level": level, "date": "" if level == "none" else (verify_date or _today())}
+    if refs is not None or add_refs or drop_refs:
+        new_refs = list(refs) if refs is not None else list(state["refs"])
+        new_refs += list(add_refs or [])
+        drop = {r.strip() for r in (drop_refs or [])}
+        missing = sorted(drop - {r.strip() for r in new_refs})
+        if missing:
+            raise ArchEngineError(f"要移除的引用不存在：{', '.join(missing)}。当前引用：{', '.join(state['refs']) or '无'}")
+        node["refs"] = list(dict.fromkeys(r.strip() for r in new_refs if r.strip() and r.strip() not in drop))
+    if file_paths is not None:
+        _store_files(node, file_paths)
+
+    if json.dumps(_node_state(node), sort_keys=True) == before:
+        return f"节点 '{node_id}' 的状态没有变化：{_state_text(node)}。"
+    graph["step"] += 1
+    tag = f"state-{node_id}-s{graph['step']:02d}"
+    _save_graph(graph)
+    _shadow_commit(tag, f"set-node-state {node_id}")
+    st = _node_state(node)
+    lines = [f"已更新节点 '{node_id}' 的状态，快照 {tag}：{_state_text(node)}"]
+    if st["files"]:
+        lines.append(f"实现文件：{', '.join(st['files'])}")
+    if st["refs"]:
+        lines.append(f"引用：{', '.join(st['refs'])}")
+    return "\n".join(lines)
+
+
+def op_open_add(
+    question: str,
+    kind: str,
+    owner: str,
+    scope: Union[None, str, List[str]] = None,
+    blocking: bool = False,
+) -> str:
+    if kind not in OPEN_KINDS:
+        raise ArchEngineError(f"类型只能是 {' / '.join(OPEN_KINDS)}，收到：{kind}")
+    if owner not in OPEN_OWNERS:
+        raise ArchEngineError(f"处理方只能是 {' / '.join(OPEN_OWNERS)}，收到：{owner}")
+    if not question.strip():
+        raise ArchEngineError("待办项需要写明问题。")
+    rec = _load_records(for_write=True)
+    item = {
+        "id": _next_id(rec["open_items"], "OI"),
+        "scope": _normalize_scopes(scope, _graph_if_any()),
+        "question": question.strip(),
+        "kind": kind,
+        "owner": owner,
+        "blocking": bool(blocking),
+        "status": "open",
+        "resolution": "",
+        "created": _today(),
+        "resolved_at": "",
+    }
+    rec["open_items"].append(item)
+    _save_records(rec)
+    _shadow_commit(f"open-{item['id']}", f"open add {item['id']}")
+    return f"已登记待办项：\n{_open_line(item)}"
+
+
+def op_open_resolve(item_id: str, resolution: str, constraint: str = "") -> str:
+    """Close an open item; with `constraint`, its conclusion also becomes a fact."""
+    rec = _load_records(for_write=True)
+    item = next((o for o in rec["open_items"] if o["id"] == item_id), None)
+    if item is None:
+        raise ArchEngineError(f"待办项 '{item_id}' 不存在。用 arch open list --all 查看编号。")
+    if item.get("status") == "resolved":
+        raise ArchEngineError(f"待办项 '{item_id}' 已在 {item.get('resolved_at', '')} 解决：{item.get('resolution', '')}")
+    if not resolution.strip():
+        raise ArchEngineError("关闭待办项需要写明结论。")
+    item["status"] = "resolved"
+    item["resolution"] = resolution.strip()
+    item["resolved_at"] = _today()
+    out = [f"已关闭待办项：\n{_open_line(item)}"]
+    if constraint.strip():
+        fact = {
+            "id": _next_id(rec["facts"], "GT"),
+            "scope": list(item["scope"]),
+            "text": resolution.strip(),
+            "constraint": constraint.strip(),
+            "source": f"待办项 {item_id}",
+            "date": _today(),
+            "supersedes": [],
+            "detail": "",
+        }
+        rec["facts"].append(fact)
+        out.append(f"并沉淀为事实：\n{_fact_line(fact)}")
+        if _is_global(fact) and _budget_warning(rec):
+            out.append(_budget_warning(rec))
+    _save_records(rec)
+    _shadow_commit(f"resolve-{item_id}", f"open resolve {item_id}")
+    return "\n".join(out)
+
+
+def op_open_list(
+    node_id: str = "",
+    scope: str = "",
+    include_resolved: bool = False,
+    owner: str = "",
+    blocking_only: bool = False,
+) -> str:
+    rec = _load_records()
+    items = rec["open_items"]
+    if not include_resolved:
+        items = [o for o in items if o.get("status") != "resolved"]
+    if node_id:
+        graph = _load_graph()
+        if _find_any_node(graph, node_id) is None:
+            raise ArchEngineError(f"节点 '{node_id}' 不存在。")
+        keys = _context_keys(graph, node_id)
+        items = [o for o in items if _matches(o, keys)]
+    if scope:
+        items = [o for o in items if scope in (o.get("scope") or ["global"])]
+    if owner:
+        items = [o for o in items if o.get("owner") == owner]
+    if blocking_only:
+        items = [o for o in items if o.get("blocking")]
+    if not items:
+        return "没有符合条件的待办项。"
+    items = sorted(items, key=lambda o: (o.get("status") == "resolved", not o.get("blocking")))
+    return f"待办项 {len(items)} 条：\n" + "\n".join(_open_line(o) for o in items)
+
+
+def op_facts(node_id: str = "", all_scopes: bool = False, with_superseded: bool = False) -> str:
+    """Facts for one node (its scope, stage and folded children), all facts, or global ones."""
+    rec = _load_records()
+    gone = _superseded_ids(rec)
+    facts = rec["facts"] if with_superseded else _active_facts(rec)
+    line = lambda f, **kw: _fact_line(f, superseded_by=gone.get(f["id"], ""), **kw)
+
+    if node_id:
+        graph = _load_graph()
+        if _find_any_node(graph, node_id) is None:
+            raise ArchEngineError(f"节点 '{node_id}' 不存在。")
+        keys = _context_keys(graph, node_id)
+        picked = [f for f in facts if not _is_global(f) and _matches(f, keys)]
+        graves = [g for g in rec["graveyard"] if g["node"] in keys]
+        out = [f"节点 {node_id} 的事实（作用域：{', '.join(sorted(keys))}）："]
+        out += [line(f) for f in picked] or ["（无）"]
+        if graves:
+            out.append("墓志：")
+            out += [_grave_line(g) for g in graves]
+        n_global = sum(1 for f in facts if _is_global(f))
+        out.append(f"另有 {n_global} 条 global 事实对所有节点生效（arch facts 查看）。")
+        return "\n".join(out)
+
+    if all_scopes:
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for f in sorted(facts, key=lambda f: not _is_global(f)):
+            groups.setdefault(_scope_text(f.get("scope")), []).append(f)
+        out = []
+        for scope, items in groups.items():
+            out.append(f"--- 作用域 {scope}（{len(items)} 条）---")
+            out += [line(f, show_scope=False) for f in items]
+        if rec["graveyard"]:
+            out.append(f"--- 墓志（{len(rec['graveyard'])} 条）---")
+            out += [_grave_line(g) for g in rec["graveyard"]]
+        if not out:
+            return "暂无事实记录。"
+        if not with_superseded and gone:
+            out.append(f"另有 {len(gone)} 条已被取代的事实未展示（加 --with-superseded 查看）。")
+        return "\n".join(out)
+
+    picked = [f for f in facts if _is_global(f)]
+    used, limit = _global_fact_budget(rec)
+    out = [f"global 事实 {len(picked)} 条，共 {used} 字符（上限 {limit}）："]
+    out += [line(f, show_scope=False) for f in picked] or ["（无）"]
+    warning = _budget_warning(rec)
+    if warning:
+        out.append(warning)
+    return "\n".join(out)
+
+
+def op_rescope(record_id: str, scope: Union[str, List[str]]) -> str:
+    """Change the scope of a fact (GT-xx) or open item (OI-xx); the content stays as written."""
+    rec = _load_records(for_write=True)
+    pool = rec["facts"] if record_id.startswith("GT-") else rec["open_items"] if record_id.startswith("OI-") else None
+    if pool is None:
+        raise ArchEngineError("rescope 只适用于事实 (GT-xx) 和待办项 (OI-xx)。墓志的作用域就是它记录的节点。")
+    item = next((x for x in pool if x["id"] == record_id), None)
+    if item is None:
+        raise ArchEngineError(f"记录 '{record_id}' 不存在。")
+    scopes = _normalize_scopes(scope, _graph_if_any())
+    if scopes == item.get("scope"):
+        return f"{record_id} 的作用域已经是 {_scope_text(scopes)}。"
+    old = _scope_text(item.get("scope"))
+    item["scope"] = scopes
+    _save_records(rec)
+    _shadow_commit(f"rescope-{record_id}", f"rescope {record_id}: {old} -> {_scope_text(scopes)}")
+    out = f"已把 {record_id} 的作用域从 {old} 改为 {_scope_text(scopes)}。"
+    used, limit = _global_fact_budget(rec)
+    return out + f"\nglobal 事实现为 {used} / {limit} 字符。"
+
+
+def op_legacy(action: str = "list", record_id: str = "", note: str = "", include_resolved: bool = False) -> str:
+    """List, show or resolve unclassified blocks kept verbatim by migrate-records."""
+    rec = _load_records(for_write=(action == "resolve"))
+    if action == "list":
+        items = [lg for lg in rec["legacy"] if include_resolved or lg.get("status") != "resolved"]
+        if not items:
+            return "没有待处理的未分类遗留记录。"
+        out = [f"未分类遗留记录 {len(items)} 条（arch legacy show --id LG-xx 看全文）："]
+        for lg in items:
+            first = next((ln.strip() for ln in lg["text"].splitlines() if ln.strip()), "")
+            state = "已处理" if lg.get("status") == "resolved" else "待处理"
+            where = lg["source"] + (f" · {lg['section']}" if lg.get("section") else "")
+            out.append(f"- [{lg['id']}] {state} · {where} · {len(lg['text'])} 字符：{first[:60]}")
+        out.append(
+            "处理方式：把其中仍有用的内容拆成 verify --scope（决策与约束）、open add（待验证项）、"
+            "set-node-state（实现状态 / refs），调查过程只留结论和证据路径；然后 legacy resolve --id 关闭。"
+        )
+        return "\n".join(out)
+    item = next((lg for lg in rec["legacy"] if lg["id"] == record_id), None)
+    if item is None:
+        raise ArchEngineError(f"遗留记录 '{record_id}' 不存在。用 arch legacy list 查看编号。")
+    if action == "show":
+        head = f"[{item['id']}] 来自 {item['source']}" + (f" · {item['section']}" if item.get("section") else "")
+        if item.get("status") == "resolved":
+            head += f"（已处理：{item.get('note', '')}）"
+        return head + "\n\n" + item["text"]
+    if action == "resolve":
+        if item.get("status") == "resolved":
+            return f"{record_id} 已处理过。"
+        item["status"] = "resolved"
+        item["note"] = note.strip()
+        item["resolved_at"] = _today()
+        _save_records(rec)
+        _shadow_commit(f"legacy-{record_id}", f"legacy resolve {record_id}")
+        left = sum(1 for lg in rec["legacy"] if lg.get("status") != "resolved")
+        return (f"已将 {record_id} 标记为已处理（原文仍保存在 records.json）。剩余待处理 {left} 条。")
+    raise ArchEngineError(f"legacy 的操作只能是 list / show / resolve，收到：{action}")
+
+
+def op_config(global_fact_limit: Optional[int] = None) -> str:
+    rec = _load_records(for_write=global_fact_limit is not None)
+    if global_fact_limit is not None:
+        if global_fact_limit <= 0:
+            raise ArchEngineError("global 事实字数上限必须是正整数。")
+        rec["settings"]["global_fact_char_limit"] = int(global_fact_limit)
+        _save_records(rec)
+        _shadow_commit("config", f"config global_fact_char_limit={global_fact_limit}")
+    used, limit = _global_fact_budget(rec)
+    return f"global_fact_char_limit = {limit}（当前 global 事实 {used} 字符）"
+
+
+def op_status() -> str:
+    """Whole-project progress: node states, open items, record counts, migration state."""
+    graph = _load_graph()
+    all_nodes = list(_iter_all_nodes(graph["nodes"]))
+    leaves = [n for n in all_nodes if n["status"] != "super_node"]
+    count = Counter(n["status"] for n in all_nodes)
+    solid = [n for n in leaves if n["status"] == "solid"]
+    impl = Counter(_node_state(n)["impl"] for n in solid)
+    verify = Counter(_node_state(n)["verify"]["level"] for n in solid)
+
+    out = [f"=== 项目状态 · step {graph.get('step', 0)} ==="]
+    out.append(
+        f"节点：已确定 {count['solid']} · 待定 {count['hole']} · 储备 {count['fog']} · 折叠模块 {count['super_node']}"
+    )
+    out.append(
+        "实现进度（已确定节点，含折叠子节点）："
+        + " · ".join(f"{IMPL_TEXT[k]} {impl[k]}" for k in reversed(IMPL_LEVELS))
+    )
+    out.append("验证程度：" + " · ".join(f"{VERIFY_TEXT[k]} {verify[k]}" for k in reversed(VERIFY_LEVELS)))
+
+    out.append("--- 节点明细 ---")
+
+    def describe(n: Dict[str, Any], depth: int) -> None:
+        pad = "  " * depth + ("└ " if depth else "")
+        if n["status"] == "super_node":
+            inner = [c for c in _iter_all_nodes(n["children"]) if c["status"] != "super_node"]
+            built = sum(1 for c in inner if _node_state(c)["impl"] == "built")
+            out.append(f"{pad}{n['id']} [模块] {built}/{len(inner)} 已实现")
+            for c in n["children"]:
+                describe(c, depth + 1)
+            return
+        st = _node_state(n)
+        extra = []
+        if st["files"]:
+            extra.append(f"文件 {len(st['files'])}")
+        if st["refs"]:
+            extra.append(f"引用 {len(st['refs'])}")
+        state = _state_text(n) if n["status"] == "solid" else {"hole": "待定", "fog": "储备"}.get(n["status"], n["status"])
+        out.append(f"{pad}{n['id']} [{n['status']}] {state}" + (f" · {' · '.join(extra)}" if extra else ""))
+
+    for n in graph["nodes"]:
+        describe(n, 0)
+
+    out.append("--- 记录 ---")
+    if not _records_enabled():
+        out.append(NOT_MIGRATED_HINT)
+        return "\n".join(out)
+    rec = _read_records()
+    active = _active_facts(rec)
+    used, limit = _global_fact_budget(rec)
+    n_global = sum(1 for f in active if _is_global(f))
+    out.append(
+        f"事实：生效 {len(active)} 条（global {n_global} 条 / {used} 字符，上限 {limit}；"
+        f"节点/阶段 {len(active) - n_global} 条），已被取代 {len(rec['facts']) - len(active)} 条"
+    )
+    out.append(f"墓志：{len(rec['graveyard'])} 条")
+    opens = [o for o in rec["open_items"] if o.get("status") != "resolved"]
+    blocking = [o for o in opens if o.get("blocking")]
+    owners = Counter(o.get("owner") for o in opens)
+    out.append(
+        f"待办项：未关闭 {len(opens)} 条（卡开发 {len(blocking)}；用户 {owners['user']} / 代理 {owners['agent']}），"
+        f"已解决 {len(rec['open_items']) - len(opens)} 条"
+    )
+    out += [_open_line(o) for o in blocking]
+    legacy = [lg for lg in rec["legacy"] if lg.get("status") != "resolved"]
+    if legacy:
+        out.append(
+            f"[LEGACY_RECORDS] {len(legacy)} 条未分类遗留记录待人工处理（{', '.join(lg['id'] for lg in legacy)}）："
+            "arch legacy list / legacy show --id / legacy resolve --id"
+        )
+    warning = _budget_warning(rec)
+    if warning:
+        out.append(warning)
+    ids = {n["id"] for n in all_nodes}
+    stages = {n.get("stage") for n in all_nodes if n.get("stage")}
+    orphans = [
+        f"{r['id']}→{s}"
+        for r in active + opens
+        for s in (r.get("scope") or [])
+        if s != "global" and s not in ids and s not in stages
+    ] + [f"{g['id']}→{g['node']}" for g in rec["graveyard"] if g["node"] not in ids]
+    if orphans:
+        out.append(f"[ORPHAN_SCOPES] 以下记录指向图中已不存在的节点或阶段：{', '.join(orphans)}（可用 rescope 改正）")
+    if _pending_md_edits(rec):
+        out.append("[RECORDS_MD_EDITED] 生成的 md 被手改过，运行 arch migrate-records 导入。")
+    return "\n".join(out)
+
+
+def op_migrate_records() -> str:
+    """Convert md records into .arch/records.json, then render the md from it.
+
+    Idempotent: entries already present (same content) are skipped, and a
+    generated md that nobody edited contributes nothing. Lines added by hand
+    to a generated md are imported too.
+    """
+    if not ARCH_DIR.exists():
+        raise ArchEngineError("未找到 .arch/ 目录。请在持有 .arch/ 的项目根目录执行。")
+    first_time = not _records_enabled()
+    rec = _new_records() if first_time else _read_records()
+    expected = _rendered_files(rec)
+    stats: Counter = Counter()
+    sources = []
+    for path in (GROUND_TRUTH_FILE, GRAVEYARD_FILE, OPEN_ITEMS_FILE):
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if text == expected[path] or _md_is_boilerplate(text):
+            continue
+        if GENERATED_MARKER in text:
+            text = _added_lines(text, expected[path])
+        before = sum(stats[k] for k in ("facts", "graveyard", "legacy"))
+        _merge_parsed(rec, _parse_md_records(text), path.name, stats)
+        if sum(stats[k] for k in ("facts", "graveyard", "legacy")) > before:
+            sources.append(path.name)
+
+    if not first_time and not sources:
+        out = "记录已是最新：没有需要导入的新内容。" + (f"（跳过重复 {stats['skipped']} 条）" if stats["skipped"] else "")
+        if _pending_md_edits(rec):
+            # Only duplicates or deletions were made by hand: records.json wins.
+            _save_records(rec)
+            out += "\nmd 里的删改不会生效，已按 records.json 重新生成；改动记录请用 verify --supersedes、rescope 等命令。"
+        return out
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    _shadow_commit(f"pre-migrate-records-{stamp}", "snapshot before migrate-records")
+    _save_records(rec)
+    _shadow_commit(f"migrate-records-{stamp}", "migrate-records")
+    out = [
+        f"已{'迁移' if first_time else '导入'}结构化记录到 {RECORDS_FILE}（迁移前快照：pre-migrate-records-{stamp}）：",
+        f"事实 {stats['facts']} 条（默认作用域 global）、墓志 {stats['graveyard']} 条、"
+        f"未分类遗留 {stats['legacy']} 条；跳过重复 {stats['skipped']} 条。",
+        "ground_truth.md / graveyard.md / open_items.md 现由工具生成，不要再手改。",
+    ]
+    if stats["legacy"]:
+        out.append(
+            f"[LEGACY_RECORDS] 有 {stats['legacy']} 段内容不是标准条目，已原样保存为未分类遗留记录。"
+            "JIT 指令：和用户逐条处理（arch legacy list / legacy show --id），拆成带作用域的事实、待办项或节点状态后 legacy resolve。"
+        )
+    if stats["facts"]:
+        out.append("导入的事实都是 global 作用域；只与部分节点相关的，用 arch rescope --id GT-xx --scope <节点> 收窄。")
+    warning = _budget_warning(rec)
+    if warning:
+        out.append(warning)
+    return "\n".join(out)
+
+
 def _md_bullets(path: Path) -> List[str]:
     if not path.exists():
         return []
@@ -1046,9 +2297,27 @@ def op_export_ui(out_path: str = "") -> str:
         "skeleton": _find_walking_skeleton(graph),
         "next_focus": _next_focus_hole(graph),
         "limits": {"holes": MAX_ACTIVE_HOLES, "solids": MAX_UNFOLDED_SOLID},
-        "ground_truth": _md_bullets(GROUND_TRUTH_FILE),
-        "graveyard": _md_bullets(GRAVEYARD_FILE),
+        "node_state": {
+            n["id"]: _node_state(n) for n in _iter_all_nodes(graph["nodes"]) if n["status"] != "super_node"
+        },
+        "records": {"enabled": False},
     }
+    if _records_enabled():
+        rec = _read_records()
+        active = _active_facts(rec)
+        payload["ground_truth"] = [_fact_line(f, show_scope=False) for f in active if _is_global(f)]
+        payload["graveyard"] = [_grave_line(g) for g in rec["graveyard"]]
+        payload["records"] = {
+            "enabled": True,
+            "facts": [{"id": f["id"], "scope": f.get("scope") or ["global"], "line": _fact_line(f, show_scope=False)}
+                      for f in active],
+            "graveyard": [{"id": g["id"], "node": g["node"], "line": _grave_line(g)} for g in rec["graveyard"]],
+            "open_items": [o for o in rec["open_items"] if o.get("status") != "resolved"],
+            "legacy_open": sum(1 for lg in rec["legacy"] if lg.get("status") != "resolved"),
+        }
+    else:
+        payload["ground_truth"] = _md_bullets(GROUND_TRUTH_FILE)
+        payload["graveyard"] = _md_bullets(GRAVEYARD_FILE)
     data = (
         json.dumps(payload, ensure_ascii=False)
         .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
@@ -1128,9 +2397,69 @@ def main() -> None:
         help="折叠期间新增连线的归位：外部节点ID=子节点ID（可重复）",
     )
 
-    p_ver = sub.add_parser("verify")
+    p_ver = sub.add_parser("verify", help="沉淀已验证事实与架构约束")
     p_ver.add_argument("--fact", required=True)
     p_ver.add_argument("--constraint", required=True)
+    p_ver.add_argument("--scope", action="append", default=[],
+                       help="作用域：global（默认）、节点 ID 或阶段名，可重复；需已迁移为结构化记录")
+    p_ver.add_argument("--source", default="", help="证据来源，如 analysis/x/case.json#key 或实测记录路径")
+    p_ver.add_argument("--supersedes", action="append", default=[], metavar="GT-xx",
+                       help="本条取代的旧事实编号，可重复；被取代的条目默认不再展示")
+
+    p_state = sub.add_parser("set-node-state", help="记录节点的实现进度、验证程度、引用与实现文件")
+    p_state.add_argument("--node", required=True)
+    p_state.add_argument("--impl", default="", choices=["", *IMPL_LEVELS])
+    p_state.add_argument("--verify", default="", choices=["", *VERIFY_LEVELS])
+    p_state.add_argument("--verify-date", default="", help="YYYY-MM-DD，缺省为今天")
+    p_state.add_argument("--ref", action="append", default=None,
+                         help="替换整个引用列表，可重复，如 docs/protocol.md#6")
+    p_state.add_argument("--add-ref", action="append", default=[])
+    p_state.add_argument("--drop-ref", action="append", default=[])
+    p_state.add_argument("--file-path", action="append", default=None, help="替换实现文件列表，可重复")
+
+    p_open = sub.add_parser("open", help="待办项登记：add / resolve / list")
+    open_sub = p_open.add_subparsers(dest="open_cmd", required=True)
+    p_oadd = open_sub.add_parser("add")
+    p_oadd.add_argument("--question", required=True)
+    p_oadd.add_argument("--kind", required=True, choices=list(OPEN_KINDS))
+    p_oadd.add_argument("--owner", required=True, choices=list(OPEN_OWNERS))
+    p_oadd.add_argument("--scope", action="append", default=[], help="global（默认）、节点 ID 或阶段名，可重复")
+    p_oadd.add_argument("--blocking", action="store_true", help="卡住开发")
+    p_ores = open_sub.add_parser("resolve")
+    p_ores.add_argument("--id", required=True)
+    p_ores.add_argument("--resolution", required=True)
+    p_ores.add_argument("--constraint", default="", help="给出时把结论同时沉淀为同作用域的事实")
+    p_olist = open_sub.add_parser("list")
+    p_olist.add_argument("--node", default="", help="与该节点相关（含阶段、折叠子节点）")
+    p_olist.add_argument("--scope", default="", help="作用域精确匹配，如 global")
+    p_olist.add_argument("--owner", default="", choices=["", *OPEN_OWNERS])
+    p_olist.add_argument("--blocking", action="store_true")
+    p_olist.add_argument("--all", action="store_true", help="包括已解决的")
+
+    p_facts = sub.add_parser("facts", help="查询事实：缺省列 global，--node 列节点相关，--all 列全部")
+    p_facts.add_argument("--node", default="")
+    p_facts.add_argument("--all", action="store_true")
+    p_facts.add_argument("--with-superseded", action="store_true")
+
+    sub.add_parser("status", help="项目进度总览：节点实现/验证、待办项、记录统计")
+    sub.add_parser("migrate-records", help="把旧格式 ground_truth.md / graveyard.md 导入 .arch/records.json（幂等）")
+
+    p_rescope = sub.add_parser("rescope", help="修改事实 (GT-xx) 或待办项 (OI-xx) 的作用域")
+    p_rescope.add_argument("--id", required=True)
+    p_rescope.add_argument("--scope", action="append", required=True)
+
+    p_legacy = sub.add_parser("legacy", help="未分类遗留记录：list / show / resolve")
+    legacy_sub = p_legacy.add_subparsers(dest="legacy_cmd", required=True)
+    p_llist = legacy_sub.add_parser("list")
+    p_llist.add_argument("--all", action="store_true", help="包括已处理的")
+    p_lshow = legacy_sub.add_parser("show")
+    p_lshow.add_argument("--id", required=True)
+    p_lres = legacy_sub.add_parser("resolve")
+    p_lres.add_argument("--id", required=True)
+    p_lres.add_argument("--note", default="", help="处理去向，如“拆为 GT-12、OI-03”")
+
+    p_cfg = sub.add_parser("config", help="查看或设置记录配置")
+    p_cfg.add_argument("--global-fact-limit", type=int, default=None, help="global 事实字数上限（默认 3000）")
 
     p_gnd = sub.add_parser("ground")
     p_gnd.add_argument("--type", required=True, choices=["human_verify", "doc_ref", "probe_cmd", "code_ref"])
@@ -1142,7 +2471,7 @@ def main() -> None:
 
     p_com = sub.add_parser("commit-node")
     p_com.add_argument("--node", required=True)
-    p_com.add_argument("--file-path", required=True)
+    p_com.add_argument("--file-path", required=True, action="append", help="实现文件，可重复绑定多个")
 
     p_syn = sub.add_parser("sync-manual")
     p_syn.add_argument("--node", required=True)
@@ -1190,7 +2519,32 @@ def main() -> None:
                 attach[neighbour.strip()] = child.strip()
             print(op_unfold(args.node, attach))
         elif args.cmd == "verify":
-            print(op_verify(args.fact, args.constraint))
+            print(op_verify(args.fact, args.constraint, args.scope, args.source, args.supersedes))
+        elif args.cmd == "set-node-state":
+            print(op_set_node_state(
+                args.node, args.impl, args.verify, args.verify_date,
+                args.ref, args.add_ref, args.drop_ref, args.file_path,
+            ))
+        elif args.cmd == "open":
+            if args.open_cmd == "add":
+                print(op_open_add(args.question, args.kind, args.owner, args.scope, args.blocking))
+            elif args.open_cmd == "resolve":
+                print(op_open_resolve(args.id, args.resolution, args.constraint))
+            else:
+                print(op_open_list(args.node, args.scope, args.all, args.owner, args.blocking))
+        elif args.cmd == "facts":
+            print(op_facts(args.node, args.all, args.with_superseded))
+        elif args.cmd == "status":
+            print(op_status())
+        elif args.cmd == "migrate-records":
+            print(op_migrate_records())
+        elif args.cmd == "rescope":
+            print(op_rescope(args.id, args.scope))
+        elif args.cmd == "legacy":
+            print(op_legacy(args.legacy_cmd, getattr(args, "id", ""), getattr(args, "note", ""),
+                            getattr(args, "all", False)))
+        elif args.cmd == "config":
+            print(op_config(args.global_fact_limit))
         elif args.cmd == "ground":
             print(op_ground(args.type, args.source, args.note))
         elif args.cmd == "export-task":

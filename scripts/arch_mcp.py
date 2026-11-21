@@ -182,14 +182,131 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "arch_verify",
-        "description": "将用户刚刚在现实环境中实测确认的客观事实与硬约束永久沉淀进 .arch/ground_truth.md。",
+        "description": (
+            "沉淀已验证的客观事实与架构硬约束（结构化记录在 .arch/records.json，ground_truth.md 由工具生成）。"
+            "只与部分节点相关的事实务必给 scope，global 事实每次 focus 都会带上；过时的事实用 supersedes 取代，不要重复追加。"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "fact": {"type": "string", "description": "已验证的客观现实结论"},
                 "constraint": {"type": "string", "description": "由此推导出的架构硬约束"},
+                "scope": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "可选：作用域，global（默认）、节点 ID 或阶段名",
+                },
+                "source": {"type": "string", "description": "可选：证据来源路径，如 analysis/x/case.json#key"},
+                "supersedes": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "可选：被本条取代的旧事实编号（GT-xx）",
+                },
             },
             "required": ["fact", "constraint"],
+        },
+    },
+    {
+        "name": "arch_set_node_state",
+        "description": (
+            "记录节点的实现进度（impl）、验证程度（verify，自动记日期）、引用（refs，如 docs/protocol.md#6，"
+            "export_task 会内联该章节）与实现文件（可多个）。可直接用于折叠模块内的子节点。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string"},
+                "impl": {"type": "string", "enum": ["planned", "building", "built"]},
+                "verify": {"type": "string", "enum": ["none", "unit", "api", "device"]},
+                "verify_date": {"type": "string", "description": "可选：YYYY-MM-DD，缺省为今天"},
+                "refs": {"type": "array", "items": {"type": "string"}, "description": "可选：替换整个引用列表"},
+                "add_refs": {"type": "array", "items": {"type": "string"}},
+                "drop_refs": {"type": "array", "items": {"type": "string"}},
+                "file_paths": {"type": "array", "items": {"type": "string"}, "description": "可选：替换实现文件列表"},
+            },
+            "required": ["node_id"],
+        },
+    },
+    {
+        "name": "arch_open",
+        "description": (
+            "待办项登记：action=add 登记待验证的未知项（真机实测 / 调研 / 待决策，由用户或代理处理，是否卡开发）；"
+            "action=resolve 写结论关闭，带 constraint 时同时沉淀为同作用域的事实；action=list 列出。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["add", "resolve", "list"]},
+                "question": {"type": "string", "description": "add：要弄清的问题"},
+                "kind": {"type": "string", "enum": ["device_test", "research", "decision"]},
+                "owner": {"type": "string", "enum": ["user", "agent"]},
+                "scope": {"type": "array", "items": {"type": "string"},
+                          "description": "add：作用域，global（默认）、节点 ID 或阶段名；list：按作用域精确筛选（取第一个）"},
+                "blocking": {"type": "boolean", "description": "add：是否卡住开发；list：只列卡开发的"},
+                "id": {"type": "string", "description": "resolve：待办项编号 OI-xx"},
+                "resolution": {"type": "string", "description": "resolve：结论"},
+                "constraint": {"type": "string", "description": "resolve：可选，同时沉淀为事实的架构约束"},
+                "node_id": {"type": "string", "description": "list：与该节点相关的"},
+                "include_resolved": {"type": "boolean", "description": "list：包括已解决的"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "arch_facts",
+        "description": "查询事实：缺省列 global 事实及字数；node_id 列与该节点（含阶段、折叠子节点）相关的事实和墓志；all=true 按作用域列全部。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string"},
+                "all": {"type": "boolean"},
+                "with_superseded": {"type": "boolean", "description": "包括已被取代的事实"},
+            },
+        },
+    },
+    {
+        "name": "arch_status",
+        "description": "项目进度总览：各节点实现进度与验证程度、未关闭与卡开发的待办项、记录统计、未分类遗留与迁移提示。",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "arch_migrate_records",
+        "description": (
+            "把旧格式 ground_truth.md / graveyard.md 导入 .arch/records.json（幂等）。标准条目转为事实 / 墓志，"
+            "其余段落原样保存为未分类遗留记录，需与用户逐条处理（arch_legacy）。"
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "arch_rescope",
+        "description": "修改事实 (GT-xx) 或待办项 (OI-xx) 的作用域，内容不变。迁移后把只与部分节点相关的 global 事实收窄时使用。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "scope": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["id", "scope"],
+        },
+    },
+    {
+        "name": "arch_legacy",
+        "description": "未分类遗留记录：action=list 列出，show 看全文，resolve 标记已处理（原文仍保留在 records.json）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "show", "resolve"]},
+                "id": {"type": "string", "description": "show / resolve：LG-xx"},
+                "note": {"type": "string", "description": "resolve：处理去向，如“拆为 GT-12、OI-03”"},
+                "include_resolved": {"type": "boolean", "description": "list：包括已处理的"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "arch_config",
+        "description": "查看或设置记录配置：global_fact_limit 为 global 事实字数上限（默认 3000，超出时 focus / status 会警告）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"global_fact_limit": {"type": "integer"}},
         },
     },
     {
@@ -226,9 +343,13 @@ TOOLS: List[Dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "node_id": {"type": "string"},
-                "file_path": {"type": "string"},
+                "file_path": {"type": "string", "description": "实现文件（项目相对路径）"},
+                "file_paths": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "可选：节点由多个文件实现时传全部路径，代替 file_path",
+                },
             },
-            "required": ["node_id", "file_path"],
+            "required": ["node_id"],
         },
     },
     {
@@ -344,13 +465,60 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
     if name == "arch_unfold":
         return arch_cli.op_unfold(args["node_id"], args.get("attach") or {})
     if name == "arch_verify":
-        return arch_cli.op_verify(args["fact"], args["constraint"])
+        return arch_cli.op_verify(
+            args["fact"], args["constraint"],
+            scope=args.get("scope"), source=args.get("source", ""), supersedes=args.get("supersedes"),
+        )
+    if name == "arch_set_node_state":
+        return arch_cli.op_set_node_state(
+            args["node_id"],
+            impl=args.get("impl", ""),
+            verify=args.get("verify", ""),
+            verify_date=args.get("verify_date", ""),
+            refs=args.get("refs"),
+            add_refs=args.get("add_refs"),
+            drop_refs=args.get("drop_refs"),
+            file_paths=args.get("file_paths"),
+        )
+    if name == "arch_open":
+        action = args.get("action", "list")
+        if action == "add":
+            return arch_cli.op_open_add(
+                args.get("question", ""), args.get("kind", ""), args.get("owner", ""),
+                scope=args.get("scope"), blocking=bool(args.get("blocking")),
+            )
+        if action == "resolve":
+            return arch_cli.op_open_resolve(args.get("id", ""), args.get("resolution", ""), args.get("constraint", ""))
+        if action == "list":
+            scope = args.get("scope") or ""
+            if isinstance(scope, list):
+                scope = scope[0] if scope else ""
+            return arch_cli.op_open_list(
+                node_id=args.get("node_id", ""), scope=scope,
+                include_resolved=bool(args.get("include_resolved")),
+                owner=args.get("owner", ""), blocking_only=bool(args.get("blocking")),
+            )
+        raise arch_cli.ArchEngineError(f"arch_open 的 action 只能是 add / resolve / list，收到：{action}")
+    if name == "arch_facts":
+        return arch_cli.op_facts(args.get("node_id", ""), bool(args.get("all")), bool(args.get("with_superseded")))
+    if name == "arch_status":
+        return arch_cli.op_status()
+    if name == "arch_migrate_records":
+        return arch_cli.op_migrate_records()
+    if name == "arch_rescope":
+        return arch_cli.op_rescope(args["id"], args["scope"])
+    if name == "arch_legacy":
+        return arch_cli.op_legacy(
+            args.get("action", "list"), args.get("id", ""), args.get("note", ""), bool(args.get("include_resolved")),
+        )
+    if name == "arch_config":
+        return arch_cli.op_config(args.get("global_fact_limit"))
     if name == "arch_ground":
         return arch_cli.op_ground(args["source_type"], args["source"], args.get("note", ""))
     if name == "arch_export_task":
         return arch_cli.op_export_task(args["node_id"])
     if name == "arch_commit_node":
-        return arch_cli.op_commit_node(args["node_id"], args["file_path"])
+        return arch_cli.op_commit_node(args["node_id"], args.get("file_paths") or args.get("file_path", ""))
     if name == "arch_sync_manual":
         return arch_cli.op_sync_manual(args["node_id"], args["summary"])
     if name == "arch_reset_node":

@@ -134,6 +134,14 @@
     border: 1.6px solid var(--ink); border-radius: 999px; box-shadow: 1.5px 1.5px 0 var(--shadow);
   }
 
+  .impl-pill {
+    position: absolute; left: 10px; bottom: -11px; white-space: nowrap;
+    font: 700 9.5px/1 var(--mono); padding: 3px 6px; color: #1f1d1a; background: #e9e4da;
+    border: 1.6px solid var(--ink); border-radius: 999px; box-shadow: 1.5px 1.5px 0 var(--shadow);
+  }
+  .impl-pill.building { background: #f8d877; }
+  .impl-pill.built { background: #a8e2c0; }
+
   .edge { fill: none; stroke: var(--line); stroke-width: 2; transition: opacity .2s; }
   .edge.skeleton { stroke-width: 2.7; }
   .edge.pending { stroke: var(--amber-line); stroke-dasharray: 6 5; stroke-width: 2.2; }
@@ -340,6 +348,23 @@
   function shq(s) { s = String(s); return /^[A-Za-z0-9_.:\/-]+$/.test(s) ? s : "'" + s.replace(/'/g, "'\\''") + "'"; }
 
   var graph = (DATA && DATA.graph) || {};
+  var NODE_STATE = (DATA && DATA.node_state) || {};
+  var RECORDS = (DATA && DATA.records) || { enabled: false };
+  var IMPL_TEXT = { planned: '未实现', building: '实现中', built: '已实现' };
+  var VERIFY_TEXT = { none: '未验证', unit: '单测', api: '接口实测', device: '真机实测' };
+  function stateOf(id) {
+    var st = NODE_STATE[id] || {};
+    return { impl: st.impl || 'planned', verify: (st.verify && st.verify.level) || 'none',
+             date: (st.verify && st.verify.date) || '', refs: st.refs || [], files: st.files || [] };
+  }
+  function leavesOf(n) {
+    var out = [];
+    (n.children || []).forEach(function (c) { if (c.status === 'super_node') out = out.concat(leavesOf(c)); else out.push(c); });
+    return out;
+  }
+  function scopeHit(scope, ids) {
+    return (scope || ['global']).some(function (s) { return ids.indexOf(s) >= 0; });
+  }
   var nodes = (graph.nodes || []).filter(function (n) { return n && n.id != null; }).map(function (n) {
     var c = {}; for (var k in n) c[k] = n[k]; c.id = String(n.id); return c;
   });
@@ -646,6 +671,16 @@
         var dot = h('span', 'dot'); dot.style.setProperty('--c', FAM[famFor(roleOf(n))].dot); el.appendChild(dot);
       }
       el.appendChild(h('span', 'label', displayLabel(n)));
+      if (n.status === 'solid') {
+        var st0 = stateOf(n.id);
+        if (st0.impl !== 'planned' || st0.verify !== 'none') {
+          var pillText = IMPL_TEXT[st0.impl] + (st0.verify !== 'none' ? ' · ' + VERIFY_TEXT[st0.verify] : '');
+          el.appendChild(h('span', 'impl-pill ' + st0.impl, pillText));
+        }
+      } else if (n.status === 'super_node') {
+        var lv = leavesOf(n), nb = lv.filter(function (c) { return stateOf(c.id).impl === 'built'; }).length;
+        if (nb) el.appendChild(h('span', 'impl-pill' + (nb === lv.length ? ' built' : ' building'), nb + '/' + lv.length + ' 已实现'));
+      }
       if (id === nextFocus) el.appendChild(h('span', 'next-pill', '下一个决定'));
       el.title = displayLabel(n) + (n.spec ? '\n' + n.spec : '');
       el.setAttribute('aria-label', displayLabel(n) + '，' + (STATUS_TEXT[n.status] || n.status) + (id === nextFocus ? '，下一个决定' : ''));
@@ -885,8 +920,27 @@
       }
       contractRows(section('输入契约 · IN'), edges.filter(function (e) { return e.to === n.id; }), 'in');
       contractRows(section('输出契约 · OUT'), edges.filter(function (e) { return e.from === n.id; }), 'out');
-      if (n.file_path || n.last_tag) {
-        section('实现绑定').appendChild(h('div', 'box mono', (n.file_path ? '📁 ' + n.file_path : '未绑定源码') + (n.last_tag ? '\n🏷 ' + n.last_tag : '')));
+      if (n.status === 'super_node') {
+        var lv2 = leavesOf(n);
+        var nb2 = lv2.filter(function (c) { return stateOf(c.id).impl === 'built'; }).length;
+        section('实现进度').appendChild(h('div', 'box mono', nb2 + ' / ' + lv2.length + ' 个子节点已实现'));
+      } else {
+        var st = stateOf(n.id);
+        var stLines = ['实现：' + IMPL_TEXT[st.impl], '验证：' + VERIFY_TEXT[st.verify] + (st.date ? '（' + st.date + '）' : '')];
+        st.files.forEach(function (f) { stLines.push('📁 ' + f); });
+        if (!st.files.length) stLines.push('未绑定源码');
+        if (n.last_tag) stLines.push('🏷 ' + n.last_tag);
+        st.refs.forEach(function (r) { stLines.push('🔗 ' + r); });
+        section('实现与验证').appendChild(h('div', 'box mono', stLines.join('\n')));
+      }
+      if (RECORDS.enabled) {
+        var ids = [n.id].concat(n.stage ? [n.stage] : []).concat(leavesOf(n).map(function (c) { return c.id; }));
+        var rel = (RECORDS.facts || []).filter(function (f) { return f.scope.indexOf('global') < 0 && scopeHit(f.scope, ids); }).map(function (f) { return f.line; })
+          .concat((RECORDS.graveyard || []).filter(function (g) { return ids.indexOf(g.node) >= 0; }).map(function (g) { return g.line; }));
+        listOrEmpty(section('相关事实与墓志'), rel, '暂无');
+        var ops = (RECORDS.open_items || []).filter(function (o) { return scopeHit(o.scope, ids); })
+          .map(function (o) { return '[' + o.id + '] ' + o.question + (o.blocking ? '（卡开发）' : ''); });
+        if (ops.length) listOrEmpty(section('待办项'), ops, '');
       }
       var cs = section('接下来可以');
       commandsFor(n).forEach(function (c) {
@@ -921,7 +975,36 @@
     if (skeleton) skS.appendChild(h('div', 'box chain', skeleton.map(nameOf).join('  →  ')));
     else skS.appendChild(h('div', 'empty', '尚未贯通：还没有一条从入口到出口、不含待定节点的通路。'));
 
-    listOrEmpty(section('已验证事实 · GROUND TRUTH'), DATA && DATA.ground_truth, '暂无记录');
+    var progress = { built: 0, building: 0, planned: 0 }, verified = 0, decided = 0;
+    nodes.forEach(function (x) {
+      var pool = x.status === 'super_node' ? leavesOf(x) : [x];
+      pool.forEach(function (c) {
+        if (c.status !== 'solid') return;
+        decided++;
+        var sc = stateOf(c.id); progress[sc.impl]++;
+        if (sc.verify !== 'none') verified++;
+      });
+    });
+    var pstats = h('div', 'stats');
+    [['built', '已实现', '#a8e2c0'], ['building', '实现中', '#f8d877'], ['planned', '未实现', '#e9e4da']].forEach(function (s) {
+      var c3 = h('div', 'stat'); c3.style.background = s[2];
+      c3.appendChild(h('b', null, progress[s[0]])); c3.appendChild(h('span', null, s[1]));
+      pstats.appendChild(c3);
+    });
+    var psec = section('实现进度 · ' + decided + ' 个已确定节点');
+    psec.appendChild(pstats);
+    psec.appendChild(h('div', 'note', '其中 ' + verified + ' 个做过验证（单测 / 接口 / 真机）。'));
+
+    if (RECORDS.enabled) {
+      var openItems = (RECORDS.open_items || []).slice().sort(function (a, b) { return (b.blocking ? 1 : 0) - (a.blocking ? 1 : 0); });
+      listOrEmpty(section('待办项 · OPEN ' + openItems.length), openItems.map(function (o) {
+        return '[' + o.id + '] ' + o.question + '（' + (o.scope || ['global']).join(', ') + (o.blocking ? ' · 卡开发' : '') + '）';
+      }), '暂无');
+      if (RECORDS.legacy_open) section('未分类遗留').appendChild(h('div', 'note', RECORDS.legacy_open + ' 条迁移遗留记录待人工处理：arch legacy list'));
+    }
+    var scoped = RECORDS.enabled ? (RECORDS.facts || []).filter(function (f) { return f.scope.indexOf('global') < 0; }).length : 0;
+    listOrEmpty(section(RECORDS.enabled ? '全局事实 · GLOBAL' : '已验证事实 · GROUND TRUTH'), DATA && DATA.ground_truth, '暂无记录');
+    if (scoped) panel.lastChild.appendChild(h('div', 'note', '另有 ' + scoped + ' 条节点 / 阶段事实，见各节点详情。'));
     listOrEmpty(section('踩坑记录 · GRAVEYARD'), DATA && DATA.graveyard, '暂无记录');
 
     var lg = section('图例');

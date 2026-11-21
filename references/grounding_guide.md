@@ -4,7 +4,7 @@
 
 1. 涉及代码不可见的现实条件（硬件休眠/延迟、操作系统后台策略、黑盒软件行为、物理红线）。  
 2. 若按理想情况猜错，后续代码返工代价高昂。  
-3. 当前 `.arch/ground_truth.md` 中尚无相关记录。
+3. `arch facts --node "$NODE_ID"`、全局事实和 `arch open list --node "$NODE_ID"` 中尚无相关记录。
 
 ## 1\. 标准现实验证卡片模板
 
@@ -22,5 +22,6 @@
 
 以下 `arch` 命令按 [CLI 入口](../SKILL.md#cli-入口) 执行。
 
-* **记录用户验证结果**：调用 MCP 工具 `arch_verify` 或执行 `arch verify --fact "$FACT" --constraint "$CONSTRAINT"`。结果写入 `.arch/ground_truth.md`，并用于调整相关节点。
-* **挂载外部资料或探针**：调用 `arch_ground`，或用 `arch ground --type doc_ref --source "$DOC_PATH"` 将协议文档登记进 `.arch/grounding.json`。其他类型为 `probe_cmd`、`human_verify` 和 `code_ref`。需要交给实现方的文档章节可以直接在节点 `spec` 或连线契约中引用。
+* **用户暂时无法验证时**：登记为待办项，不要把“待实测”写进节点 `spec`。用 `arch open add --question "$QUESTION" --kind device_test --owner user --scope "$NODE_ID"`，卡住开发时加 `--blocking`。代理自己能调研的问题写 `--kind research --owner agent`，并直接去调研。
+* **记录用户验证结果**：调用 MCP 工具 `arch_verify` 或执行 `arch verify --fact "$FACT" --constraint "$CONSTRAINT" --scope "$NODE_ID" --source "$EVIDENCE_PATH"`。约束对所有节点都成立时省略 `--scope`（即 `global`）。新结论推翻旧事实时加 `--supersedes GT-xx`。来自待办项的结论用 `arch open resolve --id OI-xx --resolution "$FACT" --constraint "$CONSTRAINT"`，会同时关闭待办项并沉淀事实。结果写入 `.arch/records.json`，`ground_truth.md` 随之重新生成。
+* **挂载外部资料或探针**：调用 `arch_ground`，或用 `arch ground --type doc_ref --source "$DOC_PATH"` 将协议文档登记进 `.arch/grounding.json`。其他类型为 `probe_cmd`、`human_verify` 和 `code_ref`。需要交给实现方的文档章节用 `arch set-node-state --node "$NODE_ID" --add-ref "docs/x.md#6"` 挂到节点上，`export-task` 会内联该章节原文。
