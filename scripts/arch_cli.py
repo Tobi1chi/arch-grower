@@ -426,8 +426,10 @@ NOT_MIGRATED_HINT = (
     "会全文拼接。运行 arch migrate-records 可转为结构化记录，之后按节点只带相关内容。"
 )
 
+# A fact line: `- [GT-xx] (已验证) text -> 架构约束：constraint`. The "(已验证)"
+# tag and the constraint part are optional; group 3 is None without an arrow.
 GT_LINE = re.compile(
-    r"^[-*]\s+\[(GT-[^\]\s]+)\]\s*(?:[(（]已验证[)）]\s*)?(.*?)\s*->\s*架构约束\s*[：:]\s*(.*)$"
+    r"^[-*]\s+\[(GT-[^\]\s]+)\]\s*(?:[(（]已验证[)）]\s*)?(.*?)(?:\s*->\s*架构约束\s*[：:]\s*(.*))?$"
 )
 GY_LINE = re.compile(r"^[-*]\s+❌\s*\[节点\s+([^\s/\]]+)\s*/\s*(.*)\]\s*废弃原因\s*[：:]\s*(.*)$")
 MD_HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
@@ -569,8 +571,14 @@ def _matches(record: Dict[str, Any], keys: set) -> bool:
 
 # ---------------------------------------------------------------- formatting
 
+def _fact_head(f: Dict[str, Any]) -> str:
+    """`- [GT-xx] text -> 架构约束：constraint`, without the arrow when there is no constraint."""
+    head = f"- [{f['id']}] {f['text']}"
+    return head + (f" -> 架构约束：{f['constraint']}" if f.get("constraint") else "")
+
+
 def _fact_line(f: Dict[str, Any], show_scope: bool = True, superseded_by: str = "") -> str:
-    line = f"- [{f['id']}] {f['text']} -> 架构约束：{f['constraint']}"
+    line = _fact_head(f)
     meta = []
     if show_scope and not _is_global(f):
         meta.append(f"作用域 {_scope_text(f['scope'])}")
@@ -628,7 +636,7 @@ def _render_ground_truth(rec: Dict[str, Any]) -> str:
     for scope, facts in groups.items():
         lines += [f"## 作用域 · {scope}", ""]
         for f in facts:
-            lines.append(f"- [{f['id']}] {f['text']} -> 架构约束：{f['constraint']}")
+            lines.append(_fact_head(f))
             meta = [x for x in (
                 f"来源：{f['source']}" if f.get("source") else "",
                 f"日期：{f['date']}" if f.get("date") else "",
@@ -643,7 +651,7 @@ def _render_ground_truth(rec: Dict[str, Any]) -> str:
     if old:
         lines += ["## 已被取代（focus / export-task 默认不展示）", ""]
         for f in old:
-            lines.append(f"- [{f['id']}] {f['text']} -> 架构约束：{f['constraint']}")
+            lines.append(_fact_head(f))
             lines.append(f"  - 作用域：{_scope_text(f.get('scope'))} · 由 {gone[f['id']]} 取代")
             if f.get("detail"):
                 lines.append(textwrap.indent(f["detail"], "  "))
@@ -779,7 +787,7 @@ def _parse_md_records(text: str) -> Dict[str, List[Dict[str, Any]]]:
             flush(True)
             if fm:
                 last = {"legacy_id": fm.group(1), "text": fm.group(2).strip(),
-                        "constraint": fm.group(3).strip(), "section": section, "_detail": []}
+                        "constraint": (fm.group(3) or "").strip(), "section": section, "_detail": []}
                 facts.append(last)
             else:
                 last = {"node": gm.group(1), "scheme": gm.group(2).strip(),
@@ -2208,12 +2216,42 @@ def op_status() -> str:
     return "\n".join(out)
 
 
+def _reparse_legacy(rec: Dict[str, Any], stats: Counter) -> List[str]:
+    """Split open legacy records that the current parser now understands.
+
+    A legacy block holding entries (e.g. GT lines without "-> 架构约束", which
+    older versions did not recognise) becomes those entries plus whatever is
+    left as new legacy blocks; the original block is marked resolved and kept
+    verbatim. Blocks with no entries are left untouched, so this is idempotent.
+    """
+    notes = []
+    for lg in [x for x in rec["legacy"] if x.get("status") != "resolved"]:
+        parsed = _parse_md_records(lg["text"])
+        if not parsed["facts"] and not parsed["graveyard"]:
+            continue
+        for item in parsed["facts"] + parsed["graveyard"] + parsed["legacy"]:
+            item["section"] = item["section"] or lg.get("section", "")
+        known = {x["id"] for key in ("facts", "graveyard", "legacy") for x in rec[key]}
+        _merge_parsed(rec, parsed, lg["source"], stats)
+        new_ids = [x["id"] for key in ("facts", "graveyard", "legacy") for x in rec[key] if x["id"] not in known]
+        for key in ("facts", "graveyard", "legacy"):
+            for x in rec[key]:
+                if x["id"] in new_ids:
+                    x["from_legacy"] = lg["id"]
+        lg["status"] = "resolved"
+        lg["resolved_at"] = _today()
+        lg["note"] = "migrate-records 重新解析为 " + ("、".join(new_ids) or "已有条目（内容重复）")
+        notes.append(f"{lg['id']} → {'、'.join(new_ids) or '已有条目'}")
+    return notes
+
+
 def op_migrate_records() -> str:
     """Convert md records into .arch/records.json, then render the md from it.
 
     Idempotent: entries already present (same content) are skipped, and a
     generated md that nobody edited contributes nothing. Lines added by hand
-    to a generated md are imported too.
+    to a generated md are imported too. Open legacy records that contain
+    recognisable entries are split into them (see _reparse_legacy).
     """
     if not ARCH_DIR.exists():
         raise ArchEngineError("未找到 .arch/ 目录。请在持有 .arch/ 的项目根目录执行。")
@@ -2234,8 +2272,9 @@ def op_migrate_records() -> str:
         _merge_parsed(rec, _parse_md_records(text), path.name, stats)
         if sum(stats[k] for k in ("facts", "graveyard", "legacy")) > before:
             sources.append(path.name)
+    reparsed = _reparse_legacy(rec, stats)
 
-    if not first_time and not sources:
+    if not first_time and not sources and not reparsed:
         out = "记录已是最新：没有需要导入的新内容。" + (f"（跳过重复 {stats['skipped']} 条）" if stats["skipped"] else "")
         if _pending_md_edits(rec):
             # Only duplicates or deletions were made by hand: records.json wins.
@@ -2253,6 +2292,8 @@ def op_migrate_records() -> str:
         f"未分类遗留 {stats['legacy']} 条；跳过重复 {stats['skipped']} 条。",
         "ground_truth.md / graveyard.md / open_items.md 现由工具生成，不要再手改。",
     ]
+    if reparsed:
+        out.append("已把含标准条目的未分类遗留记录拆开（原文保留为已处理）：" + "；".join(reparsed))
     if stats["legacy"]:
         out.append(
             f"[LEGACY_RECORDS] 有 {stats['legacy']} 段内容不是标准条目，已原样保存为未分类遗留记录。"

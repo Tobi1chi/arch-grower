@@ -835,7 +835,7 @@ class MigrationTest(EngineTestCase):
                 heading = arch_cli.MD_HEADING.match(line)
                 pieces = (fm.groups()[1:] if fm else gm.groups() if gm
                           else [heading.group(2)] if heading else [stripped])
-                for piece in pieces:
+                for piece in [x for x in pieces if x]:
                     with self.subTest(file=name, line=line, piece=piece):
                         self.assertIn(json.dumps(piece, ensure_ascii=False)[1:-1], dump)
 
@@ -897,6 +897,90 @@ class MigrationTest(EngineTestCase):
         arch_cli.op_init("again")
         self.assertFalse(Path(".arch/records.json").exists())
         self.assertIn("长段调查", Path(".arch/ground_truth.md").read_text(encoding="utf-8"))
+
+
+GT_WITHOUT_ARROWS = """# 已验证现实事实与硬约束 (Ground Truth)
+
+- [GT-01] (已验证) 板子只有 2 路 UART -> 架构约束：日志走 RTT
+- [GT-02] BLE MTU 185 -> 架构约束：分片 ≤ 180
+- [GT-03] 用户授权按已确认架构开发，不再逐项确认。
+- [GT-04] (已验证) 唤醒词经真机验证可用
+- [GT-05] 原生“小雷小雷”连续交互复用本机Agent对话。
+- [GT-06]（已验证）全角括号也算已验证标记
+- [GT-07] 第七条
+  缩进的补充说明
+状态表之类的叙述
+"""
+
+
+class GtWithoutConstraintTest(EngineTestCase):
+    """Real projects carry GT entries without "-> 架构约束：" (OpenRayneo GT-03 / GT-05)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        Path(".arch/records.json").unlink()
+        Path(".arch/open_items.md").unlink()
+        Path(".arch/ground_truth.md").write_text(GT_WITHOUT_ARROWS, encoding="utf-8")
+
+    def test_every_gt_line_is_its_own_fact(self) -> None:
+        arch_cli.op_migrate_records()
+        rec = _records()
+        got = [(f["id"], f["text"], f["constraint"]) for f in rec["facts"]]
+        self.assertEqual(got, [
+            ("GT-01", "板子只有 2 路 UART", "日志走 RTT"),
+            ("GT-02", "BLE MTU 185", "分片 ≤ 180"),
+            ("GT-03", "用户授权按已确认架构开发，不再逐项确认。", ""),
+            ("GT-04", "唤醒词经真机验证可用", ""),
+            ("GT-05", "原生“小雷小雷”连续交互复用本机Agent对话。", ""),
+            ("GT-06", "全角括号也算已验证标记", ""),
+            ("GT-07", "第七条", ""),
+        ])
+        self.assertEqual(rec["facts"][6]["detail"], "缩进的补充说明")
+        self.assertEqual([lg["text"] for lg in rec["legacy"]], ["状态表之类的叙述"])
+
+    def test_facts_without_constraint_display_cleanly(self) -> None:
+        arch_cli.op_migrate_records()
+        arch_cli.op_rescope("GT-03", "entry_input")
+        focus = arch_cli.op_focus("entry_input")
+        self.assertIn("- [GT-03] 用户授权按已确认架构开发，不再逐项确认。（作用域 entry_input）", focus)
+        self.assertIn("- [GT-05] 原生“小雷小雷”连续交互复用本机Agent对话。\n", focus)
+        self.assertNotIn("架构约束：\n", focus)
+        self.assertNotIn("架构约束：（", focus)
+        self.assertIn("- [GT-04] 唤醒词经真机验证可用", arch_cli.op_facts())
+        md = Path(".arch/ground_truth.md").read_text(encoding="utf-8")
+        self.assertIn("- [GT-05] 原生“小雷小雷”连续交互复用本机Agent对话。\n", md)
+        self.assertIn("记录已是最新", arch_cli.op_migrate_records())
+        self.assertEqual(len(_records()["facts"]), 7)
+
+    def test_project_migrated_by_the_old_parser_recovers_its_facts(self) -> None:
+        # What the previous parser produced: GT-01/02 as facts, the rest as
+        # one legacy block that swallowed several adjacent GT lines.
+        arch_cli.op_migrate_records()
+        rec = _records()
+        merged = "\n".join(GT_WITHOUT_ARROWS.splitlines()[4:])  # GT-03 .. narrative
+        rec["facts"] = rec["facts"][:2]
+        rec["legacy"] = [{"id": "LG-01", "source": "ground_truth.md", "section": "", "text": merged,
+                          "status": "open", "note": "", "imported": "2026-11-20"}]
+        Path(".arch/records.json").write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        arch_cli._save_records(arch_cli._read_records())  # re-render the md as that version would
+
+        out = arch_cli.op_migrate_records()
+        self.assertIn("LG-01 → GT-03、GT-04、GT-05、GT-06、GT-07、LG-02", out)
+        rec = _records()
+        self.assertEqual([f["id"] for f in rec["facts"]], [f"GT-0{i}" for i in range(1, 8)])
+        self.assertTrue(all(f.get("from_legacy") == "LG-01" for f in rec["facts"][2:]))
+        lg1, lg2 = rec["legacy"]
+        self.assertEqual((lg1["status"], lg1["text"]), ("resolved", merged))   # original kept verbatim
+        self.assertEqual((lg2["status"], lg2["text"]), ("open", "状态表之类的叙述"))
+
+        before = Path(".arch/records.json").read_text(encoding="utf-8")
+        self.assertIn("记录已是最新", arch_cli.op_migrate_records())
+        self.assertEqual(Path(".arch/records.json").read_text(encoding="utf-8"), before)
+
+    def test_new_facts_with_constraints_are_unchanged(self) -> None:
+        arch_cli.op_migrate_records()
+        out = arch_cli.op_verify("新事实", "新约束", scope="entry_input")
+        self.assertIn("-> 架构约束：新约束", out)
 
 
 class ForkKeepsRecordsTest(EngineTestCase):
