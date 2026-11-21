@@ -193,9 +193,20 @@ arch-grower/
 ├── SKILL.md                 # Agent 核心引导规范与开箱配置
 ├── MANIFESTO.md             # 架构演进哲学与核心设计原则
 ├── scripts/
-│   ├── arch_cli.py          # 纯标准库状态机、1-Hop 切片器与 Shadow Git 引擎
+│   ├── arch_cli.py          # CLI 入口：参数解析与命令分发（uv run --no-project scripts/arch_cli.py ...）
 │   ├── arch_mcp.py          # 标准 Stdio MCP (Model Context Protocol) 服务端
-│   └── dashboard_template.html  # export-ui 使用的单文件看板模板（零外部依赖，离线可用）
+│   ├── dashboard_template.html  # export-ui 使用的单文件看板模板（零外部依赖，离线可用）
+│   └── arch_engine/         # 纯标准库引擎，依赖自上而下单向
+│       ├── common.py        # 路径与上限、ArchEngineError、Shadow Git、graph.json 读写
+│       ├── graph.py         # 拓扑、折叠模块、最小闭环、连线溯源、节点状态、漂移检测
+│       ├── records.py       # records.json 存储、作用域、格式化与生成的 md
+│       ├── refs.py          # 解析 file.md#章节 / file.json#键 引用
+│       ├── migration.py     # migrate-records：旧 md 记录无损导入
+│       ├── views.py         # 只读视图：focus 切片、export-task、facts、status
+│       ├── graph_ops.py     # 节点与连线操作（init / collapse / add-node / commit-node / reset-node 等）
+│       ├── fold_ops.py      # fold / unfold
+│       ├── record_ops.py    # verify、待办项、rescope、legacy、config、ground
+│       └── dashboard.py     # export-ui 看板导出
 ├── tests/
 │   └── test_arch_cli.py     # 标准库 unittest 回归测试：uv run --no-project python -m unittest discover -s tests
 ├── docs/

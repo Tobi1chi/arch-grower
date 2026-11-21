@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 arch_mcp.py - Zero-dependency Stdio MCP (Model Context Protocol) Server
-exposing native Tool Calls backed by arch_cli.py state machine.
+exposing native Tool Calls backed by engine.py state machine.
 """
 
 import json
@@ -10,12 +10,12 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
-# Ensure sibling arch_cli module is importable regardless of working directory
+# Ensure the sibling arch_engine package is importable regardless of working directory
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import arch_cli  # noqa: E402
+import arch_engine as engine  # noqa: E402
 
 # The engine keeps state in a relative `.arch/` directory. Hosts launch MCP
 # servers from different working directories (Claude Desktop and global configs
@@ -402,11 +402,11 @@ TOOLS: List[Dict[str, Any]] = [
 
 def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
     if name == "arch_init":
-        return arch_cli.op_init(args["seed"])
+        return engine.op_init(args["seed"])
     if name == "arch_focus":
-        return arch_cli.op_focus(args.get("node_id"))
+        return engine.op_focus(args.get("node_id"))
     if name == "arch_collapse":
-        return arch_cli.op_collapse(
+        return engine.op_collapse(
             node_id=args["node_id"],
             label=args["label"],
             spec=args["spec"],
@@ -417,9 +417,9 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             stage=args.get("stage", ""),
         )
     if name == "arch_set_edge_contract":
-        return arch_cli.op_set_edge_contract(args["from_node"], args["to_node"], args["contract"])
+        return engine.op_set_edge_contract(args["from_node"], args["to_node"], args["contract"])
     if name == "arch_add_node":
-        return arch_cli.op_add_node(
+        return engine.op_add_node(
             node_id=args["node_id"],
             label=args["label"],
             spec=args["spec"],
@@ -431,7 +431,7 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             contract=args.get("contract", "TBD"),
         )
     if name == "arch_add_fog":
-        return arch_cli.op_add_node(
+        return engine.op_add_node(
             node_id=args["node_id"],
             label=args["label"],
             spec=args["spec"],
@@ -442,20 +442,20 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             contract="optional_fog",
         )
     if name == "arch_deactivate":
-        return arch_cli.op_deactivate_node(
+        return engine.op_deactivate_node(
             node_id=args["node_id"],
             reason=args.get("reason", ""),
             bypass_contract=args.get("bypass_contract", ""),
         )
     if name == "arch_activate":
-        return arch_cli.op_activate_node(
+        return engine.op_activate_node(
             node_id=args["node_id"],
             after_node=args.get("after_node", ""),
             before_node=args.get("before_node", ""),
             contract=args.get("contract", "TBD"),
         )
     if name == "arch_fold":
-        return arch_cli.op_fold(
+        return engine.op_fold(
             node_ids=args["node_ids"],
             super_id=args["super_id"],
             label=args["label"],
@@ -463,14 +463,14 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             stage=args.get("stage", ""),
         )
     if name == "arch_unfold":
-        return arch_cli.op_unfold(args["node_id"], args.get("attach") or {})
+        return engine.op_unfold(args["node_id"], args.get("attach") or {})
     if name == "arch_verify":
-        return arch_cli.op_verify(
+        return engine.op_verify(
             args["fact"], args["constraint"],
             scope=args.get("scope"), source=args.get("source", ""), supersedes=args.get("supersedes"),
         )
     if name == "arch_set_node_state":
-        return arch_cli.op_set_node_state(
+        return engine.op_set_node_state(
             args["node_id"],
             impl=args.get("impl", ""),
             verify=args.get("verify", ""),
@@ -483,51 +483,51 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
     if name == "arch_open":
         action = args.get("action", "list")
         if action == "add":
-            return arch_cli.op_open_add(
+            return engine.op_open_add(
                 args.get("question", ""), args.get("kind", ""), args.get("owner", ""),
                 scope=args.get("scope"), blocking=bool(args.get("blocking")),
             )
         if action == "resolve":
-            return arch_cli.op_open_resolve(args.get("id", ""), args.get("resolution", ""), args.get("constraint", ""))
+            return engine.op_open_resolve(args.get("id", ""), args.get("resolution", ""), args.get("constraint", ""))
         if action == "list":
             scope = args.get("scope") or ""
             if isinstance(scope, list):
                 scope = scope[0] if scope else ""
-            return arch_cli.op_open_list(
+            return engine.op_open_list(
                 node_id=args.get("node_id", ""), scope=scope,
                 include_resolved=bool(args.get("include_resolved")),
                 owner=args.get("owner", ""), blocking_only=bool(args.get("blocking")),
             )
-        raise arch_cli.ArchEngineError(f"arch_open 的 action 只能是 add / resolve / list，收到：{action}")
+        raise engine.ArchEngineError(f"arch_open 的 action 只能是 add / resolve / list，收到：{action}")
     if name == "arch_facts":
-        return arch_cli.op_facts(args.get("node_id", ""), bool(args.get("all")), bool(args.get("with_superseded")))
+        return engine.op_facts(args.get("node_id", ""), bool(args.get("all")), bool(args.get("with_superseded")))
     if name == "arch_status":
-        return arch_cli.op_status()
+        return engine.op_status()
     if name == "arch_migrate_records":
-        return arch_cli.op_migrate_records()
+        return engine.op_migrate_records()
     if name == "arch_rescope":
-        return arch_cli.op_rescope(args["id"], args["scope"])
+        return engine.op_rescope(args["id"], args["scope"])
     if name == "arch_legacy":
-        return arch_cli.op_legacy(
+        return engine.op_legacy(
             args.get("action", "list"), args.get("id", ""), args.get("note", ""), bool(args.get("include_resolved")),
         )
     if name == "arch_config":
-        return arch_cli.op_config(args.get("global_fact_limit"))
+        return engine.op_config(args.get("global_fact_limit"))
     if name == "arch_ground":
-        return arch_cli.op_ground(args["source_type"], args["source"], args.get("note", ""))
+        return engine.op_ground(args["source_type"], args["source"], args.get("note", ""))
     if name == "arch_export_task":
-        return arch_cli.op_export_task(args["node_id"])
+        return engine.op_export_task(args["node_id"])
     if name == "arch_commit_node":
-        return arch_cli.op_commit_node(args["node_id"], args.get("file_paths") or args.get("file_path", ""))
+        return engine.op_commit_node(args["node_id"], args.get("file_paths") or args.get("file_path", ""))
     if name == "arch_sync_manual":
-        return arch_cli.op_sync_manual(args["node_id"], args["summary"])
+        return engine.op_sync_manual(args["node_id"], args["summary"])
     if name == "arch_reset_node":
-        return arch_cli.op_reset_node(args["node_id"], args["reason"])
+        return engine.op_reset_node(args["node_id"], args["reason"])
     if name == "arch_fork":
-        return arch_cli.op_fork(args["from_tag"])
+        return engine.op_fork(args["from_tag"])
     if name == "arch_export_ui":
-        return arch_cli.op_export_ui(args.get("out_path", ""))
-    raise arch_cli.ArchEngineError(f"未知 MCP 工具：{name}")
+        return engine.op_export_ui(args.get("out_path", ""))
+    raise engine.ArchEngineError(f"未知 MCP 工具：{name}")
 
 
 def _send_response(msg_id: Any, result: Dict[str, Any]) -> None:
@@ -583,7 +583,7 @@ def serve_stdio() -> None:
                         "isError": False,
                     },
                 )
-            except arch_cli.ArchEngineError as exc:
+            except engine.ArchEngineError as exc:
                 _send_response(
                     msg_id,
                     {
