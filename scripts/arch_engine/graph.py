@@ -345,10 +345,14 @@ def _flatten_folds(
       subsystems atomic so their own readiness gates the spoke.
     """
     parent_topo = _container_topology(container)
+    parent_has_top_hub = (
+        parent_topo == "star"
+        and any(n.get("role") == "hub" and n["status"] != "super_node" for n in _container_nodes(container))
+    )
     expandable = (
         {"pipeline"} if parent_topo == "pipeline"
         else {"ring", "pipeline"} if parent_topo == "ring"
-        else {"star"}
+        else (set() if parent_has_top_hub else {"star"})
     )
 
     flat_nodes: List[Dict[str, Any]] = []
@@ -358,7 +362,7 @@ def _flatten_folds(
 
     def walk(node: Dict[str, Any], top_id: str) -> None:
         if node["status"] == "super_node":
-            if _container_topology(node) not in expandable:
+            if node.get("promoted") or _container_topology(node) not in expandable:
                 eff = dict(node)
                 eff["status"] = "solid" if _is_super_ready(node, _seen=_seen) else "hole"
                 flat_nodes.append(eff)

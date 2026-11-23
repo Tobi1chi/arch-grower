@@ -304,6 +304,7 @@ def op_promote(
     node["status"] = "super_node"
     node["type"] = "super_node"
     node["topology"] = sub_topo
+    node["promoted"] = True
     node["children"] = children
     node["inner_edges"] = inner_edges
     node["entry_children"] = entry_children

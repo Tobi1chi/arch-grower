@@ -1136,6 +1136,26 @@ class MultiTopologyTest(EngineTestCase):
         arch_cli.op_reset_node("core_hub", "重选中枢", scope="core_a")
         self.assertIsNone(arch_cli._find_walking_skeleton(arch_cli._load_graph()))
 
+    def test_promoted_star_spoke_gates_parent_star_readiness(self) -> None:
+        # Codex round-4 regression: promoting a star's spoke into another star must
+        # keep the spoke gated on its own subsystem readiness (collapsing only its
+        # inner hub must NOT prematurely make the parent star ready).
+        arch_cli.op_init("Nested star", topology="star")
+        for nid in ("core_hub", "spoke_a", "spoke_b"):
+            self.collapse(nid)
+        arch_cli.op_promote("spoke_a", topology="star")
+        arch_cli.op_collapse("spoke_a_hub", "子中枢", "spec", scope="spoke_a")
+        self.assertIsNone(arch_cli._find_walking_skeleton(arch_cli._load_graph(), scope="spoke_a"))
+        self.assertIsNone(arch_cli._find_walking_skeleton(arch_cli._load_graph()))
+
+        # Once the promoted spoke's own star becomes ready, parent star becomes ready too.
+        arch_cli.op_collapse("spoke_a_spoke_a", "子通道A", "spec", scope="spoke_a")
+        arch_cli.op_collapse("spoke_a_spoke_b", "子通道B", "spec", scope="spoke_a")
+        self.assertEqual(
+            arch_cli._find_walking_skeleton(arch_cli._load_graph()),
+            ["core_hub", "spoke_a", "spoke_b"],
+        )
+
 
 class SubsystemSuperNodeTest(EngineTestCase):
     def test_promote_creates_isolated_subsystem_with_compositional_skeleton(self) -> None:
