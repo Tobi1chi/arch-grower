@@ -1,6 +1,7 @@
 """Fold a settled sub-graph into a super node, unfold it exactly, or promote a
 node top-down into an isolated sub-system with its own topology."""
 
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from .common import ArchEngineError, _load_config, _load_graph, _save_graph, _shadow_commit
@@ -10,6 +11,30 @@ from .graph import (
     _validate_topology,
 )
 from .views import op_focus
+
+
+def _infer_folded_topology(
+    members: Dict[str, Dict[str, Any]], inner: List[Dict[str, Any]],
+) -> str:
+    """Infer an internal topology for a folded subgraph when none was given explicitly.
+
+    Avoids inheriting `ring` onto an open arc (which has no internal cycle and
+    would make `_is_super_ready` permanently False).
+    """
+    hubs = [nid for nid, n in members.items() if n.get("role") == "hub"]
+    for h in hubs:
+        nbrs = {
+            e["to"] if e["from"] == h else e["from"]
+            for e in inner if h in (e["from"], e["to"]) and e["from"] != e["to"]
+        }
+        if len(nbrs) >= 2:
+            return "star"
+
+    directed_inner = [e for e in inner if _edge_kind(e) != "bidirectional"]
+    scc_sizes = Counter(_sccs(members.keys(), directed_inner, include_feedback=True).values())
+    if any(sz >= 2 for sz in scc_sizes.values()):
+        return "ring"
+    return "pipeline"
 
 
 def _replace_container_lists(
@@ -195,7 +220,7 @@ def op_fold(
         grouped.setdefault((super_id, e["to"]), []).extend(_edge_members(e))
     folded_edges = [_edge_from_members(u, v, ms) for (u, v), ms in grouped.items()]
 
-    sub_topo = _validate_topology(topology) if topology else _container_topology(container)
+    sub_topo = _validate_topology(topology) if topology else _infer_folded_topology(members, inner)
     child_stages = {members[nid].get("stage", "") for nid in ids}
     super_node: Dict[str, Any] = {
         "id": super_id,
