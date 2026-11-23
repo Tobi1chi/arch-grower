@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__ARCH_TITLE__ · arch-grower</title>
 <!--
-  arch-grower dashboard template, rendered by `arch_cli.py export-ui`, which
-  fills in the page title and the embedded JSON payload. Single file, no
+  arch-grower multi-topology dashboard template, rendered by `arch_cli.py export-ui`,
+  which fills in the page title and the embedded JSON payload. Single file, no
   network access. All node text is inserted with textContent, never as HTML.
 -->
 <style>
@@ -19,6 +19,7 @@
     --muted: #6f685c;
     --line: #2b2824;
     --accent: #7c6cf0;
+    --feedback: #1d8f84;
     --amber: #f6cf5a;
     --amber-soft: #fff3cc;
     --amber-stripe: #fbe19a;
@@ -35,15 +36,17 @@
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
       --bg: #1b1916; --dot: #38342d; --surface: #2a2722; --ink: #efe8da; --shadow: #000;
-      --muted: #a69e8e; --line: #d8d0c0; --amber-soft: #4a3d1c; --amber-stripe: #5c4b1f;
-      --amber-line: #e0b043; --fog: #3b374a; --fog-stripe: #312e3d; --fog-line: #8f85bd;
+      --muted: #a69e8e; --line: #d8d0c0; --feedback: #45c7ba;
+      --amber-soft: #4a3d1c; --amber-stripe: #5c4b1f; --amber-line: #e0b043;
+      --fog: #3b374a; --fog-stripe: #312e3d; --fog-line: #8f85bd;
       color-scheme: dark;
     }
   }
   :root[data-theme="dark"] {
     --bg: #1b1916; --dot: #38342d; --surface: #2a2722; --ink: #efe8da; --shadow: #000;
-    --muted: #a69e8e; --line: #d8d0c0; --amber-soft: #4a3d1c; --amber-stripe: #5c4b1f;
-    --amber-line: #e0b043; --fog: #3b374a; --fog-stripe: #312e3d; --fog-line: #8f85bd;
+    --muted: #a69e8e; --line: #d8d0c0; --feedback: #45c7ba;
+    --amber-soft: #4a3d1c; --amber-stripe: #5c4b1f; --amber-line: #e0b043;
+    --fog: #3b374a; --fog-stripe: #312e3d; --fog-line: #8f85bd;
     color-scheme: dark;
   }
 
@@ -53,7 +56,7 @@
     background: var(--bg); color: var(--ink); font-family: var(--font);
     overflow: hidden; -webkit-font-smoothing: antialiased;
   }
-  button, input { font-family: inherit; }
+  button, input, select { font-family: inherit; }
 
   /* ---------- canvas ---------- */
   #viewport {
@@ -76,6 +79,9 @@
     font: 700 10.5px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase;
     padding: 6px 9px; border: 1.8px solid var(--ink); border-radius: 6px;
     background: var(--gtag); color: var(--tag-ink); box-shadow: 2px 2px 0 var(--shadow);
+  }
+  .guide-ring {
+    fill: none; stroke: var(--dot); stroke-width: 2; stroke-dasharray: 7 7; opacity: .7;
   }
 
   .node {
@@ -114,8 +120,16 @@
     height: 54px; font-size: 17px; font-weight: 800; background: var(--amber); color: #1f1d1a;
   }
   .node.seed .dot { background: #fff; border-color: #1f1d1a; }
+  .node.boundary {
+    height: 44px; font-size: 13px; border-style: dashed; border-radius: 999px;
+    background: var(--bg); color: var(--muted); box-shadow: 2px 2px 0 var(--shadow);
+  }
+  .node.hub {
+    height: 56px; font-size: 16px; border-width: 3px; border-radius: 16px;
+  }
   .node.super { box-shadow: 4px 4px 0 var(--shadow), 8px 8px 0 -2px var(--surface), 8px 8px 0 0 var(--ink); }
   .node.super .qicon { background: var(--accent); color: #fff; }
+  .node.super.unready { border-style: dashed; }
   .node.dim, .group.dim { opacity: .34; }
   .node.match { outline: 3px dashed var(--accent); outline-offset: 4px; }
   .hide-fog .node.fog, .hide-fog .edge.foglink { display: none; }
@@ -133,7 +147,6 @@
     font: 800 10px/1 var(--font); padding: 4px 7px; color: #1f1d1a; background: var(--amber);
     border: 1.6px solid var(--ink); border-radius: 999px; box-shadow: 1.5px 1.5px 0 var(--shadow);
   }
-
   .impl-pill {
     position: absolute; left: 10px; bottom: -11px; white-space: nowrap;
     font: 700 9.5px/1 var(--mono); padding: 3px 6px; color: #1f1d1a; background: #e9e4da;
@@ -143,14 +156,19 @@
   .impl-pill.built { background: #a8e2c0; }
 
   .edge { fill: none; stroke: var(--line); stroke-width: 2; transition: opacity .2s; }
-  .edge.skeleton { stroke-width: 2.7; }
+  .edge.skeleton { stroke-width: 2.8; }
+  .edge.feedback { stroke: var(--feedback); stroke-dasharray: 8 5; stroke-width: 2.3; }
+  .edge.bidir { stroke-width: 2.3; }
   .edge.pending { stroke: var(--amber-line); stroke-dasharray: 6 5; stroke-width: 2.2; }
   .edge.foglink { stroke: var(--fog-line); stroke-dasharray: 5 5; stroke-width: 2; }
-  .edge.hot { stroke: var(--accent); stroke-width: 3; stroke-dasharray: none; }
+  .edge.boundarylink { stroke: var(--muted); stroke-dasharray: 4 4; stroke-width: 1.8; }
+  .edge.hot { stroke: var(--accent); stroke-width: 3.1; stroke-dasharray: none; }
   .edge.dim, .edot.dim { opacity: .2; }
   .edot { fill: var(--coral); stroke: var(--line); stroke-width: 1.5; }
+  .edot.feedback { fill: var(--feedback); }
   .arrow { fill: var(--line); }
   .arrow.pending { fill: var(--amber-line); }
+  .arrow.feedback { fill: var(--feedback); }
   .arrow.hot { fill: var(--accent); }
 
   .chip {
@@ -161,12 +179,13 @@
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
   }
   .chip.hot { border-color: var(--accent); }
+  .chip.feedback { border-color: var(--feedback); }
 
   /* ---------- HUD ---------- */
   .hud { position: fixed; z-index: 10; }
   .titlepill {
     top: 16px; left: 16px; display: flex; align-items: center; gap: 10px;
-    max-width: calc(100vw - 620px); min-width: 0; padding: 5px 18px 5px 5px;
+    max-width: calc(100vw - 680px); min-width: 0; padding: 5px 18px 5px 5px;
     background: var(--surface); border: 2.5px solid var(--ink); border-radius: 999px;
     box-shadow: 4px 4px 0 var(--shadow);
   }
@@ -175,27 +194,31 @@
     background: var(--accent); color: #fff; border: 2px solid var(--ink); font: 800 13px/1 var(--mono);
   }
   .titlepill .t { font-size: 17px; font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .badges { top: 74px; left: 16px; display: flex; flex-wrap: wrap; gap: 8px; max-width: calc(100vw - 400px); }
+  .badges { top: 74px; left: 16px; display: flex; flex-wrap: wrap; gap: 8px; max-width: calc(100vw - 400px); align-items: center; }
   .badge {
     font: 700 11px/1.2 var(--mono); padding: 6px 10px; color: #1f1d1a; cursor: default;
     border: 2px solid var(--ink); border-radius: 8px; box-shadow: 2px 2px 0 var(--shadow);
   }
   .badge.ok { background: #a8e2c0; }
   .badge.warn { background: #ffbcb0; }
+  .badge.info { background: #b9cdfd; }
+  .badge.crumb { background: var(--surface); color: var(--ink); cursor: pointer; }
+  .badge.crumb:hover { transform: translate(-1px, -1px); }
   .badge.next { background: var(--amber); cursor: pointer; }
   .toolbar { top: 16px; right: 16px; display: flex; gap: 8px; align-items: center; }
-  .btn {
+  .btn, .sel {
     height: 36px; min-width: 36px; padding: 0 11px; cursor: pointer; white-space: nowrap;
     font-size: 13px; font-weight: 700; color: var(--ink); background: var(--surface);
     border: 2px solid var(--ink); border-radius: 9px; box-shadow: 3px 3px 0 var(--shadow);
   }
-  .btn:hover { transform: translate(-1px, -1px); box-shadow: 4px 4px 0 var(--shadow); }
+  .btn:hover, .sel:hover { transform: translate(-1px, -1px); box-shadow: 4px 4px 0 var(--shadow); }
   .btn:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--shadow); }
-  .btn:focus-visible, .search input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .btn:focus-visible, .sel:focus-visible, .search input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
   .btn[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
   .btn.small { height: 28px; font-size: 12px; padding: 0 9px; box-shadow: 2px 2px 0 var(--shadow); }
+  .btn.primary { background: var(--accent); color: #fff; }
   .search {
-    position: relative; display: flex; align-items: center; height: 36px; width: 210px;
+    position: relative; display: flex; align-items: center; height: 36px; width: 195px;
     background: var(--surface); border: 2px solid var(--ink); border-radius: 9px; box-shadow: 3px 3px 0 var(--shadow);
   }
   .search input {
@@ -301,6 +324,12 @@
     <input id="search" type="search" placeholder="搜索节点" autocomplete="off" aria-label="搜索节点">
     <span class="count" id="searchCount"></span><kbd>/</kbd>
   </label>
+  <select class="sel" id="layoutSelect" title="切换拓扑布局模式" aria-label="布局模式">
+    <option value="auto">布局：自动</option>
+    <option value="pipeline">布局：泳道</option>
+    <option value="star">布局：星形</option>
+    <option value="ring">布局：环形</option>
+  </select>
   <button class="btn" id="btnFog" type="button" aria-pressed="true" title="显示/隐藏储备区节点">储备区</button>
   <button class="btn" id="btnContracts" type="button" aria-pressed="false" title="在连线上显示全部契约">契约</button>
   <button class="btn" id="btnTheme" type="button" title="切换亮/暗主题">◐</button>
@@ -311,7 +340,7 @@
   <span class="pct" id="zoomPct">100%</span>
   <button class="btn" id="btnIn" type="button" title="放大 (+)">+</button>
   <button class="btn" id="btnFit" type="button" title="适配视图 (F)">适配</button>
-  <span class="hint">拖拽平移 · ⌘/Ctrl + 滚轮缩放 · 点击节点看契约</span>
+  <span class="hint">拖拽平移 · ⌘/Ctrl + 滚轮缩放 · 双击模块进入子系统</span>
 </div>
 <aside id="panel" aria-live="polite"></aside>
 <div id="emptyState"><div class="card"><b>还没有可显示的架构图</b><br>这份模板需要由 <code>arch export-ui</code> 注入 <code>.arch/graph.json</code> 后再打开。</div></div>
@@ -321,7 +350,6 @@
 (function () {
   'use strict';
 
-  // ---------------------------------------------------------------- data
   var DATA = null;
   var raw = (document.getElementById('arch-data').textContent || '').trim();
   if (raw.charAt(0) === '{') {
@@ -347,51 +375,17 @@
   function trunc(s, n) { s = String(s == null ? '' : s); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
   function shq(s) { s = String(s); return /^[A-Za-z0-9_.:\/-]+$/.test(s) ? s : "'" + s.replace(/'/g, "'\\''") + "'"; }
 
-  var graph = (DATA && DATA.graph) || {};
+  var ROOT_GRAPH = (DATA && DATA.graph) || {};
   var NODE_STATE = (DATA && DATA.node_state) || {};
   var RECORDS = (DATA && DATA.records) || { enabled: false };
+  var SUBSYSTEMS = (DATA && DATA.subsystems) || {};
+  var CFG = (DATA && DATA.config) || {};
+  var LIMITS = (DATA && DATA.limits) || { holes: 3, solids: 7 };
   var IMPL_TEXT = { planned: '未实现', building: '实现中', built: '已实现' };
   var VERIFY_TEXT = { none: '未验证', unit: '单测', api: '接口实测', device: '真机实测' };
-  function stateOf(id) {
-    var st = NODE_STATE[id] || {};
-    return { impl: st.impl || 'planned', verify: (st.verify && st.verify.level) || 'none',
-             date: (st.verify && st.verify.date) || '', refs: st.refs || [], files: st.files || [] };
-  }
-  function leavesOf(n) {
-    var out = [];
-    (n.children || []).forEach(function (c) { if (c.status === 'super_node') out = out.concat(leavesOf(c)); else out.push(c); });
-    return out;
-  }
-  function scopeHit(scope, ids) {
-    return (scope || ['global']).some(function (s) { return ids.indexOf(s) >= 0; });
-  }
-  var nodes = (graph.nodes || []).filter(function (n) { return n && n.id != null; }).map(function (n) {
-    var c = {}; for (var k in n) c[k] = n[k]; c.id = String(n.id); return c;
-  });
-  if (!DATA || !nodes.length) { document.getElementById('emptyState').style.display = 'grid'; }
+  var TOPO_TEXT = { pipeline: '流水线', star: '星形', ring: '环形' };
+  var STATUS_TEXT = { solid: '已确定 · SOLID', hole: '待定 · HOLE', fog: '储备 · FOG', super_node: '子系统 · SUPER' };
 
-  var byId = new Map(nodes.map(function (n) { return [n.id, n]; }));
-  var edges = (graph.edges || []).filter(function (e) {
-    return e && byId.has(String(e.from)) && byId.has(String(e.to));
-  }).map(function (e) { return { from: String(e.from), to: String(e.to), contract: e.contract == null ? '' : String(e.contract) }; });
-
-  var isFog = function (n) { return n.status === 'fog'; };
-  var active = nodes.filter(function (n) { return !isFog(n); });
-  var fogs = nodes.filter(isFog);
-  var aSet = new Set(active.map(function (n) { return n.id; }));
-  var aEdges = edges.filter(function (e) { return aSet.has(e.from) && aSet.has(e.to); });
-
-  var seedText = (DATA && DATA.seed) ? String(DATA.seed).trim() : '';
-  var firstLine = seedText.split('\n')[0] || '';
-  var title = (firstLine.split('：')[0].split(':')[0].trim() || firstLine || '架构推演看板').slice(0, 40);
-  var limits = (DATA && DATA.limits) || { holes: 3, solids: 7 };
-  var nextFocus = DATA && DATA.next_focus && byId.has(String(DATA.next_focus)) ? String(DATA.next_focus) : null;
-  var skeleton = DATA && Array.isArray(DATA.skeleton) ? DATA.skeleton.map(String).filter(function (id) { return byId.has(id); }) : null;
-  if (skeleton && skeleton.length < 2) skeleton = null;
-  var skelEdges = new Set();
-  if (skeleton) for (var si = 0; si + 1 < skeleton.length; si++) skelEdges.add(skeleton[si] + '\u0000' + skeleton[si + 1]);
-
-  // -------------------------------------------------------- semantics
   var FAM = {
     blue: { tag: '#b9cdfd', dot: '#4f6bed' }, green: { tag: '#a8e2c0', dot: '#36a872' },
     purple: { tag: '#cdbffd', dot: '#8466ee' }, coral: { tag: '#ffbcb0', dot: '#ec6a58' },
@@ -402,13 +396,14 @@
     input: 'blue', entry: 'blue', ingest: 'blue', source: 'blue',
     output: 'coral', sink: 'coral', delivery: 'coral',
     service: 'green', core: 'green', worker: 'green',
-    llm: 'purple', ai: 'purple', model: 'purple', router: 'purple',
+    llm: 'purple', ai: 'purple', model: 'purple', router: 'purple', hub: 'purple',
     storage: 'teal', db: 'teal', store: 'teal', cache: 'teal',
     reality_gate: 'orange', gate: 'orange', probe: 'orange',
     adapter: 'pink', port: 'slate', super_node: 'purple'
   };
   var HASH_FAMS = ['blue', 'green', 'purple', 'teal', 'orange', 'pink', 'coral'];
   var STAGE_FAMS = ['green', 'blue', 'purple', 'teal', 'orange', 'pink', 'coral'];
+
   function famFor(key) {
     var k = String(key || '').toLowerCase().trim();
     if (TYPE_FAMILY[k]) return TYPE_FAMILY[k];
@@ -421,281 +416,406 @@
     var v = parseInt(hex.slice(1), 16);
     return 'rgba(' + (v >> 16 & 255) + ',' + (v >> 8 & 255) + ',' + (v & 255) + ',' + a + ')';
   }
-
-  var predA = new Map(), succA = new Map();
-  active.forEach(function (n) { predA.set(n.id, []); succA.set(n.id, []); });
-  aEdges.forEach(function (e) { succA.get(e.from).push(e.to); predA.get(e.to).push(e.from); });
-
-  function roleOf(n) {
-    var t = String(n.type || '').trim();
-    if (t && t !== 'port') return t;
-    if (isFog(n)) return 'port';
-    if (!predA.get(n.id).length) return 'input';
-    if (!succA.get(n.id).length) return 'output';
-    return 'port';
+  function stateOf(id) {
+    var st = NODE_STATE[id] || {};
+    return { impl: st.impl || 'planned', verify: (st.verify && st.verify.level) || 'none',
+             date: (st.verify && st.verify.date) || '', refs: st.refs || [], files: st.files || [] };
   }
+  function leavesOf(n) {
+    var out = [];
+    (n.children || []).forEach(function (c) { if (c.status === 'super_node') out = out.concat(leavesOf(c)); else out.push(c); });
+    return out;
+  }
+  function scopeHit(scope, ids) { return (scope || ['global']).some(function (s) { return ids.indexOf(s) >= 0; }); }
   function displayLabel(n) {
     var l = String(n.label == null ? '' : n.label).replace(/^\s*\?\s*/, '').trim();
     return l || n.id;
   }
   function childCount(n) { return Array.isArray(n.children) ? n.children.length : 0; }
-  function tagFor(n) {
-    if (n.status === 'hole') return { text: '待定 · ?', bg: '#f8d877' };
-    if (n.status === 'fog') return { text: '储备 · FOG', bg: '#dcd6ee' };
-    if (n.status === 'super_node') return { text: '模块 · ' + childCount(n) + ' 个子节点', bg: FAM.purple.tag };
-    return { text: roleOf(n).replace(/_/g, ' '), bg: FAM[famFor(roleOf(n))].tag };
-  }
-  var STATUS_TEXT = { solid: '已确定 · SOLID', hole: '待定 · HOLE', fog: '储备 · FOG', super_node: '折叠模块 · SUPER' };
 
-  // ----------------------------------------------------------- layout
+  // Index every node at every depth so deep links & drill-down resolve cleanly.
+  var ALL_BY_ID = new Map();
+  var PARENT_OF = new Map();
+  function indexTree(container, parentId) {
+    var list = container.children || container.nodes || [];
+    list.forEach(function (n) {
+      if (!n || n.id == null) return;
+      var id = String(n.id);
+      ALL_BY_ID.set(id, n);
+      PARENT_OF.set(id, parentId);
+      if (n.status === 'super_node') indexTree(n, id);
+    });
+  }
+  indexTree(ROOT_GRAPH, null);
+
+  var seedText = (DATA && DATA.seed) ? String(DATA.seed).trim() : '';
+  var firstLine = seedText.split('\n')[0] || '';
+  var title = (firstLine.split('：')[0].split(':')[0].trim() || firstLine || '架构推演看板').slice(0, 40);
+
+  document.title = trunc(title, 30) + ' · 架构图';
+  document.getElementById('titleText').textContent = title;
+  document.getElementById('titlepill').title = seedText || title;
+  var stepEl = document.getElementById('stepNum');
+  stepEl.textContent = String(ROOT_GRAPH.step || 0).padStart(2, '0');
+  stepEl.title = '当前推演步数 Step ' + (ROOT_GRAPH.step || 0);
+
+  if (!DATA || !(ROOT_GRAPH.nodes && ROOT_GRAPH.nodes.length)) {
+    document.getElementById('emptyState').style.display = 'grid';
+  }
+
+  // ------------------------------------------------------- mutable view state
+  var state = {
+    scopeStack: [],      // array of super_node IDs from outermost to current
+    layoutPref: 'auto',  // auto | pipeline | star | ring
+    selected: null,
+    query: '',
+    showFog: true,
+    showContracts: false
+  };
+
+  // Current rendered scope locals
+  var curContainer = ROOT_GRAPH;
+  var curTopology = 'pipeline';
+  var curLayout = 'pipeline';
+  var nodes = [], byId = new Map(), edges = [], active = [], fogs = [], aSet = new Set(), aEdges = [];
+  var predA = new Map(), succA = new Map();
+  var nextFocus = null, skeleton = null, skelEdges = new Set(), curWarnings = [];
+  var boxes = new Map(), groups = [], nodeEls = new Map(), edgeEls = [], mainPath = [];
+  var WORLD_W = 1, WORLD_H = 1;
+  var matches = null;
+
   var FONT = cssVar('--font'), MONO = cssVar('--mono');
   var NODE_H = 50, SEED_H = 54, GAP_X = 112, ROW_H = 124, FOG_GAP_Y = 80, PAD = 90;
   var measureCtx = document.createElement('canvas').getContext('2d');
   function textW(t, font) { measureCtx.font = font; return measureCtx.measureText(String(t)).width; }
   function tagW(t) { return textW(String(t).toUpperCase(), '700 9.5px ' + MONO) + String(t).length * 0.76 + 16; }
-  function nodeWidth(n, seed) {
-    var label = seed ? trunc(title, 22) : displayLabel(n);
-    // padding 32 + border 5 + gap 10 + icon (dot 13 / "?" "+" "▣" 21) + slack
-    var iconW = seed ? 13 : (n.status === 'solid') ? 13 : 21;
-    var w = textW(label, (seed ? '800 17px ' : '650 15px ') + FONT) + 47 + iconW + 8;
-    var tw = (seed ? tagW('IDEA · 一句话想法') : tagW(tagFor(n).text)) + 24;
+
+  var isFog = function (n) { return n.status === 'fog'; };
+  function roleOf(n) {
+    if (n.role) return n.role;
+    var t = String(n.type || '').trim();
+    if (t && t !== 'port') return t;
+    if (isFog(n)) return 'port';
+    if (predA.has(n.id) && !predA.get(n.id).length) return 'input';
+    if (succA.has(n.id) && !succA.get(n.id).length) return 'output';
+    return 'port';
+  }
+  function tagFor(n) {
+    if (n.status === 'hole') return { text: '待定 · ?', bg: '#f8d877' };
+    if (n.status === 'fog') return { text: '储备 · FOG', bg: '#dcd6ee' };
+    if (n.status === 'super_node') {
+      var st = (SUBSYSTEMS[n.id] && SUBSYSTEMS[n.id].topology) || n.topology || 'pipeline';
+      return { text: '子系统 · ' + st + ' · ' + childCount(n), bg: FAM.purple.tag };
+    }
+    var r = roleOf(n);
+    return { text: r.replace(/_/g, ' '), bg: FAM[famFor(r)].tag };
+  }
+  function nodeWidth(n, kind) {
+    if (kind === 'seed') {
+      var w0 = textW(trunc(title, 22), '800 17px ' + FONT) + 68;
+      return Math.round(Math.min(320, Math.max(170, Math.max(w0, tagW('IDEA · 一句话想法') + 24))));
+    }
+    if (kind === 'boundary') {
+      var wb = textW(n.label, '650 13px ' + FONT) + 46;
+      return Math.round(Math.min(240, Math.max(124, wb)));
+    }
+    var label = displayLabel(n);
+    var iconW = n.status === 'solid' ? 13 : 21;
+    var w = textW(label, (n.role === 'hub' ? '800 16px ' : '650 15px ') + FONT) + 47 + iconW + 8;
+    var tw = tagW(tagFor(n).text) + 24;
     w = Math.max(w, tw);
-    return Math.round(Math.min(seed ? 320 : 270, Math.max(seed ? 170 : 136, w)));
+    return Math.round(Math.min(280, Math.max(138, w)));
   }
 
-  // topological order (engine order first, cycles fall back to append order)
-  var indegL = new Map(active.map(function (n) { return [n.id, predA.get(n.id).length]; }));
-  var order = [], q = active.filter(function (n) { return indegL.get(n.id) === 0; }).map(function (n) { return n.id; });
-  while (q.length) {
-    var u = q.shift(); order.push(u);
-    succA.get(u).forEach(function (v) { indegL.set(v, indegL.get(v) - 1); if (indegL.get(v) === 0) q.push(v); });
-  }
-  var inOrder = new Set(order);
-  active.forEach(function (n) { if (!inOrder.has(n.id)) order.push(n.id); });
+  function currentScopeId() { return state.scopeStack.length ? state.scopeStack[state.scopeStack.length - 1] : ''; }
 
-  var rank = new Map(), dist = new Map(), prevL = new Map();
-  order.forEach(function (id) {
-    var r = 1, d = 1, p = null;
-    predA.get(id).forEach(function (pv) {
-      if (rank.has(pv)) {
-        r = Math.max(r, rank.get(pv) + 1);
-        if (dist.get(pv) + 1 > d) { d = dist.get(pv) + 1; p = pv; }
+  function resolveParentEdgesFor(scopeId) {
+    if (!scopeId) return { in: [], out: [] };
+    var pid = PARENT_OF.get(scopeId);
+    var pCont = pid ? ALL_BY_ID.get(pid) : ROOT_GRAPH;
+    var pEdges = (pCont && (pCont.inner_edges || pCont.edges)) || [];
+    var bin = [], bout = [];
+    pEdges.forEach(function (e) {
+      var k = e.kind || 'primary';
+      if (String(e.to) === scopeId || (k === 'bidirectional' && String(e.from) === scopeId)) {
+        bin.push({ other: String(e.from) === scopeId ? String(e.to) : String(e.from), contract: e.contract || '', kind: k });
+      }
+      if (String(e.from) === scopeId || (k === 'bidirectional' && String(e.to) === scopeId)) {
+        bout.push({ other: String(e.to) === scopeId ? String(e.from) : String(e.to), contract: e.contract || '', kind: k });
       }
     });
-    rank.set(id, r); dist.set(id, d); prevL.set(id, p);
-  });
-
-  // main row = the longest path (the trunk); branches go to rows above/below
-  var mainPath = [];
-  if (order.length) {
-    var endId = order[0];
-    order.forEach(function (id) { if (dist.get(id) > dist.get(endId)) endId = id; });
-    for (var cur = endId; cur; cur = prevL.get(cur)) mainPath.unshift(cur);
+    return { in: bin, out: bout };
   }
 
-  // Off-trunk leaves (e.g. storage, a pending side branch) hang directly under
-  // their upstream node instead of taking the next column, so they do not
-  // stretch the neighbouring stage box over nodes of another stage.
-  var onMain = new Set(mainPath);
-  order.forEach(function (id) {
-    if (onMain.has(id) || succA.get(id).length || !predA.get(id).length) return;
-    var anchor = null;
-    predA.get(id).forEach(function (pv) { if (!anchor || rank.get(pv) > rank.get(anchor)) anchor = pv; });
-    var st = String(byId.get(id).stage || '').trim();
-    if (st && st !== String(byId.get(anchor).stage || '').trim()) return; // another stage: keep its own column
-    rank.set(id, rank.get(anchor));
-  });
-
-  var rowOf = new Map();
-  mainPath.forEach(function (id) { rowOf.set(id, 0); });
-  var cols = new Map(), maxCol = 0;
-  order.forEach(function (id) {
-    var c = rank.get(id); maxCol = Math.max(maxCol, c);
-    if (!cols.has(c)) cols.set(c, []);
-    cols.get(c).push(id);
-  });
-  for (var c = 1; c <= maxCol; c++) {
-    var ids = cols.get(c) || [];
-    var used = new Set();
-    ids.forEach(function (id) { if (rowOf.has(id)) used.add(rowOf.get(id)); });
-    ids.forEach(function (id) {
-      if (rowOf.has(id)) return;
-      var pr = predA.get(id).filter(function (p) { return rowOf.has(p); }).map(function (p) { return rowOf.get(p); });
-      var want = pr.length ? Math.round(pr.reduce(function (a, b) { return a + b; }, 0) / pr.length) : 0;
-      var seq = [want];
-      for (var k = 1; k < 60; k++) seq.push(want + k, want - k);
-      for (var s = 0; s < seq.length; s++) if (!used.has(seq[s])) { rowOf.set(id, seq[s]); used.add(seq[s]); break; }
+  // ------------------------------------------------------- layout engines
+  function buildPipelineLayout(hasSeed, bPorts) {
+    // Topological order on non-feedback edges so feedback arcs do not warp ranks.
+    var pPred = new Map(), pSucc = new Map();
+    active.forEach(function (n) { pPred.set(n.id, []); pSucc.set(n.id, []); });
+    aEdges.forEach(function (e) {
+      if (e.kind === 'feedback') return;
+      pSucc.get(e.from).push(e.to);
+      pPred.get(e.to).push(e.from);
     });
-  }
-
-  var boxes = new Map();
-  var hasSeed = !!seedText;
-  var colW = [];
-  colW[0] = hasSeed ? nodeWidth(null, true) : 0;
-  for (c = 1; c <= maxCol; c++) colW[c] = 0;
-  active.forEach(function (n) { n._w = nodeWidth(n, false); colW[rank.get(n.id)] = Math.max(colW[rank.get(n.id)], n._w); });
-  var colX = [], xAcc = 0;
-  for (c = 0; c <= maxCol; c++) { colX[c] = xAcc; if (colW[c]) xAcc += colW[c] + GAP_X; }
-
-  if (hasSeed) boxes.set('__seed__', { x: 0, y: -SEED_H / 2, w: colW[0], h: SEED_H });
-  active.forEach(function (n) {
-    var cc = rank.get(n.id);
-    boxes.set(n.id, { x: colX[cc] + (colW[cc] - n._w) / 2, y: rowOf.get(n.id) * ROW_H - NODE_H / 2, w: n._w, h: NODE_H });
-  });
-
-  // stage groups (only stages that are actually set — no invented names)
-  var stageOrder = [], stageMembers = new Map();
-  nodes.forEach(function (n) {
-    var st = String(n.stage || '').trim();
-    if (!st) return;
-    if (!stageMembers.has(st)) { stageMembers.set(st, []); stageOrder.push(st); }
-    if (!isFog(n)) stageMembers.get(st).push(n.id);
-  });
-  var groups = [];
-  stageOrder.forEach(function (st, i) {
-    var mem = stageMembers.get(st);
-    if (!mem.length) return;
-    var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    mem.forEach(function (id) { var b = boxes.get(id); x0 = Math.min(x0, b.x); y0 = Math.min(y0, b.y); x1 = Math.max(x1, b.x + b.w); y1 = Math.max(y1, b.y + b.h); });
-    var fam = FAM[STAGE_FAMS[i % STAGE_FAMS.length]];
-    var pillW = textW(st.toUpperCase(), '700 10.5px ' + MONO) + st.length * 0.63 + 22;
-    groups.push({ stage: st, fam: fam, x: x0 - 26, y: y0 - 32, w: x1 - x0 + 52, h: y1 - y0 + 66, pillW: pillW, members: mem });
-  });
-  var groupByStage = new Map(groups.map(function (g) { return [g.stage, g]; }));
-
-  var bandTop = Infinity, bandBottom = -Infinity;
-  boxes.forEach(function (b) { bandTop = Math.min(bandTop, b.y - 14); bandBottom = Math.max(bandBottom, b.y + b.h); });
-  groups.forEach(function (g) { bandTop = Math.min(bandTop, g.y); bandBottom = Math.max(bandBottom, g.y + g.h + 14); });
-  if (!isFinite(bandTop)) { bandTop = 0; bandBottom = 0; }
-
-  // fog placement: tied to a neighbour node, else to its stage group, else a tray below
-  var placed = { above: [], below: [] };
-  function placeX(side, x, w) {
-    var list = placed[side], moved = true, guard2 = 0;
-    while (moved && guard2++ < 200) {
-      moved = false;
-      for (var i = 0; i < list.length; i++) {
-        var p = list[i];
-        if (x < p.x + p.w + 28 && x + w + 28 > p.x) { x = p.x + p.w + 28; moved = true; }
-      }
+    var indegL = new Map(active.map(function (n) { return [n.id, pPred.get(n.id).length]; }));
+    var order = [], q = active.filter(function (n) { return indegL.get(n.id) === 0; }).map(function (n) { return n.id; });
+    while (q.length) {
+      var u = q.shift(); order.push(u);
+      pSucc.get(u).forEach(function (v) { indegL.set(v, indegL.get(v) - 1); if (indegL.get(v) === 0) q.push(v); });
     }
-    list.push({ x: x, w: w });
-    return x;
-  }
-  var fogLinks = [], fogLinkedEdge = new Set();
-  var trayX = 0;
-  fogs.forEach(function (f) {
-    var w = nodeWidth(f, false);
-    var nb = edges.filter(function (e) { return (e.from === f.id && aSet.has(e.to)) || (e.to === f.id && aSet.has(e.from)); })[0];
-    var side, ax, ay, link = null;
-    if (nb) {
-      var other = nb.from === f.id ? nb.to : nb.from, ob = boxes.get(other);
-      side = 'above'; ax = ob.x + ob.w * 0.62; ay = ob.y;
-      link = { kind: 'node', id: other };
-      fogLinkedEdge.add(nb.from + '\u0000' + nb.to);
-    } else if (f.stage && groupByStage.has(String(f.stage).trim())) {
-      var g = groupByStage.get(String(f.stage).trim());
-      side = 'below'; ax = g.x + 20 + g.pillW / 2; ay = g.y + g.h + 13;
-      link = { kind: 'group', stage: g.stage };
-    } else {
-      side = 'below'; ax = trayX + w / 2; ay = null;
-    }
-    var x = placeX(side, ax - w / 2, w);
-    if (!link) trayX = x + w + 28;
-    var y = side === 'above' ? bandTop - FOG_GAP_Y - NODE_H : bandBottom + FOG_GAP_Y;
-    boxes.set(f.id, { x: x, y: y, w: w, h: NODE_H });
-    if (link) fogLinks.push({ fog: f.id, side: side, ax: ax, ay: ay, link: link });
-  });
+    var inOrder = new Set(order);
+    active.forEach(function (n) { if (!inOrder.has(n.id)) order.push(n.id); });
 
-  // normalise to positive coordinates
-  var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  boxes.forEach(function (b) { minX = Math.min(minX, b.x); minY = Math.min(minY, b.y - 14); maxX = Math.max(maxX, b.x + b.w); maxY = Math.max(maxY, b.y + b.h + 12); });
-  groups.forEach(function (g) { minX = Math.min(minX, g.x); minY = Math.min(minY, g.y); maxX = Math.max(maxX, g.x + g.w); maxY = Math.max(maxY, g.y + g.h + 14); });
-  if (!isFinite(minX)) { minX = minY = 0; maxX = maxY = 1; }
-  var dx = PAD - minX, dy = PAD - minY;
-  boxes.forEach(function (b) { b.x += dx; b.y += dy; });
-  groups.forEach(function (g) { g.x += dx; g.y += dy; });
-  fogLinks.forEach(function (l) { l.ax += dx; if (l.ay != null) l.ay += dy; });
-  var WORLD_W = maxX - minX + PAD * 2, WORLD_H = maxY - minY + PAD * 2;
-
-  // ----------------------------------------------------------- render
-  var world = document.getElementById('world');
-  var svg = document.getElementById('edges');
-  var nodesLayer = document.getElementById('nodes');
-  var groupsLayer = document.getElementById('groups');
-  var chipsLayer = document.getElementById('chips');
-  world.style.width = WORLD_W + 'px'; world.style.height = WORLD_H + 'px';
-  svg.setAttribute('width', WORLD_W); svg.setAttribute('height', WORLD_H);
-
-  var defs = sv('defs', {});
-  ['', 'pending', 'hot'].forEach(function (kind) {
-    var m = sv('marker', { id: 'arrow' + (kind ? '-' + kind : ''), viewBox: '0 0 10 10', refX: '9', refY: '5', markerWidth: '9', markerHeight: '9', orient: 'auto-start-reverse', markerUnits: 'userSpaceOnUse' });
-    m.appendChild(sv('path', { d: 'M0,0 L10,5 L0,10 z', 'class': 'arrow' + (kind ? ' ' + kind : '') }));
-    defs.appendChild(m);
-  });
-  svg.appendChild(defs);
-
-  groups.forEach(function (g) {
-    var d = h('div', 'group');
-    d.style.left = g.x + 'px'; d.style.top = g.y + 'px'; d.style.width = g.w + 'px'; d.style.height = g.h + 'px';
-    d.style.setProperty('--g', g.fam.dot); d.style.setProperty('--gfill', hexA(g.fam.dot, 0.13)); d.style.setProperty('--gtag', g.fam.tag);
-    d.appendChild(h('span', 'group-label', g.stage));
-    groupsLayer.appendChild(d);
-    g.el = d;
-  });
-
-  var nodeEls = new Map();
-  function makeNode(id, n) {
-    var b = boxes.get(id);
-    var el = h('div', 'node');
-    el.tabIndex = 0;
-    el.setAttribute('role', 'button');
-    el.dataset.id = id;
-    el.style.left = b.x + 'px'; el.style.top = b.y + 'px'; el.style.width = b.w + 'px'; el.style.height = b.h + 'px';
-    var tag;
-    if (!n) {
-      el.classList.add('seed');
-      tag = h('span', 'tag', 'IDEA · 一句话想法'); tag.style.setProperty('--t', '#fff3b8');
-      el.appendChild(tag); el.appendChild(h('span', 'dot'));
-      el.appendChild(h('span', 'label', trunc(title, 22)));
-      el.title = seedText;
-      el.setAttribute('aria-label', '初始想法：' + seedText);
-    } else {
-      var t = tagFor(n);
-      tag = h('span', 'tag', t.text); tag.style.setProperty('--t', t.bg);
-      el.appendChild(tag);
-      if (n.status === 'hole') { el.classList.add('hole'); el.appendChild(h('span', 'qicon', '?')); }
-      else if (n.status === 'fog') { el.classList.add('fog'); el.appendChild(h('span', 'qicon', '+')); }
-      else if (n.status === 'super_node') { el.classList.add('super'); el.appendChild(h('span', 'qicon', String(childCount(n)))); }
-      else {
-        var dot = h('span', 'dot'); dot.style.setProperty('--c', FAM[famFor(roleOf(n))].dot); el.appendChild(dot);
-      }
-      el.appendChild(h('span', 'label', displayLabel(n)));
-      if (n.status === 'solid') {
-        var st0 = stateOf(n.id);
-        if (st0.impl !== 'planned' || st0.verify !== 'none') {
-          var pillText = IMPL_TEXT[st0.impl] + (st0.verify !== 'none' ? ' · ' + VERIFY_TEXT[st0.verify] : '');
-          el.appendChild(h('span', 'impl-pill ' + st0.impl, pillText));
+    var rank = new Map(), dist = new Map(), prevL = new Map();
+    order.forEach(function (id) {
+      var r = 1, d = 1, p = null;
+      pPred.get(id).forEach(function (pv) {
+        if (rank.has(pv)) {
+          r = Math.max(r, rank.get(pv) + 1);
+          if (dist.get(pv) + 1 > d) { d = dist.get(pv) + 1; p = pv; }
         }
-      } else if (n.status === 'super_node') {
-        var lv = leavesOf(n), nb = lv.filter(function (c) { return stateOf(c.id).impl === 'built'; }).length;
-        if (nb) el.appendChild(h('span', 'impl-pill' + (nb === lv.length ? ' built' : ' building'), nb + '/' + lv.length + ' 已实现'));
-      }
-      if (id === nextFocus) el.appendChild(h('span', 'next-pill', '下一个决定'));
-      el.title = displayLabel(n) + (n.spec ? '\n' + n.spec : '');
-      el.setAttribute('aria-label', displayLabel(n) + '，' + (STATUS_TEXT[n.status] || n.status) + (id === nextFocus ? '，下一个决定' : ''));
-    }
-    el.addEventListener('click', function (ev) { ev.stopPropagation(); select(id); });
-    el.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); select(id); } });
-    el.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
-    nodesLayer.appendChild(el);
-    nodeEls.set(id, el);
-  }
-  if (hasSeed) makeNode('__seed__', null);
-  nodes.forEach(function (n) { makeNode(n.id, n); });
+      });
+      rank.set(id, r); dist.set(id, d); prevL.set(id, p);
+    });
 
-  // edge paths: returns { d, gap } where gap is the free span a contract chip may use
-  function sidePath(a, b) {
+    mainPath = [];
+    if (order.length) {
+      var endId = order[0];
+      order.forEach(function (id) { if (dist.get(id) > dist.get(endId)) endId = id; });
+      for (var cur = endId; cur; cur = prevL.get(cur)) mainPath.unshift(cur);
+    }
+
+    var onMain = new Set(mainPath);
+    order.forEach(function (id) {
+      if (onMain.has(id) || pSucc.get(id).length || !pPred.get(id).length) return;
+      var anchor = null;
+      pPred.get(id).forEach(function (pv) { if (!anchor || rank.get(pv) > rank.get(anchor)) anchor = pv; });
+      var st = String(byId.get(id).stage || '').trim();
+      if (st && st !== String(byId.get(anchor).stage || '').trim()) return;
+      rank.set(id, rank.get(anchor));
+    });
+
+    var rowOf = new Map();
+    mainPath.forEach(function (id) { rowOf.set(id, 0); });
+    var cols = new Map(), maxCol = 0;
+    order.forEach(function (id) {
+      var c = rank.get(id); maxCol = Math.max(maxCol, c);
+      if (!cols.has(c)) cols.set(c, []);
+      cols.get(c).push(id);
+    });
+    for (var c = 1; c <= maxCol; c++) {
+      var ids = cols.get(c) || [];
+      var used = new Set();
+      ids.forEach(function (id) { if (rowOf.has(id)) used.add(rowOf.get(id)); });
+      ids.forEach(function (id) {
+        if (rowOf.has(id)) return;
+        var pr = pPred.get(id).filter(function (p) { return rowOf.has(p); }).map(function (p) { return rowOf.get(p); });
+        var want = pr.length ? Math.round(pr.reduce(function (a, b) { return a + b; }, 0) / pr.length) : 0;
+        var seq = [want];
+        for (var k = 1; k < 60; k++) seq.push(want + k, want - k);
+        for (var s = 0; s < seq.length; s++) if (!used.has(seq[s])) { rowOf.set(id, seq[s]); used.add(seq[s]); break; }
+      });
+    }
+
+    var colW = [];
+    colW[0] = hasSeed ? nodeWidth(null, 'seed') : (bPorts.in.length ? Math.max.apply(null, bPorts.in.map(function (p) { return nodeWidth(p, 'boundary'); })) : 0);
+    for (c = 1; c <= maxCol; c++) colW[c] = 0;
+    active.forEach(function (n) { n._w = nodeWidth(n); colW[rank.get(n.id)] = Math.max(colW[rank.get(n.id)], n._w); });
+    var outColW = bPorts.out.length ? Math.max.apply(null, bPorts.out.map(function (p) { return nodeWidth(p, 'boundary'); })) : 0;
+    var colX = [], xAcc = 0;
+    for (c = 0; c <= maxCol; c++) { colX[c] = xAcc; if (colW[c]) xAcc += colW[c] + GAP_X; }
+
+    if (hasSeed) boxes.set('__seed__', { x: 0, y: -SEED_H / 2, w: colW[0], h: SEED_H });
+    bPorts.in.forEach(function (p, i) {
+      var w = nodeWidth(p, 'boundary');
+      var y = (i - (bPorts.in.length - 1) / 2) * 76 - 22;
+      boxes.set(p.id, { x: colX[0] + (colW[0] - w), y: y, w: w, h: 44 });
+    });
+    bPorts.out.forEach(function (p, i) {
+      var w = nodeWidth(p, 'boundary');
+      var y = (i - (bPorts.out.length - 1) / 2) * 76 - 22;
+      boxes.set(p.id, { x: xAcc, y: y, w: w, h: 44 });
+    });
+    active.forEach(function (n) {
+      var cc = rank.get(n.id);
+      var nh = n.role === 'hub' ? 56 : NODE_H;
+      boxes.set(n.id, { x: colX[cc] + (colW[cc] - n._w) / 2, y: rowOf.get(n.id) * ROW_H - nh / 2, w: n._w, h: nh });
+    });
+    return { guides: [] };
+  }
+
+  function buildStarLayout(hasSeed, bPorts) {
+    // Hub at center, direct spokes on inner ring, secondary leaves on outer ring.
+    var hub = active.find(function (n) { return n.role === 'hub'; });
+    if (!hub && active.length) {
+      hub = active.slice().sort(function (a, b) {
+        var da = (predA.get(a.id).length + succA.get(a.id).length);
+        var db = (predA.get(b.id).length + succA.get(b.id).length);
+        return db - da;
+      })[0];
+    }
+    var guides = [];
+    if (!hub) return { guides: guides };
+
+    var hw = nodeWidth(hub), hh = 56;
+    boxes.set(hub.id, { x: -hw / 2, y: -hh / 2, w: hw, h: hh });
+    mainPath = [hub.id];
+
+    var nbrSet = new Set();
+    aEdges.forEach(function (e) {
+      if (e.from === hub.id && e.to !== hub.id) nbrSet.add(e.to);
+      if (e.to === hub.id && e.from !== hub.id) nbrSet.add(e.from);
+    });
+    var spokes = active.filter(function (n) { return n.id !== hub.id && nbrSet.has(n.id); });
+    var outer = active.filter(function (n) { return n.id !== hub.id && !nbrSet.has(n.id); });
+    // Group same-stage spokes in adjacent angular sectors.
+    spokes.sort(function (a, b) { return String(a.stage || '').localeCompare(String(b.stage || '')); });
+
+    var r1 = Math.max(255, spokes.length * 46);
+    guides.push({ cx: 0, cy: 0, rx: r1 + 40, ry: r1 * 0.78 + 18 });
+    var angleOf = new Map();
+    spokes.forEach(function (n, i) {
+      var ang = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(1, spokes.length);
+      angleOf.set(n.id, ang);
+      var w = nodeWidth(n), cx = Math.cos(ang) * (r1 + 40), cy = Math.sin(ang) * (r1 * 0.78 + 18);
+      boxes.set(n.id, { x: cx - w / 2, y: cy - NODE_H / 2, w: w, h: NODE_H });
+    });
+
+    var r2 = r1 + 195;
+    outer.forEach(function (n, i) {
+      var parentAng = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(1, outer.length);
+      aEdges.forEach(function (e) {
+        if (e.to === n.id && angleOf.has(e.from)) parentAng = angleOf.get(e.from);
+        else if (e.from === n.id && angleOf.has(e.to)) parentAng = angleOf.get(e.to);
+      });
+      var w = nodeWidth(n), cx = Math.cos(parentAng) * (r2 + 40), cy = Math.sin(parentAng) * (r2 * 0.78);
+      boxes.set(n.id, { x: cx - w / 2, y: cy - NODE_H / 2, w: w, h: NODE_H });
+    });
+
+    var leftX = -(outer.length ? r2 : r1) - 290;
+    var rightX = (outer.length ? r2 : r1) + 200;
+    if (hasSeed) {
+      var sw = nodeWidth(null, 'seed');
+      boxes.set('__seed__', { x: leftX - sw / 2, y: -SEED_H / 2, w: sw, h: SEED_H });
+    }
+    bPorts.in.forEach(function (p, i) {
+      var w = nodeWidth(p, 'boundary');
+      boxes.set(p.id, { x: leftX - w / 2, y: (i - (bPorts.in.length - 1) / 2) * 76 - 22, w: w, h: 44 });
+    });
+    bPorts.out.forEach(function (p, i) {
+      var w = nodeWidth(p, 'boundary');
+      boxes.set(p.id, { x: rightX, y: (i - (bPorts.out.length - 1) / 2) * 76 - 22, w: w, h: 44 });
+    });
+    return { guides: guides };
+  }
+
+  function buildRingLayout(hasSeed, bPorts) {
+    var guides = [];
+    if (!active.length) return { guides: guides };
+
+    // Order primary ring starting from entry role (or first active node).
+    var anchor = active.find(function (n) { return n.role === 'entry'; }) || active[0];
+    var ringOrder = [], seen = new Set();
+    var pAdj = new Map();
+    active.forEach(function (n) { pAdj.set(n.id, []); });
+    aEdges.forEach(function (e) { pAdj.get(e.from).push(e.to); });
+
+    // Prefer walking along primary edges first, then all edges.
+    var cur = anchor.id;
+    while (cur && !seen.has(cur)) {
+      seen.add(cur); ringOrder.push(cur);
+      var nxt = aEdges.filter(function (e) { return e.from === cur && e.kind !== 'feedback' && !seen.has(e.to); })[0];
+      if (!nxt) nxt = aEdges.filter(function (e) { return e.from === cur && !seen.has(e.to); })[0];
+      cur = nxt ? nxt.to : null;
+    }
+    var sideNodes = active.filter(function (n) { return !seen.has(n.id); });
+    // If ring has < 2 nodes, put all active nodes on the ring.
+    if (ringOrder.length < 2) {
+      ringOrder = active.map(function (n) { return n.id; });
+      sideNodes = [];
+    }
+    mainPath = ringOrder.slice();
+
+    var rx = Math.max(250, ringOrder.length * 64);
+    var ry = Math.max(170, ringOrder.length * 42);
+    guides.push({ cx: 0, cy: 0, rx: rx, ry: ry });
+    var angleOf = new Map();
+    ringOrder.forEach(function (id, i) {
+      var ang = -Math.PI / 2 + (2 * Math.PI * i) / ringOrder.length;
+      angleOf.set(id, ang);
+      var n = byId.get(id), w = nodeWidth(n);
+      var cx = Math.cos(ang) * rx, cy = Math.sin(ang) * ry;
+      boxes.set(id, { x: cx - w / 2, y: cy - NODE_H / 2, w: w, h: NODE_H });
+    });
+
+    sideNodes.forEach(function (n, i) {
+      var ang = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(1, sideNodes.length);
+      aEdges.forEach(function (e) {
+        if (e.to === n.id && angleOf.has(e.from)) ang = angleOf.get(e.from);
+        else if (e.from === n.id && angleOf.has(e.to)) ang = angleOf.get(e.to);
+      });
+      var w = nodeWidth(n), cx = Math.cos(ang) * (rx + 230), cy = Math.sin(ang) * (ry + 165);
+      boxes.set(n.id, { x: cx - w / 2, y: cy - NODE_H / 2, w: w, h: NODE_H });
+    });
+
+    var leftX = -(rx + (sideNodes.length ? 300 : 190));
+    var rightX = rx + (sideNodes.length ? 260 : 170);
+    if (hasSeed) {
+      var sw = nodeWidth(null, 'seed');
+      boxes.set('__seed__', { x: leftX - sw / 2, y: -SEED_H / 2, w: sw, h: SEED_H });
+    }
+    bPorts.in.forEach(function (p, i) {
+      var w = nodeWidth(p, 'boundary');
+      boxes.set(p.id, { x: leftX - w / 2, y: (i - (bPorts.in.length - 1) / 2) * 76 - 22, w: w, h: 44 });
+    });
+    bPorts.out.forEach(function (p, i) {
+      var w = nodeWidth(p, 'boundary');
+      boxes.set(p.id, { x: rightX, y: (i - (bPorts.out.length - 1) / 2) * 76 - 22, w: w, h: 44 });
+    });
+    return { guides: guides };
+  }
+
+  // ------------------------------------------------------- edge geometry
+  function boxCenter(b) { return { x: b.x + b.w / 2, y: b.y + b.h / 2 }; }
+  function borderPoint(b, tx, ty) {
+    var cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    var dx = tx - cx, dy = ty - cy;
+    if (!dx && !dy) return { x: cx, y: cy };
+    var sx = Math.abs(dx) > 0.001 ? (b.w / 2 + 4) / Math.abs(dx) : Infinity;
+    var sy = Math.abs(dy) > 0.001 ? (b.h / 2 + 4) / Math.abs(dy) : Infinity;
+    var t = Math.min(sx, sy);
+    return { x: cx + dx * t, y: cy + dy * t };
+  }
+
+  function curvedBetween(a, b, bend) {
+    var ca = boxCenter(a), cb = boxCenter(b);
+    var mx = (ca.x + cb.x) / 2, my = (ca.y + cb.y) / 2;
+    var dx = cb.x - ca.x, dy = cb.y - ca.y;
+    var dist = Math.hypot(dx, dy) || 1;
+    var nx = -dy / dist, ny = dx / dist;
+    var cpx = mx + nx * bend, cpy = my + ny * bend;
+    var p1 = borderPoint(a, cpx, cpy), p2 = borderPoint(b, cpx, cpy);
+    return { d: 'M' + p1.x + ',' + p1.y + ' Q' + cpx + ',' + cpy + ' ' + p2.x + ',' + p2.y, gap: Math.max(90, dist * 0.55) };
+  }
+
+  function sidePath(a, b, opts) {
+    opts = opts || {};
+    if (opts.feedback && curLayout === 'pipeline') {
+      var laneY = opts.laneY;
+      var sx = a.x + a.w * 0.5, sy = a.y + a.h;
+      var ex = b.x + b.w * 0.5, ey = b.y + b.h;
+      return {
+        d: 'M' + sx + ',' + sy + ' C' + sx + ',' + laneY + ' ' + ex + ',' + laneY + ' ' + ex + ',' + ey,
+        gap: Math.max(120, Math.abs(sx - ex) * 0.7)
+      };
+    }
+    if (curLayout !== 'pipeline') {
+      var bend = opts.reversePair ? 32 : (opts.feedback ? 46 : (curLayout === 'ring' ? 28 : 0));
+      return curvedBetween(a, b, bend);
+    }
+    if (opts.reversePair) {
+      return curvedBetween(a, b, 34);
+    }
     var ax = a.x + a.w, ay = a.y + a.h / 2, bx = b.x, by = b.y + b.h / 2;
     if (bx - ax > 24) {
       var k = Math.max(30, (bx - ax) / 2);
@@ -710,62 +830,431 @@
       kk = (a.y - b.y - b.h) / 2;
       return { d: 'M' + acx + ',' + a.y + ' C' + acx + ',' + (a.y - kk) + ' ' + bcx + ',' + (b.y + b.h + kk) + ' ' + bcx + ',' + (b.y + b.h), gap: 150 };
     }
-    return { d: 'M' + ax + ',' + ay + ' C' + (ax + 70) + ',' + (ay + 110) + ' ' + (bx - 70) + ',' + (by + 110) + ' ' + bx + ',' + by, gap: 150 };
+    return curvedBetween(a, b, 90);
   }
   function vPath(x1, y1, x2, y2) {
     var m = (y2 - y1) / 2;
     return 'M' + x1 + ',' + y1 + ' C' + x1 + ',' + (y1 + m) + ' ' + x2 + ',' + (y2 - m) + ' ' + x2 + ',' + y2;
   }
 
-  var edgeEls = [];
-  function addEdge(path, cls, meta) {
-    var p = sv('path', { d: path.d, 'class': 'edge ' + cls });
-    var isFogLink = cls.indexOf('foglink') >= 0;
-    var marker = isFogLink ? '' : (cls.indexOf('pending') >= 0 ? 'url(#arrow-pending)' : 'url(#arrow)');
-    if (marker) p.setAttribute('marker-end', marker);
-    svg.appendChild(p);
-    var rec = { el: p, cls: cls, marker: marker, dots: [], meta: meta, gap: path.gap, fog: isFogLink };
-    if (!isFogLink) {
-      var len = p.getTotalLength();
-      [Math.min(11, len * 0.2), Math.max(len - 20, len * 0.7)].forEach(function (at) {
-        var pt = p.getPointAtLength(at);
-        var dot = sv('circle', { cx: pt.x, cy: pt.y, r: 3.6, 'class': 'edot' });
-        svg.appendChild(dot); rec.dots.push(dot);
+  // ------------------------------------------------------- render current scope
+  var world = document.getElementById('world');
+  var svg = document.getElementById('edges');
+  var nodesLayer = document.getElementById('nodes');
+  var groupsLayer = document.getElementById('groups');
+  var chipsLayer = document.getElementById('chips');
+  var badges = document.getElementById('badges');
+  var panel = document.getElementById('panel');
+
+  function renderScope(keepSelection) {
+    var scopeId = currentScopeId();
+    curContainer = scopeId ? ALL_BY_ID.get(scopeId) : ROOT_GRAPH;
+    if (!curContainer) { state.scopeStack = []; scopeId = ''; curContainer = ROOT_GRAPH; }
+
+    var subMeta = scopeId ? (SUBSYSTEMS[scopeId] || {}) : null;
+    curTopology = (subMeta && subMeta.topology) || curContainer.topology || (DATA && DATA.topology) || 'pipeline';
+    curLayout = state.layoutPref === 'auto' ? curTopology : state.layoutPref;
+
+    var rawNodes = (curContainer.children || curContainer.nodes || []).filter(function (n) { return n && n.id != null; });
+    nodes = rawNodes.map(function (n) { var c = {}; for (var k in n) c[k] = n[k]; c.id = String(n.id); return c; });
+    byId = new Map(nodes.map(function (n) { return [n.id, n]; }));
+
+    var rawEdges = (curContainer.inner_edges || curContainer.edges || []);
+    edges = rawEdges.filter(function (e) { return e && byId.has(String(e.from)) && byId.has(String(e.to)); })
+      .map(function (e) {
+        return { from: String(e.from), to: String(e.to), contract: e.contract == null ? '' : String(e.contract), kind: e.kind || 'primary' };
+      });
+
+    active = nodes.filter(function (n) { return !isFog(n); });
+    fogs = nodes.filter(isFog);
+    aSet = new Set(active.map(function (n) { return n.id; }));
+    aEdges = edges.filter(function (e) { return aSet.has(e.from) && aSet.has(e.to); });
+
+    predA = new Map(); succA = new Map();
+    active.forEach(function (n) { predA.set(n.id, []); succA.set(n.id, []); });
+    aEdges.forEach(function (e) {
+      succA.get(e.from).push(e.to); predA.get(e.to).push(e.from);
+      if (e.kind === 'bidirectional') { succA.get(e.to).push(e.from); predA.get(e.from).push(e.to); }
+    });
+
+    var rawNext = subMeta ? subMeta.next_focus : (DATA && DATA.next_focus);
+    nextFocus = rawNext && byId.has(String(rawNext)) ? String(rawNext) : null;
+    var rawSkel = subMeta ? subMeta.skeleton : (DATA && DATA.skeleton);
+    skeleton = Array.isArray(rawSkel) ? rawSkel.map(String).filter(function (id) { return byId.has(id); }) : null;
+    if (skeleton && skeleton.length < 2) skeleton = null;
+    curWarnings = (subMeta ? subMeta.warnings : (DATA && DATA.warnings)) || [];
+
+    skelEdges = new Set();
+    if (skeleton) {
+      if (curTopology === 'star') {
+        var sh = skeleton[0];
+        for (var si = 1; si < skeleton.length; si++) {
+          skelEdges.add(sh + '\u0000' + skeleton[si]);
+          skelEdges.add(skeleton[si] + '\u0000' + sh);
+        }
+      } else {
+        for (var si2 = 0; si2 + 1 < skeleton.length; si2++) skelEdges.add(skeleton[si2] + '\u0000' + skeleton[si2 + 1]);
+      }
+    }
+
+    // Boundary port pills when inside a subsystem
+    var bRaw = resolveParentEdgesFor(scopeId);
+    var bPorts = { in: [], out: [] };
+    bRaw.in.forEach(function (b, idx) {
+      var otherNode = ALL_BY_ID.get(b.other);
+      bPorts.in.push({ id: '__bin_' + idx, other: b.other, label: '← ' + (otherNode ? displayLabel(otherNode) : b.other), contract: b.contract, dir: 'in' });
+    });
+    bRaw.out.forEach(function (b, idx) {
+      var otherNode = ALL_BY_ID.get(b.other);
+      bPorts.out.push({ id: '__bout_' + idx, other: b.other, label: (otherNode ? displayLabel(otherNode) : b.other) + ' →', contract: b.contract, dir: 'out' });
+    });
+
+    boxes = new Map();
+    groups = [];
+    var hasSeed = !scopeId && !!seedText;
+    var layoutRes = curLayout === 'star'
+      ? buildStarLayout(hasSeed, bPorts)
+      : curLayout === 'ring'
+        ? buildRingLayout(hasSeed, bPorts)
+        : buildPipelineLayout(hasSeed, bPorts);
+
+    // Stage groups (in pipeline mode, bounding box around each stage's active nodes)
+    if (curLayout === 'pipeline') {
+      var stageOrder = [], stageMembers = new Map();
+      nodes.forEach(function (n) {
+        var st = String(n.stage || '').trim();
+        if (!st) return;
+        if (!stageMembers.has(st)) { stageMembers.set(st, []); stageOrder.push(st); }
+        if (!isFog(n)) stageMembers.get(st).push(n.id);
+      });
+      stageOrder.forEach(function (st, i) {
+        var mem = stageMembers.get(st);
+        if (!mem.length) return;
+        var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        mem.forEach(function (id) { var b = boxes.get(id); if (!b) return; x0 = Math.min(x0, b.x); y0 = Math.min(y0, b.y); x1 = Math.max(x1, b.x + b.w); y1 = Math.max(y1, b.y + b.h); });
+        if (!isFinite(x0)) return;
+        var fam = FAM[STAGE_FAMS[i % STAGE_FAMS.length]];
+        var pillW = textW(st.toUpperCase(), '700 10.5px ' + MONO) + st.length * 0.63 + 22;
+        groups.push({ stage: st, fam: fam, x: x0 - 26, y: y0 - 32, w: x1 - x0 + 52, h: y1 - y0 + 66, pillW: pillW, members: mem });
       });
     }
-    edgeEls.push(rec);
-    return rec;
+    var groupByStage = new Map(groups.map(function (g) { return [g.stage, g]; }));
+
+    var bandTop = Infinity, bandBottom = -Infinity;
+    boxes.forEach(function (b) { bandTop = Math.min(bandTop, b.y - 14); bandBottom = Math.max(bandBottom, b.y + b.h); });
+    groups.forEach(function (g) { bandTop = Math.min(bandTop, g.y); bandBottom = Math.max(bandBottom, g.y + g.h + 14); });
+    if (!isFinite(bandTop)) { bandTop = 0; bandBottom = 0; }
+
+    var feedbackCount = aEdges.filter(function (e) { return e.kind === 'feedback'; }).length;
+    var feedbackBandExtra = curLayout === 'pipeline' && feedbackCount ? (feedbackCount * 38 + 46) : 0;
+
+    // Fog placement
+    var placed = { above: [], below: [] };
+    function placeX(side, x, w) {
+      var list = placed[side], moved = true, guard2 = 0;
+      while (moved && guard2++ < 200) {
+        moved = false;
+        for (var i = 0; i < list.length; i++) {
+          var p = list[i];
+          if (x < p.x + p.w + 28 && x + w + 28 > p.x) { x = p.x + p.w + 28; moved = true; }
+        }
+      }
+      list.push({ x: x, w: w });
+      return x;
+    }
+    var fogLinks = [], fogLinkedEdge = new Set();
+    var trayX = 0;
+    fogs.forEach(function (f) {
+      var w = nodeWidth(f);
+      var nb = edges.filter(function (e) { return (e.from === f.id && aSet.has(e.to)) || (e.to === f.id && aSet.has(e.from)); })[0];
+      var side, ax, ay, link = null;
+      if (nb) {
+        var other = nb.from === f.id ? nb.to : nb.from, ob = boxes.get(other);
+        side = 'above'; ax = ob.x + ob.w * 0.62; ay = ob.y;
+        link = { kind: 'node', id: other };
+        fogLinkedEdge.add(nb.from + '\u0000' + nb.to);
+      } else if (f.stage && groupByStage.has(String(f.stage).trim())) {
+        var g = groupByStage.get(String(f.stage).trim());
+        side = 'below'; ax = g.x + 20 + g.pillW / 2; ay = g.y + g.h + 13;
+        link = { kind: 'group', stage: g.stage };
+      } else {
+        side = 'below'; ax = trayX + w / 2; ay = null;
+      }
+      var x = placeX(side, ax - w / 2, w);
+      if (!link) trayX = x + w + 28;
+      var y = side === 'above' ? bandTop - FOG_GAP_Y - NODE_H : bandBottom + feedbackBandExtra + FOG_GAP_Y;
+      boxes.set(f.id, { x: x, y: y, w: w, h: NODE_H });
+      if (link) fogLinks.push({ fog: f.id, side: side, ax: ax, ay: ay, link: link });
+    });
+
+    // Normalise coordinates
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    boxes.forEach(function (b) { minX = Math.min(minX, b.x); minY = Math.min(minY, b.y - 14); maxX = Math.max(maxX, b.x + b.w); maxY = Math.max(maxY, b.y + b.h + 12); });
+    groups.forEach(function (g) { minX = Math.min(minX, g.x); minY = Math.min(minY, g.y); maxX = Math.max(maxX, g.x + g.w); maxY = Math.max(maxY, g.y + g.h + 14); });
+    if (feedbackBandExtra) maxY = Math.max(maxY, bandBottom + feedbackBandExtra + 16);
+    if (!isFinite(minX)) { minX = minY = 0; maxX = maxY = 1; }
+    var dx = PAD - minX, dy = PAD - minY;
+    boxes.forEach(function (b) { b.x += dx; b.y += dy; });
+    groups.forEach(function (g) { g.x += dx; g.y += dy; });
+    fogLinks.forEach(function (l) { l.ax += dx; if (l.ay != null) l.ay += dy; });
+    layoutRes.guides.forEach(function (g) { g.cx += dx; g.cy += dy; });
+    WORLD_W = maxX - minX + PAD * 2;
+    WORLD_H = maxY - minY + PAD * 2;
+
+    // Clear & re-render DOM
+    groupsLayer.textContent = '';
+    nodesLayer.textContent = '';
+    chipsLayer.textContent = '';
+    svg.textContent = '';
+    world.style.width = WORLD_W + 'px'; world.style.height = WORLD_H + 'px';
+    svg.setAttribute('width', WORLD_W); svg.setAttribute('height', WORLD_H);
+
+    var defs = sv('defs', {});
+    ['', 'pending', 'feedback', 'hot'].forEach(function (kind) {
+      var m = sv('marker', { id: 'arrow' + (kind ? '-' + kind : ''), viewBox: '0 0 10 10', refX: '9', refY: '5', markerWidth: '9', markerHeight: '9', orient: 'auto-start-reverse', markerUnits: 'userSpaceOnUse' });
+      m.appendChild(sv('path', { d: 'M0,0 L10,5 L0,10 z', 'class': 'arrow' + (kind ? ' ' + kind : '') }));
+      defs.appendChild(m);
+    });
+    svg.appendChild(defs);
+
+    layoutRes.guides.forEach(function (g) {
+      svg.appendChild(sv('ellipse', { cx: g.cx, cy: g.cy, rx: g.rx, ry: g.ry, 'class': 'guide-ring' }));
+    });
+
+    groups.forEach(function (g) {
+      var d = h('div', 'group');
+      d.style.left = g.x + 'px'; d.style.top = g.y + 'px'; d.style.width = g.w + 'px'; d.style.height = g.h + 'px';
+      d.style.setProperty('--g', g.fam.dot); d.style.setProperty('--gfill', hexA(g.fam.dot, 0.13)); d.style.setProperty('--gtag', g.fam.tag);
+      d.appendChild(h('span', 'group-label', g.stage));
+      groupsLayer.appendChild(d);
+      g.el = d;
+    });
+
+    nodeEls = new Map();
+    function makeNode(id, n, special) {
+      var b = boxes.get(id);
+      if (!b) return;
+      var el = h('div', 'node');
+      el.tabIndex = 0;
+      el.setAttribute('role', 'button');
+      el.dataset.id = id;
+      el.style.left = b.x + 'px'; el.style.top = b.y + 'px'; el.style.width = b.w + 'px'; el.style.height = b.h + 'px';
+      var tag;
+      if (special === 'seed') {
+        el.classList.add('seed');
+        tag = h('span', 'tag', 'IDEA · 一句话想法'); tag.style.setProperty('--t', '#fff3b8');
+        el.appendChild(tag); el.appendChild(h('span', 'dot'));
+        el.appendChild(h('span', 'label', trunc(title, 22)));
+        el.title = seedText;
+      } else if (special === 'boundary') {
+        el.classList.add('boundary');
+        el.appendChild(h('span', 'label', n.label));
+        el.title = (n.dir === 'in' ? '父层输入端口：' : '父层输出端口：') + n.other + (n.contract ? '\n契约：' + n.contract : '');
+      } else {
+        var t = tagFor(n);
+        tag = h('span', 'tag', t.text); tag.style.setProperty('--t', t.bg);
+        el.appendChild(tag);
+        if (n.role === 'hub') el.classList.add('hub');
+        if (n.status === 'hole') { el.classList.add('hole'); el.appendChild(h('span', 'qicon', '?')); }
+        else if (n.status === 'fog') { el.classList.add('fog'); el.appendChild(h('span', 'qicon', '+')); }
+        else if (n.status === 'super_node') {
+          el.classList.add('super');
+          var sinfo = SUBSYSTEMS[n.id];
+          if (sinfo && !sinfo.ready) el.classList.add('unready');
+          el.appendChild(h('span', 'qicon', String(childCount(n))));
+          el.addEventListener('dblclick', function (ev) { ev.stopPropagation(); enterScope(n.id); });
+        } else {
+          var dot = h('span', 'dot'); dot.style.setProperty('--c', FAM[famFor(roleOf(n))].dot); el.appendChild(dot);
+        }
+        el.appendChild(h('span', 'label', displayLabel(n)));
+        if (n.status === 'solid') {
+          var st0 = stateOf(n.id);
+          if (st0.impl !== 'planned' || st0.verify !== 'none') {
+            var pillText = IMPL_TEXT[st0.impl] + (st0.verify !== 'none' ? ' · ' + VERIFY_TEXT[st0.verify] : '');
+            el.appendChild(h('span', 'impl-pill ' + st0.impl, pillText));
+          }
+        } else if (n.status === 'super_node') {
+          var lv = leavesOf(n), nb = lv.filter(function (c) { return stateOf(c.id).impl === 'built'; }).length;
+          if (nb) el.appendChild(h('span', 'impl-pill' + (nb === lv.length ? ' built' : ' building'), nb + '/' + lv.length + ' 已实现'));
+        }
+        if (id === nextFocus) el.appendChild(h('span', 'next-pill', '下一个决定'));
+        el.title = displayLabel(n) + (n.spec ? '\n' + n.spec : '') + (n.status === 'super_node' ? '\n（双击进入子系统）' : '');
+      }
+      el.addEventListener('click', function (ev) { ev.stopPropagation(); select(id); });
+      el.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); select(id); } });
+      el.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
+      nodesLayer.appendChild(el);
+      nodeEls.set(id, el);
+    }
+
+    if (hasSeed) makeNode('__seed__', null, 'seed');
+    bPorts.in.forEach(function (p) { makeNode(p.id, p, 'boundary'); });
+    bPorts.out.forEach(function (p) { makeNode(p.id, p, 'boundary'); });
+    nodes.forEach(function (n) { makeNode(n.id, n); });
+
+    edgeEls = [];
+    function addEdge(path, cls, meta) {
+      var p = sv('path', { d: path.d, 'class': 'edge ' + cls });
+      var isFogLink = cls.indexOf('foglink') >= 0;
+      var isBidir = meta && meta.kind === 'bidirectional';
+      var isFeedback = meta && meta.kind === 'feedback';
+      var marker = isFogLink ? '' : (cls.indexOf('pending') >= 0 ? 'url(#arrow-pending)' : (isFeedback ? 'url(#arrow-feedback)' : 'url(#arrow)'));
+      if (marker) {
+        p.setAttribute('marker-end', marker);
+        if (isBidir) p.setAttribute('marker-start', marker);
+      }
+      svg.appendChild(p);
+      var rec = { el: p, cls: cls, marker: marker, bidir: isBidir, feedback: isFeedback, dots: [], meta: meta, gap: path.gap, fog: isFogLink };
+      if (!isFogLink && cls.indexOf('boundarylink') < 0) {
+        var len = p.getTotalLength();
+        [Math.min(11, len * 0.2), Math.max(len - 20, len * 0.7)].forEach(function (at) {
+          var pt = p.getPointAtLength(at);
+          var dot = sv('circle', { cx: pt.x, cy: pt.y, r: 3.4, 'class': 'edot' + (isFeedback ? ' feedback' : '') });
+          svg.appendChild(dot); rec.dots.push(dot);
+        });
+      }
+      edgeEls.push(rec);
+      return rec;
+    }
+
+    // Seed edges: attach to zero-indegree nodes, else entry/hub anchor so rings & stars never orphan IDEA.
+    if (hasSeed) {
+      var sb = boxes.get('__seed__');
+      var seedTargets = [];
+      if (curTopology === 'star') {
+        var hNode = active.find(function (n) { return n.role === 'hub'; }) || active[0];
+        if (hNode) seedTargets = [hNode];
+      } else if (curTopology === 'ring') {
+        var eNode = active.find(function (n) { return n.role === 'entry'; }) || active[0];
+        if (eNode) seedTargets = [eNode];
+      } else {
+        seedTargets = active.filter(function (n) {
+          return !aEdges.some(function (e) { return e.to === n.id && e.kind !== 'feedback'; });
+        });
+        if (!seedTargets.length && active.length) seedTargets = [active[0]];
+      }
+      seedTargets.forEach(function (n) {
+        var onSkel = skeleton && skeleton[0] === n.id;
+        addEdge(sidePath(sb, boxes.get(n.id)), onSkel ? 'skeleton' : '', { from: '__seed__', to: n.id, contract: '', kind: 'primary' });
+      });
+    }
+
+    // Boundary port links when inside a subsystem
+    var entryIds = (curContainer.entry_children || []).filter(function (id) { return boxes.has(id); });
+    if (!entryIds.length && active.length) entryIds = [active[0].id];
+    var exitIds = (curContainer.exit_children || []).filter(function (id) { return boxes.has(id); });
+    if (!exitIds.length && active.length) exitIds = [active[active.length - 1].id];
+    bPorts.in.forEach(function (p) {
+      entryIds.forEach(function (eid) {
+        addEdge(sidePath(boxes.get(p.id), boxes.get(eid)), 'boundarylink', { from: p.id, to: eid, contract: p.contract, kind: 'primary' });
+      });
+    });
+    bPorts.out.forEach(function (p) {
+      exitIds.forEach(function (xid) {
+        addEdge(sidePath(boxes.get(xid), boxes.get(p.id)), 'boundarylink', { from: xid, to: p.id, contract: p.contract, kind: 'primary' });
+      });
+    });
+
+    // Graph edges
+    var pairSet = new Set(edges.map(function (e) { return e.from + '\u0000' + e.to; }));
+    var fbIdx = 0;
+    edges.forEach(function (e) {
+      var key = e.from + '\u0000' + e.to;
+      if (fogLinkedEdge.has(key)) return;
+      var A = byId.get(e.from), B = byId.get(e.to);
+      var clsList = [];
+      if (isFog(A) || isFog(B)) clsList.push('foglink');
+      else if (A.status === 'hole' || B.status === 'hole') clsList.push('pending');
+      else if (skelEdges.has(key)) clsList.push('skeleton');
+      if (e.kind === 'feedback') clsList.push('feedback');
+      if (e.kind === 'bidirectional') clsList.push('bidir');
+      var hasReverse = pairSet.has(e.to + '\u0000' + e.from);
+      var laneY = bandBottom + dy + 56 + (fbIdx * 36);
+      if (e.kind === 'feedback') fbIdx++;
+      addEdge(
+        sidePath(boxes.get(e.from), boxes.get(e.to), { feedback: e.kind === 'feedback', reversePair: hasReverse, laneY: laneY }),
+        clsList.join(' '),
+        e
+      );
+    });
+
+    fogLinks.forEach(function (l) {
+      var fb = boxes.get(l.fog), d;
+      if (l.side === 'below') d = vPath(l.ax, l.ay, fb.x + fb.w / 2, fb.y - 2);
+      else d = vPath(fb.x + fb.w / 2, fb.y + fb.h, l.ax, l.ay);
+      var meta = l.link.kind === 'node'
+        ? edges.filter(function (e) { return (e.from === l.fog && e.to === l.link.id) || (e.to === l.fog && e.from === l.link.id); })[0]
+        : { from: l.fog, to: '__group__', contract: '', kind: 'primary' };
+      addEdge({ d: d, gap: 150 }, 'foglink', meta);
+    });
+
+    renderBadges();
+    if (!keepSelection || !boxes.has(state.selected)) state.selected = null;
+    matches = null;
+    document.getElementById('search').value = '';
+    document.getElementById('searchCount').textContent = '';
+    applyView();
+    renderPanel();
+    fit();
   }
 
-  if (hasSeed) {
-    var sb = boxes.get('__seed__');
-    active.forEach(function (n) {
-      if (predA.get(n.id).length) return;
-      var onSkel = skeleton && skeleton[0] === n.id;
-      addEdge(sidePath(sb, boxes.get(n.id)), onSkel ? 'skeleton' : '', { from: '__seed__', to: n.id, contract: '' });
+  function enterScope(superId) {
+    var sn = ALL_BY_ID.get(superId);
+    if (!sn || sn.status !== 'super_node') return;
+    // Build full stack from root down to superId
+    var stack = [];
+    var cur = superId;
+    while (cur) { stack.unshift(cur); cur = PARENT_OF.get(cur); }
+    state.scopeStack = stack;
+    state.selected = null;
+    renderScope(false);
+  }
+  function jumpStack(depth) {
+    state.scopeStack = state.scopeStack.slice(0, depth);
+    state.selected = null;
+    renderScope(false);
+  }
+
+  function renderBadges() {
+    badges.textContent = '';
+    if (state.scopeStack.length) {
+      var rootBtn = h('button', 'badge crumb', '⌂ 全局 (' + (TOPO_TEXT[(DATA && DATA.topology) || 'pipeline'] || '流水线') + ')');
+      rootBtn.type = 'button';
+      rootBtn.addEventListener('click', function () { jumpStack(0); });
+      badges.appendChild(rootBtn);
+      state.scopeStack.forEach(function (sid, i) {
+        var sn = ALL_BY_ID.get(sid);
+        var st = (SUBSYSTEMS[sid] && SUBSYSTEMS[sid].topology) || (sn && sn.topology) || 'pipeline';
+        var b = h('button', 'badge crumb', '› ' + (sn ? displayLabel(sn) : sid) + ' (' + (TOPO_TEXT[st] || st) + ')');
+        b.type = 'button';
+        b.addEventListener('click', function () { jumpStack(i + 1); });
+        badges.appendChild(b);
+      });
+    } else {
+      badges.appendChild(h('span', 'badge info', '拓扑 ' + (TOPO_TEXT[curTopology] || curTopology) + (CFG.preset ? ' · ' + CFG.preset : '')));
+    }
+
+    var holeCount = nodes.filter(function (x) { return x.status === 'hole'; }).length;
+    var solidCount = nodes.filter(function (x) { return x.status === 'solid'; }).length;
+    if (skeleton) {
+      var skLabel = curTopology === 'ring' ? '闭环已贯通' : (curTopology === 'star' ? '星形中枢已贯通' : '最小闭环已贯通');
+      badges.appendChild(h('span', 'badge ok', '✓ ' + skLabel + ' · ' + skeleton.length + ' 节点'));
+    }
+    if (nextFocus) {
+      var nb2 = h('button', 'badge next', '→ 下一个决定：' + trunc(displayLabel(byId.get(nextFocus)), 12)); nb2.type = 'button';
+      nb2.addEventListener('click', function () { select(nextFocus, { center: true, force: true }); });
+      badges.appendChild(nb2);
+    }
+    if (holeCount > LIMITS.holes) badges.appendChild(h('span', 'badge warn', '⚠ 待定节点 ' + holeCount + ' / 上限 ' + LIMITS.holes));
+    if (solidCount > LIMITS.solids) badges.appendChild(h('span', 'badge warn', '⚠ 已确定节点 ' + solidCount + ' > ' + LIMITS.solids + '，建议折叠'));
+    curWarnings.forEach(function (w) {
+      if (w.indexOf('CHAIN_TOO_LONG') >= 0) badges.appendChild(h('span', 'badge warn', '⚠ 链长超限'));
+      else if (w.indexOf('HUB_OVERLOADED') >= 0) badges.appendChild(h('span', 'badge warn', '⚠ 中枢过载'));
+      else if (w.indexOf('CYCLE_TOO_LONG') >= 0) badges.appendChild(h('span', 'badge warn', '⚠ 闭环过长'));
     });
   }
-  edges.forEach(function (e) {
-    var key = e.from + '\u0000' + e.to;
-    if (fogLinkedEdge.has(key)) return;
-    var A = byId.get(e.from), B = byId.get(e.to);
-    var cls = (isFog(A) || isFog(B)) ? 'foglink' : (A.status === 'hole' || B.status === 'hole') ? 'pending' : (skelEdges.has(key) ? 'skeleton' : '');
-    addEdge(sidePath(boxes.get(e.from), boxes.get(e.to)), cls, e);
-  });
-  fogLinks.forEach(function (l) {
-    var fb = boxes.get(l.fog), d;
-    if (l.side === 'below') d = vPath(l.ax, l.ay, fb.x + fb.w / 2, fb.y - 2);
-    else d = vPath(fb.x + fb.w / 2, fb.y + fb.h, l.ax, l.ay);
-    var meta = l.link.kind === 'node'
-      ? edges.filter(function (e) { return (e.from === l.fog && e.to === l.link.id) || (e.to === l.fog && e.from === l.link.id); })[0]
-      : { from: l.fog, to: '__group__', contract: '' };
-    addEdge({ d: d, gap: 150 }, 'foglink', meta);
-  });
 
-  // ------------------------------------------------------- view state
-  var state = { selected: null, query: '', showFog: true, showContracts: false };
-  var matches = null;
-
+  // ------------------------------------------------------- selection & chips
   function neighbours(id) {
     var s = new Set([id]);
     edgeEls.forEach(function (r) { if (r.meta && (r.meta.from === id || r.meta.to === id)) { s.add(r.meta.from); s.add(r.meta.to); } });
@@ -780,8 +1269,8 @@
       var hot = !!state.selected && (r.meta.from === state.selected || r.meta.to === state.selected);
       if (!hot && !state.showContracts) return;
       var len = r.el.getTotalLength(), pt = r.el.getPointAtLength(len / 2);
-      var chip = h('div', 'chip' + (hot ? ' hot' : ''), r.meta.contract);
-      chip.title = r.meta.from + ' → ' + r.meta.to + '\n' + r.meta.contract;
+      var chip = h('div', 'chip' + (hot ? ' hot' : '') + (r.feedback ? ' feedback' : ''), r.meta.contract);
+      chip.title = r.meta.from + (r.bidir ? ' ↔ ' : ' → ') + r.meta.to + '\n' + r.meta.contract;
       chip.style.left = pt.x + 'px'; chip.style.top = pt.y + 'px';
       chip.style.maxWidth = Math.max(70, Math.min(170, r.gap - 10)) + 'px';
       chipsLayer.appendChild(chip);
@@ -808,7 +1297,11 @@
       r.el.classList.toggle('hot', hot);
       r.el.classList.toggle('dim', dim && !hot);
       r.dots.forEach(function (d) { d.classList.toggle('dim', dim && !hot); });
-      if (r.marker) r.el.setAttribute('marker-end', hot ? 'url(#arrow-hot)' : r.marker);
+      if (r.marker) {
+        var mk = hot ? 'url(#arrow-hot)' : r.marker;
+        r.el.setAttribute('marker-end', mk);
+        if (r.bidir) r.el.setAttribute('marker-start', mk);
+      }
     });
     document.getElementById('btnFog').setAttribute('aria-pressed', String(state.showFog));
     document.getElementById('btnContracts').setAttribute('aria-pressed', String(state.showContracts));
@@ -817,7 +1310,7 @@
 
   function setHash(id) {
     try {
-      var url = location.pathname + location.search + (id && id !== '__seed__' ? '#' + encodeURIComponent(id) : '');
+      var url = location.pathname + location.search + (id && id.indexOf('__') !== 0 ? '#' + encodeURIComponent(id) : '');
       history.replaceState(null, '', url);
     } catch (e) {}
   }
@@ -832,7 +1325,6 @@
   }
 
   // ------------------------------------------------------------ panel
-  var panel = document.getElementById('panel');
   function section(titleText) { var s = h('div', 'sec'); s.appendChild(h('h4', null, titleText)); panel.appendChild(s); return s; }
   function listOrEmpty(sec, items, emptyText) {
     if (!items || !items.length) { sec.appendChild(h('div', 'empty', emptyText)); return; }
@@ -840,7 +1332,11 @@
     items.forEach(function (t) { ul.appendChild(h('li', null, t)); });
     sec.appendChild(ul);
   }
-  function nameOf(id) { if (id === '__seed__') return '初始想法'; var n = byId.get(id); return n ? displayLabel(n) : id; }
+  function nameOf(id) {
+    if (id === '__seed__') return '初始想法';
+    var n = byId.get(id) || ALL_BY_ID.get(id);
+    return n ? displayLabel(n) : id;
+  }
   function jumpButton(id, head, body, extraCls) {
     var b = h('button', 'crow' + (extraCls ? ' ' + extraCls : '')); b.type = 'button';
     b.appendChild(h('span', 'from', head));
@@ -852,8 +1348,9 @@
     if (!list.length) { sec.appendChild(h('div', 'empty', dir === 'in' ? '无 · 起始边界' : '无 · 最终交付')); return; }
     var rows = h('div', 'rows');
     list.forEach(function (e) {
-      var other = dir === 'in' ? e.from : e.to;
-      rows.appendChild(jumpButton(other, (dir === 'in' ? '← ' : '→ ') + nameOf(other),
+      var other = e.kind === 'bidirectional' ? (e.from === state.selected ? e.to : e.from) : (dir === 'in' ? e.from : e.to);
+      var prefix = e.kind === 'bidirectional' ? '↔ ' : (e.kind === 'feedback' ? (dir === 'in' ? '↺ ' : '↻ ') : (dir === 'in' ? '← ' : '→ '));
+      rows.appendChild(jumpButton(other, prefix + nameOf(other) + (e.kind !== 'primary' ? ' [' + e.kind + ']' : ''),
         e.contract && e.contract !== 'TBD' ? e.contract : 'TBD · 契约待定'));
     });
     sec.appendChild(rows);
@@ -871,30 +1368,41 @@
   }
   function commandsFor(n) {
     var id = shq(n.id);
+    var inFlag = currentScopeId() ? ' --in ' + shq(currentScopeId()) : '';
     switch (n.status) {
       case 'hole': return [
-        ['arch focus --node ' + id, '让引擎围绕这个节点给出局部切片'],
-        ['arch collapse --node ' + id + ' --label "" --spec ""', '确定方案后锁定为实现规范'],
-        ['arch deactivate --node ' + id + ' --reason ""', '这一轮先不做：移入储备区'],
+        ['python3 .arch/scripts/arch_cli.py focus --node ' + id + inFlag, '围绕该节点给出局部切片'],
+        ['python3 .arch/scripts/arch_cli.py collapse --node ' + id + ' --label "" --spec ""' + inFlag, '确定方案后锁定为实现规范'],
+        ['python3 .arch/scripts/arch_cli.py promote --node ' + id + ' --topology star' + inFlag, '升级为带独立拓扑的子系统'],
+        ['python3 .arch/scripts/arch_cli.py deactivate --node ' + id + ' --reason ""' + inFlag, '这一轮先不做：移入储备区'],
       ];
-      case 'fog': return [['arch activate --node ' + id + ' --after "" --contract ""', '从储备区接回主线，成为待定节点']];
-      case 'super_node': return [['arch unfold --node ' + id, '展开模块，恢复子节点']];
+      case 'fog': return [['python3 .arch/scripts/arch_cli.py activate --node ' + id + ' --after "" --contract ""' + inFlag, '从储备区接回主线，成为待定节点']];
+      case 'super_node': return [
+        ['python3 .arch/scripts/arch_cli.py focus --in ' + id, '进入子系统作用域查看内部切片'],
+        ['python3 .arch/scripts/arch_cli.py unfold --node ' + id + inFlag, '展开模块，恢复子节点到当前层'],
+      ];
       default: return [
-        ['arch export-task --node ' + id, '导出编码任务卡，交给子代理实现'],
-        ['arch reset-node --node ' + id + ' --reason ""', '实现踩坑时退回待定，并记录原因'],
+        ['python3 .arch/scripts/arch_cli.py export-task --node ' + id + inFlag, '导出编码任务卡，交给子代理实现'],
+        ['python3 .arch/scripts/arch_cli.py promote --node ' + id + ' --topology ring' + inFlag, '向下拆解为子系统'],
+        ['python3 .arch/scripts/arch_cli.py reset-node --node ' + id + ' --reason ""' + inFlag, '实现踩坑时退回待定，并记录原因'],
       ];
     }
   }
 
   function renderPanel() {
     panel.textContent = '';
-    var n = state.selected && state.selected !== '__seed__' ? byId.get(state.selected) : null;
+    var n = state.selected && state.selected.indexOf('__') !== 0 ? byId.get(state.selected) : null;
+    var scopeId = currentScopeId();
     var head = h('div', 'p-head');
-    head.appendChild(h('span', 'p-kicker', n ? '节点详情' : '项目概览'));
+    head.appendChild(h('span', 'p-kicker', n ? '节点详情' : (scopeId ? '子系统概览' : '项目概览')));
     if (n) {
       var back = h('button', 'btn small', '← 概览'); back.type = 'button';
       back.addEventListener('click', function () { select(null); });
       head.appendChild(back);
+    } else if (scopeId) {
+      var up = h('button', 'btn small', '↑ 返回上层'); up.type = 'button';
+      up.addEventListener('click', function () { jumpStack(state.scopeStack.length - 1); });
+      head.appendChild(up);
     }
     panel.appendChild(head);
 
@@ -906,20 +1414,31 @@
       var idRow = h('div', 'p-id'); idRow.appendChild(h('span', null, 'id: ' + n.id));
       var cp = h('button', 'btn small', '复制 ID'); cp.type = 'button';
       cp.addEventListener('click', function () { copyText(n.id, cp); });
-      idRow.appendChild(cp); panel.appendChild(idRow);
+      idRow.appendChild(cp);
+      if (n.status === 'super_node') {
+        var drill = h('button', 'btn small primary', '进入子系统 →'); drill.type = 'button';
+        drill.addEventListener('click', function () { enterScope(n.id); });
+        idRow.appendChild(drill);
+      }
+      panel.appendChild(idRow);
 
       var info = [STATUS_TEXT[n.status] || n.status, '类型 ' + (n.type || 'port')];
+      if (n.role) info.push('角色 ' + n.role);
       if (n.stage) info.push('阶段 ' + n.stage);
+      if (n.status === 'super_node') {
+        var sm = SUBSYSTEMS[n.id] || {};
+        info.push('子系统拓扑 ' + (sm.topology || n.topology || 'pipeline') + ' · ' + (sm.ready ? '已贯通' : '未贯通'));
+      }
       if (n.id === nextFocus) info.push('→ 引擎建议的下一个决定');
       if (skeleton && skeleton.indexOf(n.id) >= 0) info.push('✓ 位于最小闭环上');
       section('状态').appendChild(h('div', 'box mono', info.join('\n')));
       section('规范 · SPEC').appendChild(h('div', 'box', n.spec || '无描述'));
       if (n.status === 'super_node') {
-        var kids = section('折叠的子节点 · ' + childCount(n));
-        listOrEmpty(kids, (n.children || []).map(function (ch) { return displayLabel(ch) + '（' + ch.id + '）'; }), '无');
+        var kids = section('子系统节点 · ' + childCount(n));
+        listOrEmpty(kids, (n.children || []).map(function (ch) { return displayLabel(ch) + '（' + ch.id + ' · ' + ch.status + '）'; }), '无');
       }
-      contractRows(section('输入契约 · IN'), edges.filter(function (e) { return e.to === n.id; }), 'in');
-      contractRows(section('输出契约 · OUT'), edges.filter(function (e) { return e.from === n.id; }), 'out');
+      contractRows(section('输入契约 · IN'), edges.filter(function (e) { return e.to === n.id || (e.kind === 'bidirectional' && e.from === n.id); }), 'in');
+      contractRows(section('输出契约 · OUT'), edges.filter(function (e) { return e.from === n.id || (e.kind === 'bidirectional' && e.to === n.id); }), 'out');
       if (n.status === 'super_node') {
         var lv2 = leavesOf(n);
         var nb2 = lv2.filter(function (c) { return stateOf(c.id).impl === 'built'; }).length;
@@ -949,12 +1468,18 @@
         b.addEventListener('click', function () { copyText(c[0], b); });
         row.appendChild(b); cs.appendChild(row); cs.appendChild(h('div', 'note', c[1]));
       });
-      cs.appendChild(h('div', 'note', '命令中的 arch 指 README 里定义的 CLI 入口（uv run --no-project <技能目录>/scripts/arch_cli.py），在项目根目录执行。'));
       return;
     }
 
-    panel.appendChild(h('div', 'p-title', title));
-    if (seedText && seedText !== title) panel.appendChild(h('div', 'box', seedText));
+    panel.appendChild(h('div', 'p-title', scopeId ? displayLabel(curContainer) : title));
+    if (scopeId && curContainer.spec) panel.appendChild(h('div', 'box', curContainer.spec));
+    else if (!scopeId && seedText && seedText !== title) panel.appendChild(h('div', 'box', seedText));
+
+    var metaInfo = [
+      '拓扑：' + curTopology + '（' + (TOPO_TEXT[curTopology] || curTopology) + '）',
+      '预设：' + (CFG.preset || 'standard') + ' · 深度上限 ' + (CFG.max_depth || 2) + ' · 链长上限 ' + (CFG.max_chain_len || 6)
+    ];
+    section('拓扑与预设 · PRESET').appendChild(h('div', 'box mono', metaInfo.join('\n')));
 
     var counts = { solid: 0, hole: 0, fog: 0 };
     nodes.forEach(function (x) { if (x.status === 'super_node') counts.solid++; else if (counts[x.status] != null) counts[x.status]++; });
@@ -964,7 +1489,7 @@
       c2.appendChild(h('b', null, counts[s[0]])); c2.appendChild(h('span', null, s[1]));
       stats.appendChild(c2);
     });
-    section('节点统计 · STEP ' + (graph.step || 0)).appendChild(stats);
+    section('节点统计 · STEP ' + (ROOT_GRAPH.step || 0)).appendChild(stats);
 
     if (nextFocus) {
       var nf = byId.get(nextFocus);
@@ -972,8 +1497,14 @@
     }
 
     var skS = section('最小闭环 · WALKING SKELETON');
-    if (skeleton) skS.appendChild(h('div', 'box chain', skeleton.map(nameOf).join('  →  ')));
-    else skS.appendChild(h('div', 'empty', '尚未贯通：还没有一条从入口到出口、不含待定节点的通路。'));
+    if (skeleton) {
+      var skText = curTopology === 'star'
+        ? nameOf(skeleton[0]) + ' ↔ [' + skeleton.slice(1).map(nameOf).join(', ') + ']'
+        : skeleton.map(nameOf).join('  →  ');
+      skS.appendChild(h('div', 'box chain', skText));
+    } else {
+      skS.appendChild(h('div', 'empty', '尚未贯通：当前作用域还没有不含待定节点的可运行骨架。'));
+    }
 
     var progress = { built: 0, building: 0, planned: 0 }, verified = 0, decided = 0;
     nodes.forEach(function (x) {
@@ -1007,44 +1538,14 @@
     if (scoped) panel.lastChild.appendChild(h('div', 'note', '另有 ' + scoped + ' 条节点 / 阶段事实，见各节点详情。'));
     listOrEmpty(section('踩坑记录 · GRAVEYARD'), DATA && DATA.graveyard, '暂无记录');
 
-    var lg = section('图例');
-    var legend = h('div', 'legend');
-    [['已确定', 'var(--surface)', 'solid'], ['待定 ?', 'repeating-linear-gradient(135deg,var(--amber-stripe) 0 3px,var(--amber-soft) 3px 6px)', 'dashed'],
-     ['储备 Fog', 'repeating-linear-gradient(135deg,var(--fog) 0 3px,var(--fog-stripe) 3px 6px)', 'dashed']].forEach(function (l) {
-      var s = h('span'); var i = h('i'); i.style.background = l[1]; i.style.borderStyle = l[2];
-      s.appendChild(i); s.appendChild(document.createTextNode(l[0])); legend.appendChild(s);
-    });
-    lg.appendChild(legend);
-
     var ks = section('快捷键');
     var keys = h('div', 'keys');
-    [['/', '搜索节点（Enter 跳到第一个结果）'], ['← →', '沿连线走到上游 / 下游'], ['↑ ↓', '在同一阶段里切换'], ['F', '适配视图'], ['Esc', '取消选择或清空搜索']].forEach(function (k) {
+    [['/', '搜索节点'], ['双击模块', '下钻进入子系统'], ['Backspace', '返回上一层'], ['← →', '沿连线走到上游 / 下游'], ['F', '适配视图'], ['Esc', '取消选择']].forEach(function (k) {
       keys.appendChild(h('kbd', null, k[0])); keys.appendChild(h('span', null, k[1]));
     });
     ks.appendChild(keys);
-    ks.appendChild(h('div', 'note', '选中节点后，地址栏的 #节点ID 可以直接分享或收藏。'));
     if (DATA && DATA.generated_at) panel.appendChild(h('div', 'meta', '导出于 ' + DATA.generated_at));
   }
-
-  // ------------------------------------------------------------- HUD
-  document.title = trunc(title, 30) + ' · 架构图';
-  document.getElementById('titleText').textContent = title;
-  document.getElementById('titlepill').title = seedText || title;
-  var stepEl = document.getElementById('stepNum');
-  stepEl.textContent = String(graph.step || 0).padStart(2, '0');
-  stepEl.title = '当前推演步数 Step ' + (graph.step || 0);
-
-  var badges = document.getElementById('badges');
-  var holeCount = nodes.filter(function (x) { return x.status === 'hole'; }).length;
-  var solidCount = nodes.filter(function (x) { return x.status === 'solid'; }).length;
-  if (skeleton) badges.appendChild(h('span', 'badge ok', '✓ 最小闭环已贯通 · ' + skeleton.length + ' 节点'));
-  if (nextFocus) {
-    var nb2 = h('button', 'badge next', '→ 下一个决定：' + trunc(displayLabel(byId.get(nextFocus)), 12)); nb2.type = 'button';
-    nb2.addEventListener('click', function () { select(nextFocus, { center: true, force: true }); });
-    badges.appendChild(nb2);
-  }
-  if (holeCount > limits.holes) badges.appendChild(h('span', 'badge warn', '⚠ 待定节点 ' + holeCount + ' / 上限 ' + limits.holes));
-  if (solidCount > limits.solids) badges.appendChild(h('span', 'badge warn', '⚠ 已确定节点 ' + solidCount + ' > ' + limits.solids + '，建议折叠'));
 
   // -------------------------------------------------------- pan/zoom
   var vp = document.getElementById('viewport');
@@ -1077,7 +1578,6 @@
     var right = panelOpen ? 340 + 32 : 0;
     return { x: 0, y: top + 8, w: W - right, h: H - top - 8 - 64 };
   }
-  // On narrow screens the HUD rows wrap; stack them by their real heights.
   function stackHud() {
     var W = window.innerWidth, ids = ['toolbar', 'badges', 'panel', 'zoombar'];
     ids.forEach(function (id) { document.getElementById(id).style.top = ''; });
@@ -1129,7 +1629,7 @@
   vp.addEventListener('pointerup', endDrag);
   vp.addEventListener('pointercancel', endDrag);
 
-  // ---------------------------------------------------------- search
+  // ---------------------------------------------------------- search & controls
   var searchEl = document.getElementById('search');
   var searchCount = document.getElementById('searchCount');
   function runSearch() {
@@ -1159,7 +1659,6 @@
   });
   function clearSearch() { searchEl.value = ''; runSearch(); }
 
-  // ------------------------------------------------------- keyboard nav
   function navigable(id) { return id !== '__group__' && boxes.has(id) && visible(id); }
   function stepAlong(dir) {
     var id = state.selected;
@@ -1175,7 +1674,7 @@
   }
   function stepStage(dir) {
     var id = state.selected;
-    if (!id || id === '__seed__') { stepAlong(1); return; }
+    if (!id || id.indexOf('__') === 0) { stepAlong(1); return; }
     var st = String(byId.get(id).stage || '').trim();
     var peers = nodes.filter(function (n) { return String(n.stage || '').trim() === st && navigable(n.id); }).map(function (n) { return n.id; });
     if (!st) peers = peers.filter(function (pid) { return Math.abs(boxes.get(pid).x - boxes.get(id).x) < 30 || pid === id; });
@@ -1187,11 +1686,12 @@
 
   document.addEventListener('keydown', function (e) {
     var tag = e.target && e.target.tagName;
-    if (/INPUT|TEXTAREA/.test(tag)) return;
+    if (/INPUT|TEXTAREA|SELECT/.test(tag)) return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     var handled = true;
     if (e.key === '/') { searchEl.focus(); searchEl.select(); }
     else if (e.key === 'Escape') { if (state.query) clearSearch(); else select(null); }
+    else if (e.key === 'Backspace' && state.scopeStack.length) { jumpStack(state.scopeStack.length - 1); }
     else if (e.key === 'ArrowRight') stepAlong(1);
     else if (e.key === 'ArrowLeft') stepAlong(-1);
     else if (e.key === 'ArrowDown') stepStage(1);
@@ -1206,6 +1706,10 @@
     }
   });
 
+  document.getElementById('layoutSelect').addEventListener('change', function (e) {
+    state.layoutPref = e.target.value;
+    renderScope(true);
+  });
   document.getElementById('btnIn').addEventListener('click', function () { centerZoom(1.2); });
   document.getElementById('btnOut').addEventListener('click', function () { centerZoom(1 / 1.2); });
   document.getElementById('btnFit').addEventListener('click', fit);
@@ -1228,19 +1732,25 @@
   var resizeT;
   window.addEventListener('resize', function () { clearTimeout(resizeT); resizeT = setTimeout(fit, 120); });
 
-  // ------------------------------------------------------- deep link
+  function selectDeep(id) {
+    if (!id || !ALL_BY_ID.has(id)) return;
+    var parent = PARENT_OF.get(id);
+    if (parent !== (currentScopeId() || null)) {
+      if (parent) enterScope(parent);
+      else jumpStack(0);
+    }
+    select(id, { center: true, force: true });
+  }
   function fromHash() {
     var id = '';
     try { id = decodeURIComponent(location.hash.slice(1)); } catch (e) {}
-    return id && byId.has(id) ? id : null;
+    return id && ALL_BY_ID.has(id) ? id : null;
   }
-  window.addEventListener('hashchange', function () { var id = fromHash(); if (id !== state.selected) select(id, { center: true, force: true }); });
+  window.addEventListener('hashchange', function () { var id = fromHash(); if (id && id !== state.selected) selectDeep(id); });
 
-  applyView();
-  renderPanel();
-  fit();
+  renderScope(false);
   var initial = fromHash();
-  if (initial) select(initial, { center: true, force: true });
+  if (initial) selectDeep(initial);
 })();
 </script>
 </body>

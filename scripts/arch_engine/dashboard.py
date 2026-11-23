@@ -1,18 +1,19 @@
-"""export-ui: the self-contained HTML dashboard."""
+"""export-ui: the self-contained multi-topology HTML dashboard."""
 
 import html
 import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
 from .common import (
-    ARCH_DIR, DASHBOARD_TEMPLATE, GRAVEYARD_FILE, GROUND_TRUTH_FILE, MAX_ACTIVE_HOLES,
-    MAX_UNFOLDED_SOLID, SEED_FILE, _load_graph,
+    ARCH_DIR, DASHBOARD_TEMPLATE, GRAVEYARD_FILE, GROUND_TRUTH_FILE, SEED_FILE,
+    _load_config, _load_graph,
 )
 from .graph import (
-    _find_walking_skeleton, _iter_all_nodes, _next_focus_hole, _node_state, _topological_order,
+    _container_skeleton, _container_topology, _container_warnings, _find_walking_skeleton,
+    _is_super_ready, _iter_all_nodes, _next_focus_hole, _node_state, _topological_order,
 )
 from .records import (
     _active_facts, _fact_line, _grave_line, _is_global, _read_records, _records_enabled,
@@ -26,13 +27,14 @@ def _md_bullets(path: Path) -> List[str]:
 
 
 def op_export_ui(out_path: str = "") -> str:
-    """Render the stage-swimlane dashboard from dashboard_template.html.
+    """Render the multi-topology dashboard from dashboard_template.html.
 
     The page is fully self-contained (no network). Graph data is embedded as
     JSON inside <script type="application/json">, with <, > and & escaped so
     node text can never close the script element.
     """
     graph = _load_graph()
+    cfg = _load_config()
     target = Path(out_path).resolve() if out_path else (ARCH_DIR / "dashboard.html")
     target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -41,15 +43,38 @@ def op_export_ui(out_path: str = "") -> str:
         ln for ln in seed_raw.splitlines() if ln.strip() and not ln.lstrip().startswith("#")
     ).strip() or "架构图"
 
+    subsystems: Dict[str, Any] = {}
+    for n in _iter_all_nodes(graph["nodes"]):
+        if n.get("status") == "super_node":
+            subsystems[n["id"]] = {
+                "topology": _container_topology(n),
+                "topo_order": _topological_order(n),
+                "skeleton": _container_skeleton(n),
+                "next_focus": _next_focus_hole(n),
+                "ready": _is_super_ready(n),
+                "warnings": _container_warnings(n, cfg),
+            }
+
     payload = {
         "seed": seed,
         "step": graph.get("step", 1),
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "topology": _container_topology(graph),
+        "config": cfg,
         "graph": graph,
         "topo_order": _topological_order(graph),
         "skeleton": _find_walking_skeleton(graph),
         "next_focus": _next_focus_hole(graph),
-        "limits": {"holes": MAX_ACTIVE_HOLES, "solids": MAX_UNFOLDED_SOLID},
+        "warnings": _container_warnings(graph, cfg),
+        "subsystems": subsystems,
+        "limits": {
+            "holes": cfg["max_active_holes"],
+            "solids": cfg["max_unfolded_solid"],
+            "max_depth": cfg["max_depth"],
+            "max_chain_len": cfg["max_chain_len"],
+            "max_hub_degree": cfg["max_hub_degree"],
+            "max_cycle_len": cfg["max_cycle_len"],
+        },
         "node_state": {
             n["id"]: _node_state(n) for n in _iter_all_nodes(graph["nodes"]) if n["status"] != "super_node"
         },
@@ -79,4 +104,4 @@ def op_export_ui(out_path: str = "") -> str:
     tokens = {"__ARCH_TITLE__": html.escape(seed[:40]), "__ARCH_DATA__": data}
     html_content = re.sub(r"__ARCH_(?:TITLE|DATA)__", lambda m: tokens[m.group(0)], template)
     target.write_text(html_content, encoding="utf-8")
-    return f"已成功导出阶段泳道架构看板 HTML 至：{target}"
+    return f"已成功导出多拓扑交互式架构看板 HTML 至：{target}"
