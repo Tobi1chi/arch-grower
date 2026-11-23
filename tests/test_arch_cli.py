@@ -1265,6 +1265,46 @@ class SubsystemSuperNodeTest(EngineTestCase):
         )
         self.assertNotIn("kind", restored2)
 
+    def test_scoped_fold_and_unfold_remap_subsystem_boundary_ports(self) -> None:
+        # Codex round-5 regression: folding/unfolding children inside a promoted
+        # subsystem must remap its entry_children / exit_children so unfolding the
+        # outer subsystem wires parent edges to existing direct children.
+        for nid in ("entry_input", "final_output"):
+            self.collapse(nid)
+        arch_cli.op_promote("core_transform", topology="pipeline")
+        for cid in ("core_transform_in", "core_transform_core", "core_transform_out"):
+            arch_cli.op_collapse(cid, cid, "spec", scope="core_transform")
+
+        arch_cli.op_fold(
+            ["core_transform_in", "core_transform_core"], "front", "前段", "spec",
+            scope="core_transform",
+        )
+        sub = arch_cli._find_any_node(arch_cli._load_graph(), "core_transform")
+        self.assertEqual(sub["entry_children"], ["front"])
+        self.assertEqual(sub["exit_children"], ["core_transform_out"])
+
+        # Scoped unfold restores original boundary port IDs.
+        arch_cli.op_unfold("front", scope="core_transform")
+        sub = arch_cli._find_any_node(arch_cli._load_graph(), "core_transform")
+        self.assertEqual(sub["entry_children"], ["core_transform_in"])
+
+        # Re-fold inside subsystem, then unfold outer subsystem: parent edge must target `front`.
+        arch_cli.op_fold(
+            ["core_transform_in", "core_transform_core"], "front", "前段", "spec",
+            scope="core_transform",
+        )
+        arch_cli.op_unfold("core_transform")
+        g = arch_cli._load_graph()
+        top_ids = {n["id"] for n in g["nodes"]}
+        edges = {(e["from"], e["to"]) for e in g["edges"]}
+        self.assertIn("front", top_ids)
+        self.assertIn(("entry_input", "front"), edges)
+        self.assertIn(("front", "core_transform_out"), edges)
+        self.assertEqual(
+            arch_cli._find_walking_skeleton(g),
+            ["entry_input", "front", "core_transform_out", "final_output"],
+        )
+
 
 class PresetAndBootstrapTest(EngineTestCase):
     def test_preset_enforces_max_depth_and_feedback_and_survives_fork(self) -> None:

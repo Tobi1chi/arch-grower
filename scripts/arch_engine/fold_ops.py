@@ -251,6 +251,12 @@ def op_fold(
         e for e in c_edges if e["from"] not in member_set and e["to"] not in member_set
     ] + folded_edges
     _replace_container_lists(container, new_nodes, new_edges)
+    if "children" in container:
+        for port_key in ("entry_children", "exit_children"):
+            ports = container.get(port_key) or []
+            container[port_key] = list(dict.fromkeys(
+                super_id if cid in member_set else cid for cid in ports
+            ))
 
     graph["step"] += 1
     tag = f"fold-{super_id}-s{graph['step']:02d}"
@@ -388,6 +394,16 @@ def op_unfold(
     new_nodes = c_nodes[:idx] + sn["children"] + c_nodes[idx + 1:]
     new_edges = [e for e in c_edges if super_id not in (e["from"], e["to"])] + restored
     _replace_container_lists(container, new_nodes, new_edges)
+    if "children" in container:
+        for port_key in ("entry_children", "exit_children"):
+            ports = container.get(port_key) or []
+            expanded: List[str] = []
+            for cid in ports:
+                if cid == super_id:
+                    expanded.extend(sn.get(port_key) or [c["id"] for c in sn["children"]])
+                else:
+                    expanded.append(cid)
+            container[port_key] = list(dict.fromkeys(expanded))
 
     graph["step"] += 1
     tag = f"unfold-{super_id}-s{graph['step']:02d}"
