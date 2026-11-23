@@ -19,7 +19,10 @@ GRAVEYARD_FILE = ARCH_DIR / "graveyard.md"
 OPEN_ITEMS_FILE = ARCH_DIR / "open_items.md"
 RECORDS_FILE = ARCH_DIR / "records.json"
 GROUNDING_FILE = ARCH_DIR / "grounding.json"
-SHADOW_GIT_DIR = ARCH_DIR / ".git"
+# Use a non-`.git` directory name inside `.arch/` so Git 2.34+ does not treat
+# `.arch/` itself as a nested git repository when GIT_WORK_TREE is the project root.
+SHADOW_GIT_DIR = ARCH_DIR / "shadow.git"
+LEGACY_SHADOW_GIT_DIR = ARCH_DIR / ".git"
 DASHBOARD_TEMPLATE = Path(__file__).resolve().parent.parent / "dashboard_template.html"
 
 # Only state files belong in Shadow Git snapshots; vendored `.arch/scripts/`
@@ -134,7 +137,19 @@ def _save_config(cfg: Dict[str, Any]) -> None:
     )
 
 
+def _migrate_legacy_shadow_git() -> None:
+    """Move legacy `.arch/.git` to `.arch/shadow.git` so Git 2.34+ can stage `.arch/*` files."""
+    if LEGACY_SHADOW_GIT_DIR.exists() and not SHADOW_GIT_DIR.exists():
+        LEGACY_SHADOW_GIT_DIR.rename(SHADOW_GIT_DIR)
+
+
+def _shadow_git_exists() -> bool:
+    _migrate_legacy_shadow_git()
+    return SHADOW_GIT_DIR.exists()
+
+
 def _run_shadow_git(args: List[str], check: bool = True) -> subprocess.CompletedProcess:
+    _migrate_legacy_shadow_git()
     env = os.environ.copy()
     env["GIT_DIR"] = str(SHADOW_GIT_DIR.resolve())
     env["GIT_WORK_TREE"] = str(Path(".").resolve())
@@ -147,10 +162,24 @@ def _run_shadow_git(args: List[str], check: bool = True) -> subprocess.Completed
     )
 
 
+def _ensure_shadow_gitignore() -> None:
+    """Keep `.arch/shadow.git/` out of the host project's main Git repo."""
+    gi = ARCH_DIR / ".gitignore"
+    existing = gi.read_text(encoding="utf-8") if gi.exists() else ""
+    lines = [ln.strip() for ln in existing.splitlines()]
+    if "shadow.git/" not in lines:
+        sep = "" if (not existing or existing.endswith("\n")) else "\n"
+        gi.write_text(existing + sep + "shadow.git/\n", encoding="utf-8")
+
+
 def _init_shadow_git() -> None:
+    _migrate_legacy_shadow_git()
+    ARCH_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_shadow_gitignore()
     if not SHADOW_GIT_DIR.exists():
         SHADOW_GIT_DIR.mkdir(parents=True, exist_ok=True)
         _run_shadow_git(["init"])
+        _run_shadow_git(["config", "core.bare", "false"])
         _run_shadow_git(["config", "user.name", "arch-grower"])
         _run_shadow_git(["config", "user.email", "arch@local"])
 
@@ -172,11 +201,25 @@ def _shadow_commit(tag_name: str, message: str, paths: Optional[List[str]] = Non
                 targets.append(p)
     for p in dict.fromkeys(targets):
         if Path(p).exists():
-            _run_shadow_git(["add", "-f", p], check=False)
+            add_res = _run_shadow_git(["add", "-f", "--", p], check=False)
+            if add_res.returncode != 0:
+                raise ArchEngineError(
+                    f"Shadow Git 暂存 '{p}' 失败：{add_res.stderr.strip() or add_res.stdout.strip()}"
+                )
     res = _run_shadow_git(["diff", "--cached", "--quiet"], check=False)
     if res.returncode != 0:
-        _run_shadow_git(["commit", "-m", message], check=False)
-    _run_shadow_git(["tag", "-f", tag_name], check=False)
+        com_res = _run_shadow_git(["commit", "-m", message], check=False)
+        if com_res.returncode != 0:
+            raise ArchEngineError(
+                f"Shadow Git 提交快照失败：{com_res.stderr.strip() or com_res.stdout.strip()}"
+            )
+    head_res = _run_shadow_git(["rev-parse", "--verify", "HEAD"], check=False)
+    if head_res.returncode == 0:
+        tag_res = _run_shadow_git(["tag", "-f", tag_name], check=False)
+        if tag_res.returncode != 0:
+            raise ArchEngineError(
+                f"Shadow Git 创建标签 '{tag_name}' 失败：{tag_res.stderr.strip() or tag_res.stdout.strip()}"
+            )
 
 
 def _load_graph() -> Dict[str, Any]:

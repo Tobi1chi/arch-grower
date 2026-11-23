@@ -378,7 +378,8 @@ def op_set_edge_contract(
             "当前项目 preset 禁止回流边 (allow_feedback=false)。请先通过 arch config --allow-feedback true 放开。"
         )
 
-    if edge.get("contract") == contract and _edge_kind(edge) == new_kind:
+    members_match = not kind or all(_edge_kind(m) == new_kind for m in (edge.get("members") or []))
+    if edge.get("contract") == contract and _edge_kind(edge) == new_kind and members_match:
         return f"连线 '{edge_label}' 已使用该契约。"
 
     edge["contract"] = contract
@@ -386,6 +387,12 @@ def op_set_edge_contract(
         edge.pop("kind", None)
     else:
         edge["kind"] = new_kind
+    if kind and edge.get("members"):
+        for m in edge["members"]:
+            if new_kind == "primary":
+                m.pop("kind", None)
+            else:
+                m["kind"] = new_kind
 
     graph["step"] += 1
     tag = f"arch-step-{graph['step']:02d}"
