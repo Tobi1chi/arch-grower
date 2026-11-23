@@ -227,7 +227,7 @@ arch-grower/
     ├── graveyard.md         # 由 records.json 生成，只读
     ├── open_items.md        # 由 records.json 生成，只读
     ├── grounding.json       # 挂载的文档、探针与人工验证源
-    └── .git/                # Shadow Git 快照（仅跟踪状态文件与绑定源码）
+    └── shadow.git/          # Shadow Git 快照（非 `.git` 命名以兼容 Git 2.34+，仅跟踪状态文件与绑定源码）
 ```
 
 ---

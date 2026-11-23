@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from .common import (
-    ArchEngineError, EDGE_KINDS, NODE_ROLES, SHADOW_GIT_DIR, TOPOLOGIES, _run_shadow_git,
+    ArchEngineError, EDGE_KINDS, NODE_ROLES, TOPOLOGIES, _run_shadow_git, _shadow_git_exists,
 )
 
 
@@ -140,7 +140,8 @@ def _active_topology(
     """Adjacency and degrees of the active nodes (every node that is not fog)."""
     nodes = _container_nodes(container)
     edges = _container_edges(container)
-    active_ids = {n["id"] for n in nodes if n["status"] != "fog"}
+    active_ids = [n["id"] for n in nodes if n["status"] != "fog"]
+    active_set = set(active_ids)
     adj: Dict[str, List[str]] = {nid: [] for nid in active_ids}
     in_deg: Dict[str, int] = {nid: 0 for nid in active_ids}
     out_deg: Dict[str, int] = {nid: 0 for nid in active_ids}
@@ -148,7 +149,7 @@ def _active_topology(
         if not include_feedback and _is_feedback(e):
             continue
         u, v = e["from"], e["to"]
-        if u in active_ids and v in active_ids:
+        if u in active_set and v in active_set:
             adj[u].append(v)
             in_deg[v] += 1
             out_deg[u] += 1
@@ -344,6 +345,7 @@ def _flatten_folds(
     flat_nodes: List[Dict[str, Any]] = []
     top_of: Dict[str, str] = {}
     supers: Dict[str, Dict[str, Any]] = {}
+    atomic_map: Dict[str, str] = {}
 
     def walk(node: Dict[str, Any], top_id: str) -> None:
         if node["status"] == "super_node":
@@ -352,6 +354,10 @@ def _flatten_folds(
                 eff["status"] = "solid" if _is_super_ready(node, _seen=_seen) else "hole"
                 flat_nodes.append(eff)
                 top_of[node["id"]] = top_id
+                # Map every descendant inside this atomic subsystem to its subsystem ID
+                # so boundary edge provenance (`members`) resolves to the subsystem.
+                for desc in _iter_all_nodes(node.get("children", [])):
+                    atomic_map[desc["id"]] = node["id"]
                 return
             supers[node["id"]] = node
             for ch in node.get("children", []):
@@ -364,6 +370,8 @@ def _flatten_folds(
         walk(top, top["id"])
 
     def resolve(nid: str, side: str, seen: frozenset = frozenset()) -> List[str]:
+        if nid in atomic_map:
+            return [atomic_map[nid]]
         if nid in top_of:
             return [nid]
         if nid not in supers or nid in seen:
@@ -373,6 +381,7 @@ def _flatten_folds(
 
     raw = list(_container_edges(container)) + [e for sn in supers.values() for e in sn.get("inner_edges", [])]
     flat_edges = []
+    seen_flat: Set[Tuple[str, str, str]] = set()
     for e in raw:
         ekind = _edge_kind(e)
         for m in _edge_members(e):
@@ -382,6 +391,12 @@ def _flatten_folds(
             # skeleton is never reported ready on a guess.
             for u in resolve(m["from"], "from"):
                 for v in resolve(m["to"], "to"):
+                    if u == v:
+                        continue
+                    key = (u, v, mkind)
+                    if key in seen_flat:
+                        continue
+                    seen_flat.add(key)
                     fe: Dict[str, Any] = {"from": u, "to": v, "contract": m.get("contract", "")}
                     if mkind != "primary":
                         fe["kind"] = mkind
@@ -662,7 +677,7 @@ def _container_warnings(container: Dict[str, Any], cfg: Dict[str, Any]) -> List[
 def _check_node_drift(node: Dict[str, Any]) -> None:
     files = [f for f in _node_files(node) if Path(f).exists()]
     last_tag = node.get("last_tag")
-    if not files or not last_tag or not SHADOW_GIT_DIR.exists():
+    if not files or not last_tag or not _shadow_git_exists():
         return
     file_path = ", ".join(files)
 

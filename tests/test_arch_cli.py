@@ -1127,6 +1127,71 @@ class SubsystemSuperNodeTest(EngineTestCase):
         for snippet in ("layoutSelect", "进入子系统", "buildStarLayout", "buildRingLayout"):
             self.assertIn(snippet, page)
 
+    def test_folded_star_subsystem_resolves_provenance_and_blocks_premature_skeleton(self) -> None:
+        # Codex P1 regression: folding a star inside a pipeline with a 2-node solid prefix
+        # must keep parent boundary edges resolved to the atomic subsystem node.
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+        arch_cli.op_add_node(
+            "pre", "前置校验", "spec", status="solid",
+            after_node="entry_input", before_node="core_transform",
+        )
+        arch_cli.op_add_node("sp1", "通道1", "spec", status="solid", after_node="core_transform", edge_kind="bidirectional")
+        arch_cli.op_add_node("sp2", "通道2", "spec", status="solid", after_node="core_transform", edge_kind="bidirectional")
+        arch_cli.op_collapse("core_transform", "中枢", "spec", role="hub")
+
+        arch_cli.op_fold(
+            ["core_transform", "sp1", "sp2"], "router", "星形路由", "spec", topology="star",
+        )
+        # Complete pipeline through folded star subsystem stays ready.
+        self.assertEqual(
+            arch_cli._find_walking_skeleton(arch_cli._load_graph()),
+            ["entry_input", "pre", "router", "final_output"],
+        )
+        # Resetting hub inside `router` makes subsystem unready; parent MUST NOT
+        # drop `pre -> router` and falsely report `entry_input -> pre` as ready!
+        arch_cli.op_reset_node("core_transform", "重选协议", scope="router")
+        self.assertIsNone(arch_cli._find_walking_skeleton(arch_cli._load_graph()))
+
+    def test_edge_kind_edit_on_folded_module_survives_unfold_and_affects_skeleton(self) -> None:
+        # Codex P2 regression: editing `kind` on an edge touching a folded module
+        # must propagate into `members` provenance so both flattening and unfold keep it.
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+        arch_cli.op_add_node(
+            "decoder", "解码", "spec", status="solid",
+            after_node="entry_input", before_node="core_transform",
+        )
+        arch_cli.op_fold(["entry_input", "decoder"], "front", "前端", "spec")
+        self.assertEqual(
+            arch_cli._find_walking_skeleton(arch_cli._load_graph()),
+            ["front", "core_transform", "final_output"],
+        )
+        arch_cli.op_set_edge_contract("front", "core_transform", "反馈流", kind="feedback")
+        # Feedback edge is ignored by pipeline skeleton, so the path no longer crosses into core_transform.
+        self.assertEqual(arch_cli._find_walking_skeleton(arch_cli._load_graph()), ["front"])
+        arch_cli.op_unfold("front")
+        restored = next(
+            e for e in arch_cli._load_graph()["edges"]
+            if e["from"] == "decoder" and e["to"] == "core_transform"
+        )
+        self.assertEqual(restored.get("kind"), "feedback")
+        self.assertEqual(restored.get("contract"), "反馈流")
+
+        # Also verify feedback -> primary override on a folded edge survives unfold.
+        arch_cli.op_fold(["entry_input", "decoder"], "front2", "前端2", "spec")
+        arch_cli.op_set_edge_contract("front2", "core_transform", "主流", kind="primary")
+        self.assertEqual(
+            arch_cli._find_walking_skeleton(arch_cli._load_graph()),
+            ["front2", "core_transform", "final_output"],
+        )
+        arch_cli.op_unfold("front2")
+        restored2 = next(
+            e for e in arch_cli._load_graph()["edges"]
+            if e["from"] == "decoder" and e["to"] == "core_transform"
+        )
+        self.assertNotIn("kind", restored2)
+
 
 class PresetAndBootstrapTest(EngineTestCase):
     def test_preset_enforces_max_depth_and_feedback_and_survives_fork(self) -> None:
@@ -1170,6 +1235,27 @@ class PresetAndBootstrapTest(EngineTestCase):
         arch_cli.op_fork("arch-step-01")
         self.assertTrue(embedded_cli.exists())
         self.assertTrue(marker.exists())
+
+    def test_shadow_git_uses_non_dot_git_dir_and_migrates_legacy(self) -> None:
+        # Issue #4 regression: `.arch/shadow.git` avoids Git 2.34 nested-repo `.arch/.git` bug.
+        self.assertTrue(Path(".arch/shadow.git").exists())
+        self.assertFalse(Path(".arch/.git").exists())
+        self.assertIn("shadow.git/", Path(".arch/.gitignore").read_text(encoding="utf-8"))
+
+        from arch_engine.common import _run_shadow_git
+        tracked = set(_run_shadow_git(["ls-files"]).stdout.splitlines())
+        self.assertIn(".arch/graph.json", tracked)
+        self.assertIn(".arch/config.json", tracked)
+        self.assertFalse(any(p.startswith(".arch/shadow.git") for p in tracked))
+
+        # Simulate a legacy project whose shadow repo still lives at `.arch/.git`
+        self.collapse("entry_input")
+        Path(".arch/shadow.git").rename(Path(".arch/.git"))
+        self.assertTrue(Path(".arch/.git").exists())
+        arch_cli.op_fork("arch-step-01")
+        self.assertTrue(Path(".arch/shadow.git").exists())
+        self.assertFalse(Path(".arch/.git").exists())
+        self.assertEqual(arch_cli._load_graph()["step"], 1)
 
     def test_mcp_exposes_and_dispatches_v2_tools(self) -> None:
         names = {t["name"] for t in arch_mcp.TOOLS}
