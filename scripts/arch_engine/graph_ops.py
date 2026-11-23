@@ -14,7 +14,7 @@ from .common import (
 )
 from .graph import (
     IMPL_LEVELS, VERIFY_LEVELS, VERIFY_TEXT, _edge_from_members, _edge_kind, _edge_members,
-    _find_any_node, _get_node, _iter_all_nodes, _node_files, _node_state,
+    _find_any_node, _get_node, _is_feedback, _iter_all_nodes, _node_files, _node_state,
     _reject_manual_super_type, _resolve_container, _state_text, _store_files,
     _validate_edge_kind, _validate_node_role, _validate_topology,
 )
@@ -629,12 +629,22 @@ def op_deactivate_node(
         for inc, out in bridge_pairs:
             u, v = inc["from"], out["to"]
             ct = bypass_contract or inc.get("contract") or out.get("contract") or "Bypass-Bridged"
+            inc_fb = _is_feedback(inc)
+            out_fb = _is_feedback(out)
             # Join the original endpoints on both sides, so a bypass touching a
             # folded module still knows which child it really starts or ends at.
-            bypass = [
-                {"from": a["from"], "to": b["to"], "contract": ct}
-                for a in _edge_members(inc) for b in _edge_members(out) if a["from"] != b["to"]
-            ]
+            # Preserve feedback semantics whenever either incident edge is feedback.
+            bypass = []
+            for a in _edge_members(inc):
+                for b in _edge_members(out):
+                    if a["from"] == b["to"]:
+                        continue
+                    item: Dict[str, Any] = {"from": a["from"], "to": b["to"], "contract": ct}
+                    if inc_fb or out_fb or _is_feedback(a) or _is_feedback(b):
+                        item["kind"] = "feedback"
+                    bypass.append(item)
+            if not bypass:
+                continue
             existing = next((e for e in remaining_edges if e["from"] == u and e["to"] == v), None)
             if existing is None:
                 remaining_edges.append(_edge_from_members(u, v, bypass))

@@ -1056,12 +1056,30 @@ class MultiTopologyTest(EngineTestCase):
             self.collapse(nid)
         arch_cli.op_add_node("reflect", "反思", "spec", status="solid", after_node="act", before_node="perceive")
         arch_cli.op_set_edge_contract("reflect", "perceive", "记忆回写", kind="feedback")
-        out = arch_cli.op_fold(["perceive", "decide"], "front_loop", "感知决策", "spec", topology="pipeline")
+        # Folding an open arc without explicit --topology must infer `pipeline`,
+        # not inherit `ring`, so the parent ring stays WALKING_SKELETON_READY.
+        out = arch_cli.op_fold(["perceive", "decide"], "front_loop", "感知决策", "spec")
         self.assertIn("已将 2 个节点折叠为超级节点 'front_loop'", out)
+        self.assertIn("topology=pipeline", out)
         self.assertIn("WALKING_SKELETON_READY", out)
         arch_cli.op_unfold("front_loop")
         ids = {n["id"] for n in arch_cli._load_graph()["nodes"]}
         self.assertTrue({"perceive", "decide", "act", "reflect"} <= ids)
+
+    def test_deactivate_preserves_feedback_kind_on_bypass_edge(self) -> None:
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+        arch_cli.op_connect("final_output", "entry_input", "审批回流", kind="feedback")
+        out = arch_cli.op_deactivate_node("final_output", "本轮先不做最终输出")
+        bypass = next(
+            e for e in arch_cli._load_graph()["edges"]
+            if e["from"] == "core_transform" and e["to"] == "entry_input"
+        )
+        self.assertEqual(bypass.get("kind"), "feedback")
+        self.assertIn(
+            "[WALKING_SKELETON_READY] 检测到无空洞可运行主干: entry_input -> core_transform",
+            out,
+        )
 
     def test_star_topology_hub_first_focus_and_skeleton(self) -> None:
         out = arch_cli.op_init("事件总线", topology="star", preset="platform")
