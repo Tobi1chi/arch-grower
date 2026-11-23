@@ -1029,5 +1029,159 @@ class SignatureDetectionTest(unittest.TestCase):
             self.assertFalse(self.check(line), line)
 
 
+class MultiTopologyTest(EngineTestCase):
+    def test_feedback_edge_in_pipeline_preserves_walking_skeleton(self) -> None:
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+        out = arch_cli.op_connect("final_output", "entry_input", "审批回流", kind="feedback")
+        self.assertIn("[WALKING_SKELETON_READY] 检测到无空洞可运行主干: entry_input -> core_transform -> final_output", out)
+        arch_cli.op_disconnect("final_output", "entry_input")
+        edges = {(e["from"], e["to"]) for e in arch_cli._load_graph()["edges"]}
+        self.assertNotIn(("final_output", "entry_input"), edges)
+
+    def test_ring_topology_focus_order_and_skeleton(self) -> None:
+        out = arch_cli.op_init("Agent 闭环", topology="ring", preset="agent")
+        self.assertIn("topology: ring", out)
+        # First focus should be the entry anchor `perceive`
+        self.assertIn('"id": "perceive"', out.split('"focus_node"')[1].split("}")[0])
+        self.collapse("perceive")
+        out2 = self.collapse("decide")
+        self.assertNotIn("WALKING_SKELETON_READY", out2)
+        out3 = self.collapse("act")
+        self.assertIn("[WALKING_SKELETON_READY] 检测到无空洞可运行闭环: perceive -> decide -> act -> perceive", out3)
+
+    def test_ring_allows_folding_contiguous_arc_and_unfolds_cleanly(self) -> None:
+        arch_cli.op_init("Ring fold", topology="ring")
+        for nid in ("perceive", "decide", "act"):
+            self.collapse(nid)
+        arch_cli.op_add_node("reflect", "反思", "spec", status="solid", after_node="act", before_node="perceive")
+        arch_cli.op_set_edge_contract("reflect", "perceive", "记忆回写", kind="feedback")
+        out = arch_cli.op_fold(["perceive", "decide"], "front_loop", "感知决策", "spec", topology="pipeline")
+        self.assertIn("已将 2 个节点折叠为超级节点 'front_loop'", out)
+        self.assertIn("WALKING_SKELETON_READY", out)
+        arch_cli.op_unfold("front_loop")
+        ids = {n["id"] for n in arch_cli._load_graph()["nodes"]}
+        self.assertTrue({"perceive", "decide", "act", "reflect"} <= ids)
+
+    def test_star_topology_hub_first_focus_and_skeleton(self) -> None:
+        out = arch_cli.op_init("事件总线", topology="star", preset="platform")
+        self.assertIn("topology: star", out)
+        # Focus prioritizes hub first
+        self.assertIn('"id": "core_hub"', out.split('"focus_node"')[1].split("}")[0])
+        out1 = self.collapse("core_hub")
+        self.assertNotIn("WALKING_SKELETON_READY", out1)
+        out2 = self.collapse("spoke_a")
+        self.assertNotIn("WALKING_SKELETON_READY", out2)
+        out3 = self.collapse("spoke_b")
+        self.assertIn("[WALKING_SKELETON_READY] 检测到无空洞可运行星形中枢: core_hub <-> [spoke_a, spoke_b]", out3)
+
+    def test_star_hub_deactivate_guard_and_no_bridge(self) -> None:
+        arch_cli.op_init("事件总线", topology="star")
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "AutoBridgeLimitError"):
+            arch_cli.op_deactivate_node("core_hub", "先下线")
+        out = arch_cli.op_deactivate_node("core_hub", "拆除", no_bridge=True)
+        self.assertIn("未自动缝合旁路", out)
+        self.assertEqual(arch_cli._load_graph()["edges"], [])
+
+
+class SubsystemSuperNodeTest(EngineTestCase):
+    def test_promote_creates_isolated_subsystem_with_compositional_skeleton(self) -> None:
+        self.collapse("entry_input")
+        self.collapse("final_output")
+        out = arch_cli.op_promote("core_transform", topology="star", label="路由中枢")
+        self.assertIn("升级为 star 子系统", out)
+        self.assertIn('"scope": "core_transform"', out)
+        self.assertIn('"boundary_in"', out)
+        # Parent pipeline MUST NOT report ready while star subsystem still has holes inside
+        self.assertIsNone(arch_cli._find_walking_skeleton(arch_cli._load_graph()))
+
+        # Settle all nodes inside the star subsystem using --in scope (without unfolding!)
+        arch_cli.op_collapse("core_transform_hub", "中心总线", "spec", scope="core_transform")
+        arch_cli.op_collapse("core_transform_spoke_a", "通道A", "spec", scope="core_transform")
+        sub_out = arch_cli.op_collapse("core_transform_spoke_b", "通道B", "spec", scope="core_transform")
+        self.assertIn("检测到无空洞可运行星形中枢", sub_out)
+
+        # Now parent pipeline skeleton becomes ready through the star subsystem!
+        self.assertEqual(
+            arch_cli._find_walking_skeleton(arch_cli._load_graph()),
+            ["entry_input", "core_transform", "final_output"],
+        )
+        # Export task inside subsystem carries boundary contracts
+        task = json.loads(arch_cli.op_export_task("core_transform_hub", scope="core_transform"))
+        self.assertEqual(task["subsystem_scope"], "core_transform")
+        self.assertEqual(task["subsystem_topology"], "star")
+        self.assertTrue(task["boundary_in_contracts"])
+        self.assertTrue(task["boundary_out_contracts"])
+
+    def test_dashboard_embeds_subsystem_topology_and_drilldown_markers(self) -> None:
+        self.collapse("entry_input")
+        self.collapse("final_output")
+        arch_cli.op_promote("core_transform", topology="ring", label="思考环")
+        arch_cli.op_export_ui()
+        page = Path(".arch/dashboard.html").read_text(encoding="utf-8")
+        data = ExportUiTest.embedded(None, page)
+        self.assertEqual(data["topology"], "pipeline")
+        self.assertEqual(data["subsystems"]["core_transform"]["topology"], "ring")
+        self.assertFalse(data["subsystems"]["core_transform"]["ready"])
+        self.assertEqual(data["config"]["preset"], "standard")
+        for snippet in ("layoutSelect", "进入子系统", "buildStarLayout", "buildRingLayout"):
+            self.assertIn(snippet, page)
+
+
+class PresetAndBootstrapTest(EngineTestCase):
+    def test_preset_enforces_max_depth_and_feedback_and_survives_fork(self) -> None:
+        arch_cli.op_init("lean tool", preset="lean")
+        cfg = arch_cli._load_config()
+        self.assertEqual((cfg["preset"], cfg["max_depth"], cfg["allow_feedback"]), ("lean", 1, False))
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "allow_feedback=false"):
+            arch_cli.op_connect("final_output", "entry_input", "loop", kind="feedback")
+
+        # Promote to depth 1 succeeds; promoting a child to depth 2 hits max_depth=1
+        arch_cli.op_promote("core_transform", topology="pipeline")
+        with self.assertRaisesRegex(arch_cli.ArchEngineError, "MaxDepthError"):
+            arch_cli.op_promote("core_transform_core", topology="ring", scope="core_transform")
+
+        # Raising max_depth via config unblocks depth 2 and survives fork
+        arch_cli.op_config(max_depth=2, allow_feedback=True)
+        arch_cli.op_promote("core_transform_core", topology="ring", scope="core_transform")
+        arch_cli.op_fork("arch-step-01")
+        self.assertEqual(arch_cli._load_config()["max_depth"], 2)
+        self.assertTrue(arch_cli._load_config()["allow_feedback"])
+
+    def test_chain_length_soft_warning(self) -> None:
+        arch_cli.op_config(max_chain_len=3)
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+        out = arch_cli.op_add_node("extra", "第4节", "spec", status="solid", after_node="final_output")
+        self.assertIn("[CHAIN_TOO_LONG]", out)
+
+    def test_bootstrap_embeds_cli_and_shadow_git_excludes_scripts(self) -> None:
+        out = arch_cli.op_bootstrap()
+        self.assertIn(".arch/scripts", out)
+        embedded_cli = Path(".arch/scripts/arch_cli.py")
+        self.assertTrue(embedded_cli.exists())
+        self.assertTrue(Path(".arch/scripts/arch_engine/graph.py").exists())
+        self.assertTrue(Path(".arch/scripts/VERSION").exists())
+
+        # Make a state commit and fork: Shadow Git must NOT track or roll back .arch/scripts/
+        self.collapse("entry_input")
+        marker = Path(".arch/scripts/CUSTOM_LOCAL_MARKER")
+        marker.write_text("keep-me\n", encoding="utf-8")
+        arch_cli.op_fork("arch-step-01")
+        self.assertTrue(embedded_cli.exists())
+        self.assertTrue(marker.exists())
+
+    def test_mcp_exposes_and_dispatches_v2_tools(self) -> None:
+        names = {t["name"] for t in arch_mcp.TOOLS}
+        for name in ("arch_bootstrap", "arch_connect", "arch_disconnect", "arch_promote"):
+            self.assertIn(name, names)
+        arch_mcp._dispatch_tool("arch_init", {"seed": "star app", "topology": "star", "preset": "platform"})
+        arch_mcp._dispatch_tool("arch_promote", {"node_id": "spoke_a", "topology": "ring"})
+        res = arch_mcp._dispatch_tool("arch_focus", {"scope": "spoke_a"})
+        self.assertIn("topology: ring", res)
+        arch_mcp._dispatch_tool("arch_config", {"max_chain_len": 9})
+        self.assertEqual(arch_cli._load_config()["max_chain_len"], 9)
+
+
 if __name__ == "__main__":
     unittest.main()

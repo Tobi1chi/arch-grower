@@ -213,18 +213,21 @@ arch-grower/
 │   └── examples/            # 可直接打开的看板示例 HTML
 ├── references/
 │   ├── onboarding_tutorial.md   # 5 分钟交互式新手演练剧本
+│   ├── topology_patterns.md     # 多拓扑（流水线 / 星形 / 环形）、子系统与 Preset 指南
 │   ├── stage_patterns.md        # 阶段内并发并行与多态设计模式
 │   ├── execution_and_hotswap.md # 初次交付、已落地节点变更与热替换
 │   └── grounding_guide.md       # 现实世界黑盒约束与硬件边界确认指南
 └── （目标项目中）.arch/
+    ├── scripts/             # 内嵌零依赖 CLI 引擎（arch bootstrap / init --embed 生成，不进 Shadow Git）
     ├── SEED.md              # 一句话初始意图
-    ├── graph.json           # 架构图：节点、连线、折叠模块、节点状态
+    ├── config.json          # 项目 preset 与架构护栏（max_depth / max_chain_len / ...）
+    ├── graph.json           # 架构图：顶层与子系统拓扑、节点、连线、折叠模块、节点状态
     ├── records.json         # 事实、墓志、待办项、迁移原文（唯一数据源）
     ├── ground_truth.md      # 由 records.json 生成，只读
     ├── graveyard.md         # 由 records.json 生成，只读
     ├── open_items.md        # 由 records.json 生成，只读
     ├── grounding.json       # 挂载的文档、探针与人工验证源
-    └── .git/                # Shadow Git 快照
+    └── .git/                # Shadow Git 快照（仅跟踪状态文件与绑定源码）
 ```
 
 ---
@@ -284,18 +287,20 @@ ln -s ~/.agents/skills/arch-grower ~/.gemini/config/skills/arch-grower
 
 ---
 
-### 方式三：作为命令行 CLI 工具单机体验
+### 方式三：作为命令行 CLI 工具单机体验（推荐内嵌到 `.arch/scripts/`）
 
-从目标项目根目录运行以下命令。架构状态保存在该目录的 `.arch/`。将脚本路径替换为实际的技能安装路径。
+本引擎零第三方依赖，推荐在初始化时用 `--embed`（或对已有项目运行一次 `bootstrap`）直接将脚本拷贝到项目 `.arch/scripts/` 下，此后直接用 `python3` 运行，无需 `uv run --no-project`：
 
 ```bash
-ARCH_GROWER_CLI="/实际安装路径/arch-grower/scripts/arch_cli.py"
-arch() { uv run --no-project "$ARCH_GROWER_CLI" "$@"; }
+# 1. 首次初始化并内嵌 CLI 到当前项目的 .arch/scripts/（可选 --topology pipeline|star|ring 与 --preset standard|lean|agent|platform）
+python3 "/实际安装路径/arch-grower/scripts/arch_cli.py" init \
+  --seed "实时多模态翻译耳机，BLE 输入到骨传导输出" \
+  --embed --topology pipeline --preset standard
 
-# 1. 仅在尚未初始化架构图的项目中执行
-arch init --seed "实时多模态翻译耳机，BLE 输入到骨传导输出"
+# 之后在项目根目录直接运行内置脚本：
+arch() { python3 .arch/scripts/arch_cli.py "$@"; }
 
-# 2. 查看已有节点的局部切片
+# 2. 查看已有节点的局部切片（支持 --in <子系统ID> 下钻）
 arch focus --node entry_input
 
 # 3. 确认初始图中的输入节点
@@ -305,34 +310,18 @@ arch collapse \
   --spec "监听低功耗蓝牙音频流，按 200ms 分片压入内存队列" \
   --stage "S1-Ingestion"
 
-# 4. 把暂缓开发的发散想法放入储备区
-arch add-node \
-  --node fog_cloud_backup \
-  --label "云端录音备份" \
-  --spec "异步上传分片至 S3" \
-  --status "fog"
+# 4. 在已有节点间补连回流闭环或双向边
+arch connect --from final_output --to entry_input --kind feedback --contract "回声消除参考帧"
 
-# 5. 主干稳定后，把成熟子图折叠为一个超级节点（需要修改时用 unfold 展开）
-#    只能折叠已确定的节点：这里假设 core_transform 与 final_output 已经 collapse
-arch fold \
-  --nodes "core_transform,final_output" \
-  --id translate_out \
-  --label "翻译与输出模块" \
-  --spec "将音频分片翻译后经骨传导播放"
+# 5. 自顶向下将节点升级为带独立拓扑的子系统（例如内部星形或环形）
+arch promote --node core_transform --topology ring
+arch focus --in core_transform
 
-# 6. 导出交互式架构看板 HTML
+# 6. 查看或调整项目 preset 护栏（如 max_depth / max_chain_len）
+arch config --max-depth 2 --max-chain-len 6
+
+# 7. 导出多拓扑交互式架构看板 HTML（支持泳道/星形/环形切换与双击子系统下钻）
 arch export-ui
-# 浏览器打开 .arch/dashboard.html 即可查看全局架构看板（离线可用）：
-#   点击节点查看上下游与契约；/ 搜索，← → 沿连线走，↑ ↓ 同阶段切换，Esc 取消
-# 看板是 graph.json 的只读快照，图更新后重新执行 export-ui
-
-# 7. 记录只与某个节点相关的事实、待实测问题和实现进度
-arch verify --fact "BLE MTU 实测 185" --constraint "音频分片 ≤ 180 字节" \
-  --scope entry_input --source "analysis/ble/mtu.json#android"
-arch open add --question "骨传导延迟是否 < 150ms？" --kind device_test --owner user \
-  --scope translate_out --blocking
-arch set-node-state --node entry_input --impl built --verify device --add-ref "docs/protocol.md#6"
-arch status   # 全局进度：实现 / 验证、卡开发的待办项、记录统计
 ```
 
 用 `arch <子命令> --help` 查询参数。已落地项目的修改流程见[执行与变更手册](references/execution_and_hotswap.md)。
@@ -343,14 +332,21 @@ arch status   # 全局进度：实现 / 验证、卡开发的待办项、记录�
 
 | 原生 MCP 工具名 | CLI 命令 | 作用说明 |
 | :--- | :--- | :--- |
-| `arch_init` | `init` | 初始化项目状态机，创建带待定节点的初始主干与 Shadow Git 仓库 |
-| `arch_focus` | `focus` | 获取当前节点的 1-Hop 切片、`global` 事实与相关记录（其余只给未展开计数） |
-| `arch_collapse` | `collapse` | 确定待定节点或更新已确定节点的规范并记录快照 |
-| `arch_set_edge_contract` | `set-edge-contract --from <起点> --to <终点> --contract <契约>` | 更新一条已有连线的契约 |
-| `arch_add_node` | `add-node` | 在图中增量插入新节点（可指定前驱/后继连线与生命周期 Stage） |
+| `arch_bootstrap` | `bootstrap [--out DIR]` | 将零依赖 CLI 引擎内嵌拷贝到项目 `.arch/scripts/`，直接 `python3` 运行 |
+| `arch_init` | `init --seed [--topology] [--preset] [--embed]` | 初始化项目状态机（支持 `pipeline`/`star`/`ring` 拓扑与项目 `preset` 护栏） |
+| `arch_focus` | `focus [--node] [--in <子系统>]` | 获取当前节点的 1-Hop 切片、`global` 事实、护栏告警与最小闭环状态 |
+| `arch_collapse` | `collapse [--role] [--in <子系统>]` | 确定待定节点或更新已确定节点的规范并记录快照 |
+| `arch_connect` | `connect --from --to [--kind primary\|feedback\|bidirectional] [--in]` | 在两个已有节点间建立连线（支持回流闭环与双向边） |
+| `arch_disconnect` | `disconnect --from --to [--in]` | 移除两个已有节点间的连线 |
+| `arch_set_edge_contract` | `set-edge-contract --from <起点> --to <终点> --contract <契约> [--kind] [--in]` | 更新一条已有连线的契约或类型 |
+| `arch_add_node` | `add-node [--role] [--kind] [--in]` | 在图中增量插入新节点（可指定前驱/后继连线、拓扑角色与 Stage） |
 | `arch_add_fog` | `add-node --status fog` | 快捷工具：将发散想法放入迷雾储备区，保持主干清晰聚焦 |
-| `arch_deactivate`| `deactivate` | 将活跃节点移入暂缓储备区，自动缝合上下游依赖连线 |
-| `arch_activate` | `activate` | 将储备区的节点重新激活为待定节点并接入主线 |
+| `arch_deactivate`| `deactivate [--no-bridge] [--in]` | 将活跃节点移入暂缓储备区，自动缝合上下游（受 `auto_bridge_limit` 保护） |
+| `arch_activate` | `activate [--kind] [--in]` | 将储备区的节点重新激活为待定节点并接入主线 |
+| `arch_promote` | `promote --node [--topology pipeline\|star\|ring] [--in]` | 自顶向下将节点升级为带独立拓扑的子系统超级节点，外层边保留为边界端口 |
+| `arch_fold` | `fold [--topology] [--in]` | 将已确定、彼此连通的子图折叠为超级节点（受 `max_depth` 保护，支持环弧折叠） |
+| `arch_unfold` | `unfold [--attach] [--in]` | 展开超级节点并原样恢复子节点与连线 |
+| `arch_config` | `config [--preset] [--max-depth] [--max-chain-len] [--global-fact-limit] ...` | 查看或调整项目 `preset` 护栏与记录配置（存 `.arch/config.json`） |
 | `arch_verify` | `verify --fact --constraint [--scope] [--source] [--supersedes GT-xx]` | 沉淀已验证事实与硬约束，可指定作用域、证据来源和取代的旧事实 |
 | `arch_facts` | `facts [--node <节点> \| --all] [--with-superseded]` | 查询事实：缺省列 `global`，`--node` 列节点相关事实与墓志，`--all` 按作用域列全部 |
 | `arch_rescope` | `rescope --id <GT-xx/OI-xx> --scope <作用域>` | 修改事实或待办项的作用域，内容不变 |

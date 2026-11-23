@@ -5,13 +5,14 @@ from collections import Counter
 from typing import Any, Dict, List, Optional
 
 from .common import (
-    ArchEngineError, GRAVEYARD_FILE, GROUND_TRUTH_FILE, MAX_ACTIVE_HOLES, MAX_UNFOLDED_SOLID,
-    SEED_FILE, _load_graph,
+    ArchEngineError, GRAVEYARD_FILE, GROUND_TRUTH_FILE, SEED_FILE, _load_config, _load_graph,
 )
 from .graph import (
     IMPL_LEVELS, IMPL_TEXT, SOLID_STATUSES, VERIFY_LEVELS, VERIFY_TEXT, _check_node_drift,
-    _find_any_node, _find_walking_skeleton, _get_node, _iter_all_nodes, _next_focus_hole,
-    _node_state, _node_view, _public_edge, _state_text,
+    _container_edges, _container_nodes, _container_topology, _container_warnings, _edge_kind,
+    _find_any_node, _find_walking_skeleton, _get_node, _is_super_ready, _iter_all_nodes,
+    _max_subtree_depth, _next_focus_hole, _node_state, _node_view, _parent_container_of,
+    _public_edge, _resolve_container, _skeleton_banner, _state_text,
 )
 from .records import (
     NOT_MIGRATED_HINT, _active_facts, _budget_warning, _context_keys, _fact_line,
@@ -21,19 +22,33 @@ from .records import (
 from .refs import _resolve_ref
 
 
-def op_focus(node_id: Optional[str] = None) -> str:
-    graph = _load_graph()
-    nodes = {n["id"]: n for n in graph["nodes"]}
+def _boundary_edges(graph: Dict[str, Any], scope: str) -> Dict[str, List[Dict[str, Any]]]:
+    """External incoming/outgoing edges attached to a super_node from its parent container."""
+    if not scope:
+        return {"in": [], "out": []}
+    parent = _parent_container_of(graph, scope)
+    if parent is None:
+        return {"in": [], "out": []}
+    p_edges = _container_edges(parent)
+    b_in = [_public_edge(e) for e in p_edges if e["to"] == scope or (_edge_kind(e) == "bidirectional" and e["from"] == scope)]
+    b_out = [_public_edge(e) for e in p_edges if e["from"] == scope or (_edge_kind(e) == "bidirectional" and e["to"] == scope)]
+    return {"in": b_in, "out": b_out}
 
-    holes = [n for n in graph["nodes"] if n["status"] == "hole"]
-    solids = [n for n in graph["nodes"] if n["status"] == "solid"]
-    settled = [n for n in graph["nodes"] if n["status"] in SOLID_STATUSES]
+
+def op_focus(node_id: Optional[str] = None, scope: str = "") -> str:
+    graph = _load_graph()
+    cfg = _load_config()
+    container, c_nodes, c_edges, depth, path = _resolve_container(graph, scope)
+    nodes = {n["id"]: n for n in c_nodes}
+
+    holes = [n for n in c_nodes if n["status"] == "hole"]
+    settled = [n for n in c_nodes if n["status"] in SOLID_STATUSES]
 
     target = None
     if node_id:
-        target = _get_node(graph, node_id)
+        target = _get_node(container, node_id)
     elif holes:
-        target = nodes[_next_focus_hole(graph)]
+        target = nodes[_next_focus_hole(container)]
     elif settled:
         target = settled[-1]
 
@@ -65,32 +80,41 @@ def op_focus(node_id: Optional[str] = None) -> str:
                 "运行 arch migrate-records 导入，否则下次写入记录时会被拒绝。"
             )
 
-    if len(holes) > MAX_ACTIVE_HOLES:
+    topo = _container_topology(container)
+    if scope or topo != "pipeline":
+        crumb = " › ".join(["root", *path])
         out.append(
-            f"[CIRCUIT_BREAKER_WARNING] 当前未决空洞数 ({len(holes)}) 已超过上限 ({MAX_ACTIVE_HOLES})！"
-            "请先收敛现有主干空洞，禁止继续发散新分支。"
-        )
-    if len(solids) > MAX_UNFOLDED_SOLID:
-        out.append(
-            f"[CIRCUIT_BREAKER_WARNING] 当前活跃实心节点 ({len(solids)}) 超过 {MAX_UNFOLDED_SOLID} 个，"
-            "建议调用 arch_fold 将已稳定的子图折叠为超级节点，以降低认知负荷。"
+            f"=== 当前作用域: {crumb} [topology: {topo} · depth {depth}/{cfg['max_depth']} · preset: {cfg['preset']}] ==="
         )
 
-    skeleton = _find_walking_skeleton(graph)
+    out.extend(_container_warnings(container, cfg))
+
+    skeleton = _find_walking_skeleton(graph, scope=scope)
     if skeleton:
-        out.append(f"[WALKING_SKELETON_READY] 检测到无空洞可运行主干: {' -> '.join(skeleton)}")
+        out.append(_skeleton_banner(container, skeleton))
 
     if not target:
         out.append("当前图为空。")
         return "\n".join(out)
 
     tid = target["id"]
-    in_edges = [e for e in graph["edges"] if e["to"] == tid]
-    out_edges = [e for e in graph["edges"] if e["from"] == tid]
-    neighbor_ids = {e["from"] for e in in_edges} | {e["to"] for e in out_edges}
-    fog_nodes = [n for n in graph["nodes"] if n["status"] == "fog"]
+    in_edges = [
+        e for e in c_edges
+        if e["to"] == tid or (_edge_kind(e) == "bidirectional" and e["from"] == tid)
+    ]
+    out_edges = [
+        e for e in c_edges
+        if e["from"] == tid or (_edge_kind(e) == "bidirectional" and e["to"] == tid)
+    ]
+    neighbor_ids = (
+        {e["from"] for e in in_edges}
+        | {e["to"] for e in in_edges}
+        | {e["from"] for e in out_edges}
+        | {e["to"] for e in out_edges}
+    ) - {tid}
+    fog_nodes = [n for n in c_nodes if n["status"] == "fog"]
 
-    slice_payload = {
+    slice_payload: Dict[str, Any] = {
         "current_step": graph["step"],
         "focus_node": _node_view(target),
         "upstream_edges": [_public_edge(e) for e in in_edges],
@@ -98,10 +122,21 @@ def op_focus(node_id: Optional[str] = None) -> str:
         "neighbors": [_node_view(nodes[nid]) for nid in neighbor_ids if nid in nodes],
         "fog_backlog": [{"id": f["id"], "label": f["label"]} for f in fog_nodes],
     }
+    if topo != "pipeline" or scope:
+        slice_payload["topology"] = topo
+    if scope:
+        boundary = _boundary_edges(graph, scope)
+        slice_payload["scope"] = scope
+        slice_payload["scope_path"] = path
+        slice_payload["boundary_in"] = boundary["in"]
+        slice_payload["boundary_out"] = boundary["out"]
+
     out.append("=== 当前焦点 1-Hop 切片 ===")
     out.append(json.dumps(slice_payload, indent=2, ensure_ascii=False))
     if rec is not None:
         keys = _context_keys(graph, tid, neighbor_ids)
+        if scope:
+            keys.add(scope)
         out.append(f"=== 相关记录（作用域：{', '.join(sorted(keys))}）===")
         out += _related_records(rec, keys)
     return "\n".join(out)
@@ -150,10 +185,11 @@ def _related_records(rec: Dict[str, Any], keys: set, global_open: str = "blockin
     return out
 
 
-def op_export_task(node_id: str) -> str:
+def op_export_task(node_id: str, scope: str = "") -> str:
     graph = _load_graph()
-    nodes = {n["id"]: n for n in graph["nodes"]}
-    _get_node(graph, node_id, allow_super=False)
+    container, c_nodes, c_edges, _, _ = _resolve_container(graph, scope)
+    nodes = {n["id"]: n for n in c_nodes}
+    _get_node(container, node_id, allow_super=False)
 
     node = nodes[node_id]
     if node["status"] == "hole":
@@ -161,8 +197,14 @@ def op_export_task(node_id: str) -> str:
 
     _check_node_drift(node)
 
-    in_edges = [e for e in graph["edges"] if e["to"] == node_id]
-    out_edges = [e for e in graph["edges"] if e["from"] == node_id]
+    in_edges = [
+        e for e in c_edges
+        if e["to"] == node_id or (_edge_kind(e) == "bidirectional" and e["from"] == node_id)
+    ]
+    out_edges = [
+        e for e in c_edges
+        if e["from"] == node_id or (_edge_kind(e) == "bidirectional" and e["to"] == node_id)
+    ]
 
     task: Dict[str, Any] = {
         "worker_instruction": (
@@ -176,9 +218,20 @@ def op_export_task(node_id: str) -> str:
         "input_contracts": [_public_edge(e) for e in in_edges],
         "output_contracts": [_public_edge(e) for e in out_edges],
     }
+    if scope:
+        task["subsystem_scope"] = scope
+        task["subsystem_topology"] = _container_topology(container)
+        boundary = _boundary_edges(graph, scope)
+        if node_id in (container.get("entry_children") or []) and boundary["in"]:
+            task["boundary_in_contracts"] = boundary["in"]
+        if node_id in (container.get("exit_children") or []) and boundary["out"]:
+            task["boundary_out_contracts"] = boundary["out"]
+
     if _records_enabled():
         rec = _read_records()
         keys = _context_keys(graph, node_id)
+        if scope:
+            keys.add(scope)
         active = _active_facts(rec)
         task["global_facts"] = [_fact_line(f, show_scope=False) for f in active if _is_global(f)]
         task["node_facts"] = [_fact_line(f) for f in active if not _is_global(f) and _matches(f, keys)]
@@ -253,16 +306,22 @@ def op_facts(node_id: str = "", all_scopes: bool = False, with_superseded: bool 
 
 
 def op_status() -> str:
-    """Whole-project progress: node states, open items, record counts, migration state."""
+    """Whole-project progress: preset/topology, node states, open items, record counts, migration state."""
     graph = _load_graph()
+    cfg = _load_config()
     all_nodes = list(_iter_all_nodes(graph["nodes"]))
     leaves = [n for n in all_nodes if n["status"] != "super_node"]
     count = Counter(n["status"] for n in all_nodes)
     solid = [n for n in leaves if n["status"] == "solid"]
     impl = Counter(_node_state(n)["impl"] for n in solid)
     verify = Counter(_node_state(n)["verify"]["level"] for n in solid)
+    depth = _max_subtree_depth(graph["nodes"])
 
     out = [f"=== 项目状态 · step {graph.get('step', 0)} ==="]
+    out.append(
+        f"拓扑与预设：topology={_container_topology(graph)} · preset={cfg['preset']} · "
+        f"嵌套深度 {depth}/{cfg['max_depth']} · 链长上限 {cfg['max_chain_len']}"
+    )
     out.append(
         f"节点：已确定 {count['solid']} · 待定 {count['hole']} · 储备 {count['fog']} · 折叠模块 {count['super_node']}"
     )
@@ -272,19 +331,25 @@ def op_status() -> str:
     )
     out.append("验证程度：" + " · ".join(f"{VERIFY_TEXT[k]} {verify[k]}" for k in reversed(VERIFY_LEVELS)))
 
+    out.extend(_container_warnings(graph, cfg))
+
     out.append("--- 节点明细 ---")
 
-    def describe(n: Dict[str, Any], depth: int) -> None:
-        pad = "  " * depth + ("└ " if depth else "")
+    def describe(n: Dict[str, Any], lv: int) -> None:
+        pad = "  " * lv + ("└ " if lv else "")
         if n["status"] == "super_node":
             inner = [c for c in _iter_all_nodes(n["children"]) if c["status"] != "super_node"]
             built = sum(1 for c in inner if _node_state(c)["impl"] == "built")
-            out.append(f"{pad}{n['id']} [模块] {built}/{len(inner)} 已实现")
+            topo = _container_topology(n)
+            ready_txt = "就绪" if _is_super_ready(n) else "未贯通"
+            out.append(f"{pad}{n['id']} [模块·{topo}·{ready_txt}] {built}/{len(inner)} 已实现")
             for c in n["children"]:
-                describe(c, depth + 1)
+                describe(c, lv + 1)
             return
         st = _node_state(n)
         extra = []
+        if n.get("role"):
+            extra.append(f"role:{n['role']}")
         if st["files"]:
             extra.append(f"文件 {len(st['files'])}")
         if st["refs"]:

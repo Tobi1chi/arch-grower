@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 arch_mcp.py - Zero-dependency Stdio MCP (Model Context Protocol) Server
-exposing native Tool Calls backed by engine.py state machine.
+exposing native Tool Calls backed by arch_engine state machine.
 """
 
 import json
@@ -27,23 +27,45 @@ if _ARCH_ROOT:
 
 TOOLS: List[Dict[str, Any]] = [
     {
+        "name": "arch_bootstrap",
+        "description": "将零依赖 CLI 引擎拷贝到项目的 .arch/scripts/ 下，后续可直接用 python3 .arch/scripts/arch_cli.py 运行。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target_dir": {"type": "string", "description": "可选：目标目录，默认 .arch/scripts"},
+            },
+        },
+    },
+    {
         "name": "arch_init",
-        "description": "初始化项目架构图状态机（在 .arch/ 下创建带 '?' 未知空洞的 3 节点初始主干与 Shadow Git 仓库）。",
+        "description": "初始化项目架构图状态机（支持 pipeline / star / ring 拓扑与项目 preset 护栏）。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "seed": {"type": "string", "description": "用户最初模糊想法的一句话总结（北极星锚点）"},
+                "topology": {
+                    "type": "string",
+                    "enum": list(engine.TOPOLOGIES),
+                    "description": "可选：顶层拓扑（pipeline / star / ring，默认随 preset）",
+                },
+                "preset": {
+                    "type": "string",
+                    "enum": list(engine.PRESETS),
+                    "description": "可选：项目护栏预设（standard / lean / agent / platform，默认 standard）",
+                },
+                "embed": {"type": "boolean", "description": "可选：同时把 CLI 脚本内嵌到 .arch/scripts/"},
             },
             "required": ["seed"],
         },
     },
     {
         "name": "arch_focus",
-        "description": "获取当前焦点 '?' 空洞节点的 1-Hop 上下文切片、北极星约束与可行走主干（Walking Skeleton）状态。",
+        "description": "获取当前焦点 '?' 空洞节点的 1-Hop 上下文切片、北极星约束与最小闭环状态（支持 scope 下钻子系统）。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "node_id": {"type": "string", "description": "可选：指定聚焦的节点 ID；不传则自动聚焦首个未决空洞"},
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID（留空聚焦顶层）"},
             },
         },
     },
@@ -65,26 +87,66 @@ TOOLS: List[Dict[str, Any]] = [
                     "description": "节点类型（默认 port）",
                 },
                 "stage": {"type": "string", "description": "可选：指定归属的生命周期 Stage 阶段名称"},
+                "role": {
+                    "type": "string",
+                    "enum": ["entry", "exit", "hub", "spoke"],
+                    "description": "可选：节点拓扑角色（entry / exit / hub / spoke）",
+                },
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
             },
             "required": ["node_id", "label", "spec"],
         },
     },
     {
+        "name": "arch_connect",
+        "description": "在两个已有节点之间建立连线（支持 primary 主流、feedback 闭环反馈、bidirectional 双向通信）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "from_node": {"type": "string", "description": "起点节点 ID"},
+                "to_node": {"type": "string", "description": "终点节点 ID"},
+                "contract": {"type": "string", "description": "连线契约描述"},
+                "kind": {
+                    "type": "string",
+                    "enum": list(engine.EDGE_KINDS),
+                    "description": "连线类型：primary / feedback / bidirectional",
+                },
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
+            },
+            "required": ["from_node", "to_node"],
+        },
+    },
+    {
+        "name": "arch_disconnect",
+        "description": "移除两个已有节点之间的连线。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "from_node": {"type": "string", "description": "起点节点 ID"},
+                "to_node": {"type": "string", "description": "终点节点 ID"},
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
+            },
+            "required": ["from_node", "to_node"],
+        },
+    },
+    {
         "name": "arch_set_edge_contract",
-        "description": "按起点和终点更新一条已有连线的契约，并生成 Shadow Git 快照。",
+        "description": "按起点和终点更新一条已有连线的契约或类型，并生成 Shadow Git 快照。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "from_node": {"type": "string", "description": "起点节点 ID"},
                 "to_node": {"type": "string", "description": "终点节点 ID"},
                 "contract": {"type": "string", "description": "新契约"},
+                "kind": {"type": "string", "enum": list(engine.EDGE_KINDS), "description": "可选：更新连线类型"},
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
             },
             "required": ["from_node", "to_node", "contract"],
         },
     },
     {
         "name": "arch_add_node",
-        "description": "在图中生长新节点（可插入两个节点之间，或作为 'fog' 迷雾支线暂存）。",
+        "description": "在图中生长新节点（可插入两个节点之间、挂载到星形中枢/环形节点，或作为 'fog' 迷雾支线暂存）。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -94,9 +156,12 @@ TOOLS: List[Dict[str, Any]] = [
                 "status": {"type": "string", "enum": ["hole", "solid", "fog"]},
                 "node_type": {"type": "string", "enum": ["port", "adapter", "reality_gate"]},
                 "stage": {"type": "string", "description": "可选：指定归属的生命周期 Stage 阶段名称"},
+                "role": {"type": "string", "enum": ["entry", "exit", "hub", "spoke"]},
                 "after_node": {"type": "string", "description": "可选：上游前驱节点 ID"},
                 "before_node": {"type": "string", "description": "可选：下游后继节点 ID"},
                 "contract": {"type": "string", "description": "连线契约描述"},
+                "kind": {"type": "string", "enum": list(engine.EDGE_KINDS)},
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
             },
             "required": ["node_id", "label", "spec"],
         },
@@ -110,20 +175,24 @@ TOOLS: List[Dict[str, Any]] = [
                 "node_id": {"type": "string"},
                 "label": {"type": "string"},
                 "spec": {"type": "string"},
+                "stage": {"type": "string"},
                 "after_node": {"type": "string", "description": "可选：挂载在哪个节点之后"},
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
             },
             "required": ["node_id", "label", "spec"],
         },
     },
     {
         "name": "arch_deactivate",
-        "description": "将活跃的实心（solid）或空洞（hole）节点平稳下线移入战争迷雾区（fog），并自动缝合上下游边缘。",
+        "description": "将活跃节点下线移入战争迷雾区（fog）；默认自动缝合上下游边缘（超上限或星形中枢需用 no_bridge）。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "node_id": {"type": "string", "description": "目标节点 ID"},
                 "reason": {"type": "string", "description": "暂缓/移入迷雾的原因说明"},
                 "bypass_contract": {"type": "string", "description": "可选：上下游缝合连线的新契约"},
+                "no_bridge": {"type": "boolean", "description": "可选：断开关联边而不自动缝合旁路"},
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
             },
             "required": ["node_id"],
         },
@@ -138,6 +207,8 @@ TOOLS: List[Dict[str, Any]] = [
                 "after_node": {"type": "string", "description": "可选：挂载在哪个上游节点之后"},
                 "before_node": {"type": "string", "description": "可选：插入在哪个下游节点之前"},
                 "contract": {"type": "string", "description": "连线契约描述"},
+                "kind": {"type": "string", "enum": list(engine.EDGE_KINDS)},
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
             },
             "required": ["node_id"],
         },
@@ -145,9 +216,8 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "name": "arch_fold",
         "description": (
-            "将已确定（solid / super_node）、彼此连通的子图折叠为一个超级节点，压缩认知负荷。"
+            "将已确定（solid / super_node）、彼此连通的子图折叠为一个超级节点（支持声明独立拓扑）。"
             "子节点与内部连线完整保存在超级节点内，对外连线改接到超级节点并保留契约。"
-            "当 focus 提示活跃实心节点过多时使用。"
         ),
         "inputSchema": {
             "type": "object",
@@ -157,8 +227,25 @@ TOOLS: List[Dict[str, Any]] = [
                 "label": {"type": "string", "description": "模块名称"},
                 "spec": {"type": "string", "description": "模块整体职责描述"},
                 "stage": {"type": "string", "description": "可选：所属 Stage；缺省时若子节点同属一个 Stage 则沿用"},
+                "topology": {"type": "string", "enum": list(engine.TOPOLOGIES), "description": "可选：子系统内部拓扑"},
+                "scope": {"type": "string", "description": "可选：父级子系统 ID"},
             },
             "required": ["node_ids", "super_id", "label", "spec"],
+        },
+    },
+    {
+        "name": "arch_promote",
+        "description": "自顶向下将单个节点升级为带独立拓扑（pipeline / star / ring）的子系统超级节点，内部生成初始骨架并保留外部边界端口。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string", "description": "待升级的节点 ID"},
+                "topology": {"type": "string", "enum": list(engine.TOPOLOGIES), "description": "子系统拓扑：pipeline / star / ring"},
+                "label": {"type": "string", "description": "可选：更新子系统名称"},
+                "spec": {"type": "string", "description": "可选：更新子系统职责"},
+                "scope": {"type": "string", "description": "可选：父级子系统 ID"},
+            },
+            "required": ["node_id"],
         },
     },
     {
@@ -176,6 +263,7 @@ TOOLS: List[Dict[str, Any]] = [
                     "additionalProperties": {"type": "string"},
                     "description": "可选：{外部节点ID: 子节点ID}，指定折叠期间新增连线接到哪个子节点",
                 },
+                "scope": {"type": "string", "description": "可选：父级子系统 ID"},
             },
             "required": ["node_id"],
         },
@@ -264,7 +352,7 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "arch_status",
-        "description": "项目进度总览：各节点实现进度与验证程度、未关闭与卡开发的待办项、记录统计、未分类遗留与迁移提示。",
+        "description": "项目进度总览：拓扑与预设、各节点实现进度与验证程度、未关闭与卡开发的待办项、记录统计与迁移提示。",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -320,10 +408,22 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "arch_config",
-        "description": "查看或设置记录配置：global_fact_limit 为 global 事实字数上限（默认 3000，超出时 focus / status 会警告）。",
+        "description": "查看或设置项目 preset 护栏与记录配置（max_depth、max_chain_len、max_hub_degree、allow_feedback、global_fact_limit 等）。",
         "inputSchema": {
             "type": "object",
-            "properties": {"global_fact_limit": {"type": "integer"}},
+            "properties": {
+                "preset": {"type": "string", "enum": list(engine.PRESETS)},
+                "default_topology": {"type": "string", "enum": list(engine.TOPOLOGIES)},
+                "max_depth": {"type": "integer"},
+                "max_chain_len": {"type": "integer"},
+                "max_hub_degree": {"type": "integer"},
+                "max_cycle_len": {"type": "integer"},
+                "max_active_holes": {"type": "integer"},
+                "max_unfolded_solid": {"type": "integer"},
+                "auto_bridge_limit": {"type": "integer"},
+                "allow_feedback": {"type": "boolean"},
+                "global_fact_limit": {"type": "integer"},
+            },
         },
     },
     {
@@ -349,6 +449,7 @@ TOOLS: List[Dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "node_id": {"type": "string", "description": "要导出任务的节点 ID"},
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
             },
             "required": ["node_id"],
         },
@@ -365,6 +466,7 @@ TOOLS: List[Dict[str, Any]] = [
                     "type": "array", "items": {"type": "string"},
                     "description": "可选：节点由多个文件实现时传全部路径，代替 file_path",
                 },
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
             },
             "required": ["node_id"],
         },
@@ -377,6 +479,7 @@ TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "node_id": {"type": "string"},
                 "summary": {"type": "string", "description": "一句话总结人类手动修改的逻辑"},
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
             },
             "required": ["node_id", "summary"],
         },
@@ -389,13 +492,14 @@ TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "node_id": {"type": "string"},
                 "reason": {"type": "string", "description": "踩坑原因（自动记入 graveyard.md）"},
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
             },
             "required": ["node_id", "reason"],
         },
     },
     {
         "name": "arch_fork",
-        "description": "分支回滚：从指定 Shadow Git 快照标签安全回滚图状态（自动保留所有历史避坑记录与现实事实）。",
+        "description": "分支回滚：从指定 Shadow Git 快照标签安全回滚图状态（自动保留所有历史避坑记录、现实事实与项目预设）。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -406,7 +510,7 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "arch_export_ui",
-        "description": "导出单文件交互式架构看板 HTML（阶段分组、主干与分支连线、待定/储备节点、契约详情、搜索与深链），离线可用；图变更后需重新导出。",
+        "description": "导出单文件多拓扑交互式架构看板 HTML（支持泳道 / 星形 / 环形布局切换与子系统下钻），离线可用。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -418,10 +522,17 @@ TOOLS: List[Dict[str, Any]] = [
 
 
 def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
+    if name == "arch_bootstrap":
+        return engine.op_bootstrap(args.get("target_dir", ""))
     if name == "arch_init":
-        return engine.op_init(args["seed"])
+        return engine.op_init(
+            args["seed"],
+            topology=args.get("topology", ""),
+            preset=args.get("preset", "standard"),
+            embed=bool(args.get("embed", False)),
+        )
     if name == "arch_focus":
-        return engine.op_focus(args.get("node_id"))
+        return engine.op_focus(args.get("node_id"), scope=args.get("scope", ""))
     if name == "arch_collapse":
         return engine.op_collapse(
             node_id=args["node_id"],
@@ -432,9 +543,31 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             out_contract=args.get("out_contract", ""),
             node_type=args.get("node_type", "port"),
             stage=args.get("stage", ""),
+            role=args.get("role", ""),
+            scope=args.get("scope", ""),
+        )
+    if name == "arch_connect":
+        return engine.op_connect(
+            from_node=args["from_node"],
+            to_node=args["to_node"],
+            contract=args.get("contract", "TBD"),
+            kind=args.get("kind", "primary"),
+            scope=args.get("scope", ""),
+        )
+    if name == "arch_disconnect":
+        return engine.op_disconnect(
+            from_node=args["from_node"],
+            to_node=args["to_node"],
+            scope=args.get("scope", ""),
         )
     if name == "arch_set_edge_contract":
-        return engine.op_set_edge_contract(args["from_node"], args["to_node"], args["contract"])
+        return engine.op_set_edge_contract(
+            args["from_node"],
+            args["to_node"],
+            args["contract"],
+            kind=args.get("kind", ""),
+            scope=args.get("scope", ""),
+        )
     if name == "arch_add_node":
         return engine.op_add_node(
             node_id=args["node_id"],
@@ -446,6 +579,9 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             after_node=args.get("after_node", ""),
             before_node=args.get("before_node", ""),
             contract=args.get("contract", "TBD"),
+            role=args.get("role", ""),
+            edge_kind=args.get("kind", "primary"),
+            scope=args.get("scope", ""),
         )
     if name == "arch_add_fog":
         return engine.op_add_node(
@@ -457,12 +593,15 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             stage=args.get("stage", ""),
             after_node=args.get("after_node", ""),
             contract="optional_fog",
+            scope=args.get("scope", ""),
         )
     if name == "arch_deactivate":
         return engine.op_deactivate_node(
             node_id=args["node_id"],
             reason=args.get("reason", ""),
             bypass_contract=args.get("bypass_contract", ""),
+            no_bridge=bool(args.get("no_bridge", False)),
+            scope=args.get("scope", ""),
         )
     if name == "arch_activate":
         return engine.op_activate_node(
@@ -470,6 +609,8 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             after_node=args.get("after_node", ""),
             before_node=args.get("before_node", ""),
             contract=args.get("contract", "TBD"),
+            edge_kind=args.get("kind", "primary"),
+            scope=args.get("scope", ""),
         )
     if name == "arch_fold":
         return engine.op_fold(
@@ -478,9 +619,19 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             label=args["label"],
             spec=args["spec"],
             stage=args.get("stage", ""),
+            topology=args.get("topology", ""),
+            scope=args.get("scope", ""),
+        )
+    if name == "arch_promote":
+        return engine.op_promote(
+            node_id=args["node_id"],
+            topology=args.get("topology", ""),
+            label=args.get("label", ""),
+            spec=args.get("spec", ""),
+            scope=args.get("scope", ""),
         )
     if name == "arch_unfold":
-        return engine.op_unfold(args["node_id"], args.get("attach") or {})
+        return engine.op_unfold(args["node_id"], args.get("attach") or {}, scope=args.get("scope", ""))
     if name == "arch_verify":
         return engine.op_verify(
             args["fact"], args["constraint"],
@@ -531,17 +682,31 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             args.get("action", "list"), args.get("id", ""), args.get("note", ""), bool(args.get("include_resolved")),
         )
     if name == "arch_config":
-        return engine.op_config(args.get("global_fact_limit"))
+        return engine.op_config(
+            global_fact_limit=args.get("global_fact_limit"),
+            preset=args.get("preset"),
+            default_topology=args.get("default_topology"),
+            max_depth=args.get("max_depth"),
+            max_chain_len=args.get("max_chain_len"),
+            max_hub_degree=args.get("max_hub_degree"),
+            max_cycle_len=args.get("max_cycle_len"),
+            max_active_holes=args.get("max_active_holes"),
+            max_unfolded_solid=args.get("max_unfolded_solid"),
+            auto_bridge_limit=args.get("auto_bridge_limit"),
+            allow_feedback=args.get("allow_feedback"),
+        )
     if name == "arch_ground":
         return engine.op_ground(args["source_type"], args["source"], args.get("note", ""))
     if name == "arch_export_task":
-        return engine.op_export_task(args["node_id"])
+        return engine.op_export_task(args["node_id"], scope=args.get("scope", ""))
     if name == "arch_commit_node":
-        return engine.op_commit_node(args["node_id"], args.get("file_paths") or args.get("file_path", ""))
+        return engine.op_commit_node(
+            args["node_id"], args.get("file_paths") or args.get("file_path", ""), scope=args.get("scope", ""),
+        )
     if name == "arch_sync_manual":
-        return engine.op_sync_manual(args["node_id"], args["summary"])
+        return engine.op_sync_manual(args["node_id"], args["summary"], scope=args.get("scope", ""))
     if name == "arch_reset_node":
-        return engine.op_reset_node(args["node_id"], args["reason"])
+        return engine.op_reset_node(args["node_id"], args["reason"], scope=args.get("scope", ""))
     if name == "arch_fork":
         return engine.op_fork(args["from_tag"])
     if name == "arch_export_ui":
@@ -585,7 +750,7 @@ def serve_stdio() -> None:
                 {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "arch-grower-mcp", "version": "0.1.0"},
+                    "serverInfo": {"name": "arch-grower-mcp", "version": engine.ENGINE_VERSION},
                 },
             )
         elif method == "tools/list":

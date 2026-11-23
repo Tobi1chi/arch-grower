@@ -1,12 +1,15 @@
-"""Graph model: topology, folded modules, walking skeleton, edge provenance,
-node state (impl / verify / refs / files) and drift detection."""
+"""Graph model: multi-topology containers, folded/promoted subsystems, walking
+skeleton, edge provenance, node state (impl / verify / refs / files) and drift
+detection."""
 
 import re
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from .common import ArchEngineError, SHADOW_GIT_DIR, _run_shadow_git
+from .common import (
+    ArchEngineError, EDGE_KINDS, NODE_ROLES, SHADOW_GIT_DIR, TOPOLOGIES, _run_shadow_git,
+)
 
 
 # A changed diff line that declares a function / type, across common languages
@@ -29,18 +32,130 @@ SIGNATURE_LINE = re.compile(
 SOLID_STATUSES = ("solid", "super_node")
 
 
-def _active_topology(graph: Dict[str, Any]) -> Tuple[Dict[str, List[str]], Dict[str, int], Dict[str, int]]:
-    """Adjacency and degrees of the active graph (every node that is not fog)."""
-    active_ids = {n["id"] for n in graph["nodes"] if n["status"] != "fog"}
+def _edge_kind(edge: Dict[str, Any]) -> str:
+    kind = edge.get("kind") or "primary"
+    return kind if kind in EDGE_KINDS else "primary"
+
+
+def _is_feedback(edge: Dict[str, Any]) -> bool:
+    return _edge_kind(edge) == "feedback"
+
+
+def _validate_topology(topology: str) -> str:
+    topo = (topology or "pipeline").strip()
+    if topo not in TOPOLOGIES:
+        raise ArchEngineError(
+            f"未知拓扑类型 '{topo}'。可选：{' / '.join(TOPOLOGIES)}。"
+        )
+    return topo
+
+
+def _validate_edge_kind(kind: str) -> str:
+    k = (kind or "primary").strip()
+    if k not in EDGE_KINDS:
+        raise ArchEngineError(
+            f"未知连线类型 '{k}'。可选：{' / '.join(EDGE_KINDS)}。"
+        )
+    return k
+
+
+def _validate_node_role(role: str) -> str:
+    r = (role or "").strip()
+    if r not in NODE_ROLES:
+        raise ArchEngineError(
+            f"未知节点角色 '{r}'。可选：entry / exit / hub / spoke（或留空）。"
+        )
+    return r
+
+
+def _container_nodes(container: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return container["children"] if "children" in container else container["nodes"]
+
+
+def _container_edges(container: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return container["inner_edges"] if "inner_edges" in container else container["edges"]
+
+
+def _container_topology(container: Dict[str, Any]) -> str:
+    topo = container.get("topology") or "pipeline"
+    return topo if topo in TOPOLOGIES else "pipeline"
+
+
+def _resolve_container(
+    graph: Dict[str, Any], scope: str = "",
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], int, List[str]]:
+    """Return (container, nodes, edges, depth, path) for root or a nested super_node."""
+    if not scope:
+        return graph, graph["nodes"], graph["edges"], 0, []
+
+    def search(
+        nodes: List[Dict[str, Any]], depth: int, path: List[str],
+    ) -> Optional[Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], int, List[str]]]:
+        for n in nodes:
+            if n["id"] == scope:
+                if n["status"] != "super_node":
+                    raise ArchEngineError(
+                        f"节点 '{scope}' 不是子系统超级节点（当前状态：{n['status']}），不能作为作用域。"
+                    )
+                return n, n["children"], n["inner_edges"], depth + 1, path + [scope]
+            if n["status"] == "super_node":
+                found = search(n.get("children", []), depth + 1, path + [n["id"]])
+                if found is not None:
+                    return found
+        return None
+
+    res = search(graph["nodes"], 0, [])
+    if res is None:
+        raise ArchEngineError(f"子系统作用域 '{scope}' 不存在。")
+    return res
+
+
+def _parent_container_of(graph: Dict[str, Any], target_id: str) -> Optional[Dict[str, Any]]:
+    """Return the immediate container (root graph or super_node) holding target_id."""
+    def search(container: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        for n in _container_nodes(container):
+            if n["id"] == target_id:
+                return container
+            if n["status"] == "super_node":
+                found = search(n)
+                if found is not None:
+                    return found
+        return None
+
+    return search(graph)
+
+
+def _max_subtree_depth(nodes: List[Dict[str, Any]]) -> int:
+    """Maximum nesting depth below a node list (0 when no super_nodes exist)."""
+    best = 0
+    for n in nodes:
+        if n.get("status") == "super_node":
+            best = max(best, 1 + _max_subtree_depth(n.get("children", [])))
+    return best
+
+
+def _active_topology(
+    container: Dict[str, Any], include_feedback: bool = True,
+) -> Tuple[Dict[str, List[str]], Dict[str, int], Dict[str, int]]:
+    """Adjacency and degrees of the active nodes (every node that is not fog)."""
+    nodes = _container_nodes(container)
+    edges = _container_edges(container)
+    active_ids = {n["id"] for n in nodes if n["status"] != "fog"}
     adj: Dict[str, List[str]] = {nid: [] for nid in active_ids}
     in_deg: Dict[str, int] = {nid: 0 for nid in active_ids}
     out_deg: Dict[str, int] = {nid: 0 for nid in active_ids}
-    for e in graph["edges"]:
+    for e in edges:
+        if not include_feedback and _is_feedback(e):
+            continue
         u, v = e["from"], e["to"]
         if u in active_ids and v in active_ids:
             adj[u].append(v)
             in_deg[v] += 1
             out_deg[u] += 1
+            if _edge_kind(e) == "bidirectional" and u != v:
+                adj[v].append(u)
+                in_deg[u] += 1
+                out_deg[v] += 1
     return adj, in_deg, out_deg
 
 
@@ -51,9 +166,9 @@ def _iter_all_nodes(nodes: List[Dict[str, Any]]):
         yield from _iter_all_nodes(n.get("children", []))
 
 
-def _find_container(graph: Dict[str, Any], node_id: str) -> Optional[Dict[str, Any]]:
-    """Return the top-level super node that (transitively) holds node_id."""
-    for n in graph["nodes"]:
+def _find_container(container: Dict[str, Any], node_id: str) -> Optional[Dict[str, Any]]:
+    """Return the direct super_node child of `container` that (transitively) holds node_id."""
+    for n in _container_nodes(container):
         if n["status"] == "super_node" and any(
             c["id"] == node_id for c in _iter_all_nodes(n.get("children", []))
         ):
@@ -61,32 +176,116 @@ def _find_container(graph: Dict[str, Any], node_id: str) -> Optional[Dict[str, A
     return None
 
 
-def _get_node(graph: Dict[str, Any], node_id: str, allow_super: bool = True) -> Dict[str, Any]:
-    """Look up a top-level node, with JIT guidance for folded or super nodes."""
-    for n in graph["nodes"]:
+def _get_node(
+    container: Dict[str, Any], node_id: str, allow_super: bool = True,
+) -> Dict[str, Any]:
+    """Look up a direct child node in `container`, with JIT guidance for super nodes."""
+    for n in _container_nodes(container):
         if n["id"] == node_id:
             if not allow_super and n["status"] == "super_node":
                 raise ArchEngineError(
                     f"节点 '{node_id}' 是折叠后的超级节点，不能直接执行该操作。\n"
-                    f"JIT 指令：先调用 arch_unfold(node_id='{node_id}') 展开，再对其中的子节点操作。"
+                    f"JIT 指令：可传入 --in {node_id} 进入该子系统操作其内部节点，或先调用 arch_unfold(node_id='{node_id}') 展开。"
                 )
             return n
-    container = _find_container(graph, node_id)
-    if container:
+    holder = _find_container(container, node_id)
+    if holder:
         raise ArchEngineError(
-            f"节点 '{node_id}' 已折叠在超级节点 '{container['id']}' 内。\n"
-            f"JIT 指令：先调用 arch_unfold(node_id='{container['id']}') 展开后再操作。"
+            f"节点 '{node_id}' 已折叠在超级节点 '{holder['id']}' 内。\n"
+            f"JIT 指令：使用 --in {holder['id']} 在子系统作用域内操作，或先调用 arch_unfold(node_id='{holder['id']}') 展开后再操作。"
         )
     raise ArchEngineError(f"节点 '{node_id}' 不存在。")
 
 
-def _next_focus_hole(graph: Dict[str, Any]) -> Optional[str]:
-    """Cognitive serialization: the most upstream hole is settled first."""
-    holes = [n["id"] for n in graph["nodes"] if n["status"] == "hole"]
+def _sccs(
+    node_ids: Iterable[str], edges: List[Dict[str, Any]], include_feedback: bool = True,
+) -> Dict[str, int]:
+    """Tarjan's strongly connected components: node_id -> component index."""
+    ids = list(node_ids)
+    id_set = set(ids)
+    adj: Dict[str, List[str]] = {nid: [] for nid in ids}
+    for e in edges:
+        if not include_feedback and _is_feedback(e):
+            continue
+        u, v = e["from"], e["to"]
+        if u in id_set and v in id_set:
+            adj[u].append(v)
+            if _edge_kind(e) == "bidirectional" and u != v:
+                adj[v].append(u)
+
+    index_counter = 0
+    indices: Dict[str, int] = {}
+    lowlink: Dict[str, int] = {}
+    stack: List[str] = []
+    on_stack: Set[str] = set()
+    comp_of: Dict[str, int] = {}
+    comp_id = 0
+
+    def strongconnect(v: str) -> None:
+        nonlocal index_counter, comp_id
+        indices[v] = lowlink[v] = index_counter
+        index_counter += 1
+        stack.append(v)
+        on_stack.add(v)
+        for w in adj[v]:
+            if w not in indices:
+                strongconnect(w)
+                lowlink[v] = min(lowlink[v], lowlink[w])
+            elif w in on_stack:
+                lowlink[v] = min(lowlink[v], indices[w])
+        if lowlink[v] == indices[v]:
+            while True:
+                w = stack.pop()
+                on_stack.remove(w)
+                comp_of[w] = comp_id
+                if w == v:
+                    break
+            comp_id += 1
+
+    for nid in ids:
+        if nid not in indices:
+            strongconnect(nid)
+    return comp_of
+
+
+def _next_focus_hole(container: Dict[str, Any]) -> Optional[str]:
+    """Cognitive serialization: pick the next hole to settle based on topology."""
+    nodes = _container_nodes(container)
+    holes = [n for n in nodes if n["status"] == "hole"]
     if not holes:
         return None
-    hole_ids = set(holes)
-    return next((nid for nid in _topological_order(graph) if nid in hole_ids), holes[0])
+    hole_ids = {n["id"] for n in holes}
+    topo = _container_topology(container)
+
+    if topo == "star":
+        hub_hole = next((n["id"] for n in holes if n.get("role") == "hub"), None)
+        if hub_hole:
+            return hub_hole
+        adj, in_deg, out_deg = _active_topology(container, include_feedback=True)
+        order_idx = {n["id"]: i for i, n in enumerate(nodes)}
+        return max(
+            (n["id"] for n in holes),
+            key=lambda nid: (in_deg.get(nid, 0) + out_deg.get(nid, 0), -order_idx[nid]),
+        )
+
+    if topo == "ring":
+        active = [n for n in nodes if n["status"] != "fog"]
+        start = next((n["id"] for n in active if n.get("role") == "entry"), active[0]["id"])
+        adj_pri, _, _ = _active_topology(container, include_feedback=False)
+        adj_all, _, _ = _active_topology(container, include_feedback=True)
+        visited: Set[str] = {start}
+        queue: deque = deque([start])
+        while queue:
+            curr = queue.popleft()
+            if curr in hole_ids:
+                return curr
+            for nxt in adj_pri.get(curr, []) + adj_all.get(curr, []):
+                if nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(nxt)
+        return holes[0]["id"]
+
+    return next((nid for nid in _topological_order(container) if nid in hole_ids), holes[0]["id"])
 
 
 def _compact_node(node: Dict[str, Any]) -> Dict[str, Any]:
@@ -95,10 +294,12 @@ def _compact_node(node: Dict[str, Any]) -> Dict[str, Any]:
         return node
     view = {k: v for k, v in node.items()
             if k not in ("children", "inner_edges")}
+    view["topology"] = _container_topology(node)
+    view["sub_ready"] = _is_super_ready(node)
     view["folded_children"] = [
-        {"id": c["id"], "label": c["label"]}
+        {"id": c["id"], "label": c["label"], "status": c["status"], "topology": _container_topology(c)}
         if c["status"] == "super_node" else
-        {"id": c["id"], "label": c["label"], "impl": _node_state(c)["impl"]}
+        {"id": c["id"], "label": c["label"], "status": c["status"], "impl": _node_state(c)["impl"]}
         for c in node["children"]
     ]
     leaves = [c for c in _iter_all_nodes(node["children"]) if c["status"] != "super_node"]
@@ -119,26 +320,48 @@ def _node_view(node: Dict[str, Any]) -> Dict[str, Any]:
     return view
 
 
-def _flatten_folds(graph: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str]]:
-    """Expand every super node into its original nodes and edges.
+def _is_super_ready(sn: Dict[str, Any], _seen: Optional[Set[str]] = None) -> bool:
+    """True when a super_node subsystem has a runnable walking skeleton under its own topology."""
+    if sn.get("status") != "super_node" or not sn.get("children"):
+        return False
+    seen = set(_seen or ())
+    if sn["id"] in seen:
+        return False
+    seen.add(sn["id"])
+    return bool(_container_skeleton(sn, _seen=seen))
 
-    Returns the flat graph and a map from each flat node to the top-level node
-    that currently shows it (itself, or the outermost super node holding it).
-    Edges are taken from their members, so an edge drawn to a module attaches
-    to the child it really reaches. An endpoint that is still a super node
-    (an edge attached while folded) resolves through the module's entry /
-    exit children; when there are several, the edge connects to all of them.
+
+def _flatten_folds(
+    container: Dict[str, Any], _seen: Optional[Set[str]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """Expand pipeline super_nodes into their original nodes and edges.
+
+    Heterogeneous subsystems (super_nodes with topology 'ring' or 'star') stay
+    atomic so their internal cycles or hub-spoke graphs never break the parent
+    pipeline's entry/exit analysis; their effective status is 'solid' iff their
+    own subsystem skeleton is ready, else 'hole'.
     """
     flat_nodes: List[Dict[str, Any]] = []
     top_of: Dict[str, str] = {}
     supers: Dict[str, Dict[str, Any]] = {}
-    for top in graph["nodes"]:
-        for n in _iter_all_nodes([top]):
-            if n["status"] == "super_node":
-                supers[n["id"]] = n
-            else:
-                flat_nodes.append(n)
-                top_of[n["id"]] = top["id"]
+
+    def walk(node: Dict[str, Any], top_id: str) -> None:
+        if node["status"] == "super_node":
+            if _container_topology(node) != "pipeline":
+                eff = dict(node)
+                eff["status"] = "solid" if _is_super_ready(node, _seen=_seen) else "hole"
+                flat_nodes.append(eff)
+                top_of[node["id"]] = top_id
+                return
+            supers[node["id"]] = node
+            for ch in node.get("children", []):
+                walk(ch, top_id)
+        else:
+            flat_nodes.append(node)
+            top_of[node["id"]] = top_id
+
+    for top in _container_nodes(container):
+        walk(top, top["id"])
 
     def resolve(nid: str, side: str, seen: frozenset = frozenset()) -> List[str]:
         if nid in top_of:
@@ -148,23 +371,28 @@ def _flatten_folds(graph: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str
         candidates = supers[nid]["entry_children" if side == "to" else "exit_children"]
         return [leaf for c in candidates for leaf in resolve(c, side, seen | {nid})]
 
-    raw = list(graph["edges"]) + [e for sn in supers.values() for e in sn.get("inner_edges", [])]
+    raw = list(_container_edges(container)) + [e for sn in supers.values() for e in sn.get("inner_edges", [])]
     flat_edges = []
     for e in raw:
+        ekind = _edge_kind(e)
         for m in _edge_members(e):
+            mkind = m.get("kind") or ekind
             # An endpoint that is still ambiguous connects to every candidate:
             # extra dependencies can only remove entries and exits, so the
             # skeleton is never reported ready on a guess.
             for u in resolve(m["from"], "from"):
                 for v in resolve(m["to"], "to"):
-                    flat_edges.append({"from": u, "to": v, "contract": m.get("contract", "")})
+                    fe: Dict[str, Any] = {"from": u, "to": v, "contract": m.get("contract", "")}
+                    if mkind != "primary":
+                        fe["kind"] = mkind
+                    flat_edges.append(fe)
     return {"nodes": flat_nodes, "edges": flat_edges}, top_of
 
 
-def _solid_path(graph: Dict[str, Any]) -> Optional[List[str]]:
-    """BFS for a path of >= 2 solid nodes from a real entry to a real exit."""
-    nodes = {n["id"]: n for n in graph["nodes"]}
-    adj, in_deg, out_deg = _active_topology(graph)
+def _solid_path(container: Dict[str, Any]) -> Optional[List[str]]:
+    """BFS for a path of >= 2 solid nodes from a real entry to a real exit (ignoring feedback edges)."""
+    nodes = {n["id"]: n for n in _container_nodes(container)}
+    adj, in_deg, out_deg = _active_topology(container, include_feedback=False)
     solid_ids = {nid for nid in adj if nodes[nid]["status"] in SOLID_STATUSES}
     starts = [nid for nid in adj if in_deg[nid] == 0 and nid in solid_ids]
     ends = {nid for nid in adj if out_deg[nid] == 0 and nid in solid_ids}
@@ -183,17 +411,95 @@ def _solid_path(graph: Dict[str, Any]) -> Optional[List[str]]:
     return None
 
 
-def _find_walking_skeleton(graph: Dict[str, Any]) -> Optional[List[str]]:
-    """A complete solid path from a real entry to a real exit, in top-level ids.
+def _effective_solid_ids(container: Dict[str, Any], _seen: Optional[Set[str]] = None) -> Set[str]:
+    solid: Set[str] = set()
+    for n in _container_nodes(container):
+        if n["status"] == "solid":
+            solid.add(n["id"])
+        elif n["status"] == "super_node" and _is_super_ready(n, _seen=_seen):
+            solid.add(n["id"])
+    return solid
 
-    Entries and exits are judged on the whole active graph (fog excluded), not on
-    the solid sub-graph alone; otherwise a solid node whose successor is still a
-    hole would wrongly count as an exit. Folded modules are expanded first, so a
-    path must really get through a module's interior (in through one child, out
-    through a reachable one); steps inside one module collapse to its id, and a
-    trunk folded whole is reported as that single module.
-    """
-    flat, top_of = _flatten_folds(graph)
+
+def _solid_ring(container: Dict[str, Any], _seen: Optional[Set[str]] = None) -> Optional[List[str]]:
+    """Find a directed cycle of >= 2 distinct solid nodes in a ring container."""
+    nodes = _container_nodes(container)
+    adj, _, _ = _active_topology(container, include_feedback=True)
+    solid_ids = _effective_solid_ids(container, _seen=_seen)
+    ordered = [n["id"] for n in nodes if n["id"] in solid_ids]
+    # Prefer starting from an explicit entry anchor so the reported cycle reads naturally.
+    anchors = [n["id"] for n in nodes if n["id"] in solid_ids and n.get("role") == "entry"]
+    starts = anchors + [nid for nid in ordered if nid not in anchors]
+
+    for s in starts:
+        queue: deque = deque([[s]])
+        visited: Set[str] = set()
+        while queue:
+            path = queue.popleft()
+            curr = path[-1]
+            for nxt in adj.get(curr, []):
+                if nxt == s and len(path) >= 2:
+                    return path + [s]
+                if nxt in solid_ids and nxt not in visited and nxt != s:
+                    visited.add(nxt)
+                    queue.append(path + [nxt])
+    return None
+
+
+def _star_hub_id(container: Dict[str, Any]) -> Optional[str]:
+    """Return the hub node id of a star container (role=='hub', else highest active degree)."""
+    nodes = [n for n in _container_nodes(container) if n["status"] != "fog"]
+    if not nodes:
+        return None
+    explicit = next((n["id"] for n in nodes if n.get("role") == "hub"), None)
+    if explicit:
+        return explicit
+    adj, in_deg, out_deg = _active_topology(container, include_feedback=True)
+    order_idx = {n["id"]: i for i, n in enumerate(nodes)}
+    return max(
+        (n["id"] for n in nodes),
+        key=lambda nid: (in_deg.get(nid, 0) + out_deg.get(nid, 0), -order_idx[nid]),
+    )
+
+
+def _solid_star(container: Dict[str, Any], _seen: Optional[Set[str]] = None) -> Optional[List[str]]:
+    """A star skeleton is ready when its hub and >= 2 connected spokes are solid."""
+    hub = _star_hub_id(container)
+    if not hub:
+        return None
+    solid_ids = _effective_solid_ids(container, _seen=_seen)
+    if hub not in solid_ids:
+        return None
+    nodes = _container_nodes(container)
+    active_ids = {n["id"] for n in nodes if n["status"] != "fog"}
+    neighbors: Set[str] = set()
+    for e in _container_edges(container):
+        u, v = e["from"], e["to"]
+        if u not in active_ids or v not in active_ids:
+            continue
+        if u == hub and v != hub:
+            neighbors.add(v)
+        elif v == hub and u != hub:
+            neighbors.add(u)
+    ordered_spokes = [n["id"] for n in nodes if n["id"] in neighbors and n["id"] in solid_ids]
+    all_spokes = [n["id"] for n in nodes if n["id"] in neighbors]
+    holes = [n for n in nodes if n["status"] == "hole"]
+    if len(ordered_spokes) >= 2 or (len(ordered_spokes) == 1 and len(all_spokes) == 1 and not holes):
+        return [hub, *ordered_spokes]
+    return None
+
+
+def _container_skeleton(
+    container: Dict[str, Any], _seen: Optional[Set[str]] = None,
+) -> Optional[List[str]]:
+    """Topology-aware walking skeleton for a single container (root or super_node)."""
+    topo = _container_topology(container)
+    if topo == "ring":
+        return _solid_ring(container, _seen=_seen)
+    if topo == "star":
+        return _solid_star(container, _seen=_seen)
+
+    flat, top_of = _flatten_folds(container, _seen=_seen)
     path = _solid_path(flat)
     if not path:
         return None
@@ -204,10 +510,27 @@ def _find_walking_skeleton(graph: Dict[str, Any]) -> Optional[List[str]]:
     return shown
 
 
-def _topological_order(graph: Dict[str, Any]) -> List[str]:
-    """Kahn order of the active graph; nodes left over (cycles) keep insertion order."""
-    adj, in_deg, _ = _active_topology(graph)
-    order_index = {n["id"]: i for i, n in enumerate(graph["nodes"])}
+def _find_walking_skeleton(graph: Dict[str, Any], scope: str = "") -> Optional[List[str]]:
+    """Find the walking skeleton of root or a named super_node subsystem."""
+    container, _, _, _, _ = _resolve_container(graph, scope)
+    return _container_skeleton(container)
+
+
+def _skeleton_banner(container: Dict[str, Any], skeleton: List[str]) -> str:
+    topo = _container_topology(container)
+    if topo == "ring":
+        return f"[WALKING_SKELETON_READY] 检测到无空洞可运行闭环: {' -> '.join(skeleton)}"
+    if topo == "star":
+        hub, spokes = skeleton[0], skeleton[1:]
+        return f"[WALKING_SKELETON_READY] 检测到无空洞可运行星形中枢: {hub} <-> [{', '.join(spokes)}]"
+    return f"[WALKING_SKELETON_READY] 检测到无空洞可运行主干: {' -> '.join(skeleton)}"
+
+
+def _topological_order(container: Dict[str, Any]) -> List[str]:
+    """Kahn order of the active container (ignoring feedback edges); cycles keep insertion order."""
+    nodes = _container_nodes(container)
+    adj, in_deg, _ = _active_topology(container, include_feedback=False)
+    order_index = {n["id"]: i for i, n in enumerate(nodes)}
     remaining = dict(in_deg)
     ready = sorted((nid for nid, d in remaining.items() if d == 0), key=order_index.get)
     order: List[str] = []
@@ -220,8 +543,120 @@ def _topological_order(graph: Dict[str, Any]) -> List[str]:
                 ready.append(nxt)
         ready.sort(key=order_index.get)
     seen = set(order)
-    order += [n["id"] for n in graph["nodes"] if n["id"] in adj and n["id"] not in seen]
+    order += [n["id"] for n in nodes if n["id"] in adj and n["id"] not in seen]
     return order
+
+
+def _longest_primary_chain(container: Dict[str, Any]) -> int:
+    """Longest directed node chain along primary (non-feedback, non-bidirectional) edges."""
+    nodes = _container_nodes(container)
+    active_ids = {n["id"] for n in nodes if n["status"] != "fog"}
+    if not active_ids:
+        return 0
+    adj: Dict[str, List[str]] = {nid: [] for nid in active_ids}
+    in_deg: Dict[str, int] = {nid: 0 for nid in active_ids}
+    for e in _container_edges(container):
+        if _edge_kind(e) != "primary":
+            continue
+        u, v = e["from"], e["to"]
+        if u in active_ids and v in active_ids and u != v:
+            adj[u].append(v)
+            in_deg[v] += 1
+    dist: Dict[str, int] = {nid: 1 for nid in active_ids}
+    queue = deque(nid for nid, d in in_deg.items() if d == 0)
+    while queue:
+        u = queue.popleft()
+        for v in adj[u]:
+            if dist[u] + 1 > dist[v]:
+                dist[v] = dist[u] + 1
+            in_deg[v] -= 1
+            if in_deg[v] == 0:
+                queue.append(v)
+    return max(dist.values(), default=0)
+
+
+def _max_active_degree(container: Dict[str, Any]) -> Tuple[str, int]:
+    """Highest distinct active-neighbor count in the container."""
+    nodes = _container_nodes(container)
+    active_ids = {n["id"] for n in nodes if n["status"] != "fog"}
+    nbrs: Dict[str, Set[str]] = {nid: set() for nid in active_ids}
+    for e in _container_edges(container):
+        u, v = e["from"], e["to"]
+        if u in active_ids and v in active_ids and u != v:
+            nbrs[u].add(v)
+            nbrs[v].add(u)
+    if not nbrs:
+        return "", 0
+    best_id = max(nbrs, key=lambda nid: len(nbrs[nid]))
+    return best_id, len(nbrs[best_id])
+
+
+def _shortest_active_cycle_len(container: Dict[str, Any]) -> int:
+    """Length (distinct nodes) of the main cycle in a ring container, or 0 if none."""
+    nodes = [n for n in _container_nodes(container) if n["status"] != "fog"]
+    if not nodes:
+        return 0
+    adj, _, _ = _active_topology(container, include_feedback=True)
+    anchors = [n["id"] for n in nodes if n.get("role") == "entry"] or [nodes[0]["id"]]
+    for s in anchors:
+        queue: deque = deque([(s, 0)])
+        visited: Set[str] = set()
+        while queue:
+            curr, d = queue.popleft()
+            for nxt in adj.get(curr, []):
+                if nxt == s and d + 1 >= 2:
+                    return d + 1
+                if nxt not in visited and nxt != s:
+                    visited.add(nxt)
+                    queue.append((nxt, d + 1))
+    return 0
+
+
+def _container_warnings(container: Dict[str, Any], cfg: Dict[str, Any]) -> List[str]:
+    """Preset-driven soft guardrail warnings for a container."""
+    nodes = _container_nodes(container)
+    holes = [n for n in nodes if n["status"] == "hole"]
+    solids = [n for n in nodes if n["status"] == "solid"]
+    topo = _container_topology(container)
+    warnings: List[str] = []
+
+    max_holes = int(cfg.get("max_active_holes", 3))
+    max_solids = int(cfg.get("max_unfolded_solid", 7))
+    max_chain = int(cfg.get("max_chain_len", 6))
+    max_hub = int(cfg.get("max_hub_degree", 6))
+    max_cycle = int(cfg.get("max_cycle_len", 5))
+
+    if len(holes) > max_holes:
+        warnings.append(
+            f"[CIRCUIT_BREAKER_WARNING] 当前未决空洞数 ({len(holes)}) 已超过上限 ({max_holes})！"
+            "请先收敛现有空洞，禁止继续发散新分支。"
+        )
+    if len(solids) > max_solids:
+        warnings.append(
+            f"[CIRCUIT_BREAKER_WARNING] 当前活跃实心节点 ({len(solids)}) 超过 {max_solids} 个，"
+            "建议调用 arch_fold 将已稳定的子图折叠为超级节点，以降低认知负荷。"
+        )
+    if topo == "pipeline":
+        chain = _longest_primary_chain(container)
+        if chain > max_chain:
+            warnings.append(
+                f"[CHAIN_TOO_LONG] 主干链长已达 {chain}（preset 上限 {max_chain}），"
+                "建议用 arch_fold 将连续稳定段折叠为子系统，或用 arch_config --max-chain-len 调整。"
+            )
+    if topo == "ring":
+        cyc = _shortest_active_cycle_len(container)
+        if cyc > max_cycle:
+            warnings.append(
+                f"[CYCLE_TOO_LONG] 主闭环长度已达 {cyc}（preset 上限 {max_cycle}），"
+                "建议用 arch_fold 收拢环内中间步骤，或用 arch_config --max-cycle-len 调整。"
+            )
+    top_node, deg = _max_active_degree(container)
+    if deg > max_hub:
+        warnings.append(
+            f"[HUB_OVERLOADED] 节点 '{top_node}' 连接了 {deg} 个活跃邻居（preset 上限 {max_hub}），"
+            "建议把同类分支收拢为子系统超级节点，或用 arch_config --max-hub-degree 调整。"
+        )
+    return warnings
 
 
 def _check_node_drift(node: Dict[str, Any]) -> None:
@@ -317,7 +752,7 @@ def _find_any_node(graph: Dict[str, Any], node_id: str) -> Optional[Dict[str, An
 def _reject_manual_super_type(node_type: str) -> None:
     if node_type == "super_node":
         raise ArchEngineError(
-            "超级节点只能通过 arch_fold 折叠已确定的子图生成，不能用 collapse / add-node 直接指定类型。"
+            "超级节点只能通过 arch_fold 折叠子图或 arch_promote 升级子系统生成，不能用 collapse / add-node 直接指定类型。"
         )
 
 
@@ -329,27 +764,39 @@ def _merge_contracts(contracts: List[str]) -> str:
 # Edge provenance for folding
 # ---------------------------
 # An edge that touches a super node may stand for several original edges. It
-# carries them in "members" (each a plain {from, to, contract}) together with
-# "auto_contract", the merged contract the engine wrote. Provenance lives on
-# the edge rather than inside the super node, so it travels with the edge when
-# the neighbour on the other side is folded or unfolded later, in any order.
+# carries them in "members" (each a plain {from, to, contract[, kind]}) together
+# with "auto_contract", the merged contract the engine wrote. Provenance lives
+# on the edge rather than inside the super node, so it travels with the edge
+# when the neighbour on the other side is folded or unfolded later, in any order.
 
 
 def _edge_members(e: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Original edges this edge stands for; a contract edited while folded wins."""
     members = e.get("members")
     if not members:
-        return [{"from": e["from"], "to": e["to"], "contract": e.get("contract", "")}]
+        item = {"from": e["from"], "to": e["to"], "contract": e.get("contract", "")}
+        if _edge_kind(e) != "primary":
+            item["kind"] = _edge_kind(e)
+        return [item]
     if "auto_contract" in e and e.get("contract") != e["auto_contract"]:
         return [{**m, "contract": e.get("contract", "")} for m in members]
     return [dict(m) for m in members]
 
 
 def _edge_from_members(u: str, v: str, members: List[Dict[str, Any]]) -> Dict[str, Any]:
+    kinds = {_edge_kind(m) for m in members}
     if len(members) == 1 and (members[0]["from"], members[0]["to"]) == (u, v):
-        return {"from": u, "to": v, "contract": members[0].get("contract", "")}
+        out: Dict[str, Any] = {"from": u, "to": v, "contract": members[0].get("contract", "")}
+        if _edge_kind(members[0]) != "primary":
+            out["kind"] = _edge_kind(members[0])
+        return out
     contract = _merge_contracts([m.get("contract", "") for m in members])
-    return {"from": u, "to": v, "contract": contract, "auto_contract": contract, "members": members}
+    out = {"from": u, "to": v, "contract": contract, "auto_contract": contract, "members": members}
+    if len(kinds) == 1:
+        only_kind = next(iter(kinds))
+        if only_kind != "primary":
+            out["kind"] = only_kind
+    return out
 
 
 def _public_edge(e: Dict[str, Any]) -> Dict[str, Any]:

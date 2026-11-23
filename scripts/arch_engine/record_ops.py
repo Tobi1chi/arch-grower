@@ -5,10 +5,10 @@ from datetime import datetime
 from typing import List, Optional, Union
 
 from .common import (
-    ARCH_DIR, ArchEngineError, GROUNDING_FILE, GROUND_TRUTH_FILE, _graph_if_any, _load_graph,
-    _shadow_commit, _today,
+    ARCH_DIR, ArchEngineError, GROUNDING_FILE, GROUND_TRUTH_FILE, _default_config, _graph_if_any,
+    _load_config, _load_graph, _save_config, _shadow_commit, _today,
 )
-from .graph import _find_any_node
+from .graph import _find_any_node, _validate_topology
 from .records import (
     LEGACY_GUIDE, NOT_MIGRATED_HINT, OPEN_KINDS, OPEN_OWNERS, _budget_warning, _context_keys,
     _fact_line, _global_fact_budget, _grave_line, _is_global, _load_records, _matches, _next_id,
@@ -278,13 +278,72 @@ def op_graveyard_add(node_id: str, scheme: str, reason: str) -> str:
     return f"已记入墓志：\n{_grave_line(entry)}"
 
 
-def op_config(global_fact_limit: Optional[int] = None) -> str:
-    rec = _load_records(for_write=global_fact_limit is not None)
-    if global_fact_limit is not None:
-        if global_fact_limit <= 0:
-            raise ArchEngineError("global 事实字数上限必须是正整数。")
-        rec["settings"]["global_fact_char_limit"] = int(global_fact_limit)
-        _save_records(rec)
-        _shadow_commit("config", f"config global_fact_char_limit={global_fact_limit}")
-    used, limit = _global_fact_budget(rec)
-    return f"global_fact_char_limit = {limit}（当前 global 事实 {used} 字符）"
+def op_config(
+    global_fact_limit: Optional[int] = None,
+    preset: Optional[str] = None,
+    default_topology: Optional[str] = None,
+    max_depth: Optional[int] = None,
+    max_chain_len: Optional[int] = None,
+    max_hub_degree: Optional[int] = None,
+    max_cycle_len: Optional[int] = None,
+    max_active_holes: Optional[int] = None,
+    max_unfolded_solid: Optional[int] = None,
+    auto_bridge_limit: Optional[int] = None,
+    allow_feedback: Optional[bool] = None,
+) -> str:
+    """View or update project preset / guardrail config (`.arch/config.json`) and global fact budget."""
+    cfg = _default_config(preset) if preset is not None else _load_config()
+    changed = preset is not None
+
+    if default_topology is not None:
+        cfg["default_topology"] = _validate_topology(default_topology)
+        changed = True
+
+    int_updates = {
+        "max_depth": max_depth,
+        "max_chain_len": max_chain_len,
+        "max_hub_degree": max_hub_degree,
+        "max_cycle_len": max_cycle_len,
+        "max_active_holes": max_active_holes,
+        "max_unfolded_solid": max_unfolded_solid,
+        "auto_bridge_limit": auto_bridge_limit,
+        "global_fact_char_limit": global_fact_limit,
+    }
+    for key, val in int_updates.items():
+        if val is not None:
+            if int(val) <= 0:
+                raise ArchEngineError(f"{key} 必须是正整数，收到：{val}。")
+            cfg[key] = int(val)
+            changed = True
+
+    if allow_feedback is not None:
+        cfg["allow_feedback"] = bool(allow_feedback)
+        changed = True
+
+    if changed:
+        _save_config(cfg)
+        if _records_enabled():
+            rec = _load_records(for_write=True)
+            rec["settings"]["global_fact_char_limit"] = int(cfg["global_fact_char_limit"])
+            _save_records(rec)
+        _shadow_commit("config", f"config preset={cfg['preset']}")
+
+    used_text = ""
+    if _records_enabled():
+        rec = _load_records(for_write=False)
+        used, limit = _global_fact_budget(rec)
+        if changed:
+            limit = int(cfg["global_fact_char_limit"])
+        used_text = f"（当前 global 事实 {used} 字符）"
+    else:
+        limit = int(cfg["global_fact_char_limit"])
+
+    lines = [
+        f"preset = {cfg['preset']} | default_topology = {cfg['default_topology']}",
+        f"max_depth = {cfg['max_depth']} | max_chain_len = {cfg['max_chain_len']} | "
+        f"max_hub_degree = {cfg['max_hub_degree']} | max_cycle_len = {cfg['max_cycle_len']}",
+        f"max_active_holes = {cfg['max_active_holes']} | max_unfolded_solid = {cfg['max_unfolded_solid']} | "
+        f"auto_bridge_limit = {cfg['auto_bridge_limit']} | allow_feedback = {cfg['allow_feedback']}",
+        f"global_fact_char_limit = {limit}{used_text}",
+    ]
+    return "\n".join(lines)
