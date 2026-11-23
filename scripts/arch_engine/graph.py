@@ -335,13 +335,22 @@ def _is_super_ready(sn: Dict[str, Any], _seen: Optional[Set[str]] = None) -> boo
 def _flatten_folds(
     container: Dict[str, Any], _seen: Optional[Set[str]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, str]]:
-    """Expand pipeline super_nodes into their original nodes and edges.
+    """Expand compatible super_nodes into their original nodes and edges.
 
-    Heterogeneous subsystems (super_nodes with topology 'ring' or 'star') stay
-    atomic so their internal cycles or hub-spoke graphs never break the parent
-    pipeline's entry/exit analysis; their effective status is 'solid' iff their
-    own subsystem skeleton is ready, else 'hole'.
+    - In a `pipeline` container: expand `pipeline` super_nodes; keep `ring` / `star` atomic.
+    - In a `ring` container: expand `ring` and `pipeline` super_nodes (so folding an
+      open arc or the whole ring preserves cycle readiness); keep `star` atomic.
+    - In a `star` container: expand `star` super_nodes (so folding a hub+spoke pair
+      or the whole star preserves star readiness); keep `pipeline` / `ring` spoke
+      subsystems atomic so their own readiness gates the spoke.
     """
+    parent_topo = _container_topology(container)
+    expandable = (
+        {"pipeline"} if parent_topo == "pipeline"
+        else {"ring", "pipeline"} if parent_topo == "ring"
+        else {"star"}
+    )
+
     flat_nodes: List[Dict[str, Any]] = []
     top_of: Dict[str, str] = {}
     supers: Dict[str, Dict[str, Any]] = {}
@@ -349,7 +358,7 @@ def _flatten_folds(
 
     def walk(node: Dict[str, Any], top_id: str) -> None:
         if node["status"] == "super_node":
-            if _container_topology(node) != "pipeline":
+            if _container_topology(node) not in expandable:
                 eff = dict(node)
                 eff["status"] = "solid" if _is_super_ready(node, _seen=_seen) else "hole"
                 flat_nodes.append(eff)
@@ -405,9 +414,16 @@ def _flatten_folds(
 
 
 def _solid_path(container: Dict[str, Any]) -> Optional[List[str]]:
-    """BFS for a path of >= 2 solid nodes from a real entry to a real exit (ignoring feedback edges)."""
+    """BFS for a path of >= 2 solid nodes from a real entry to a real exit.
+
+    Ignores feedback edges whenever the container has any non-feedback edges;
+    falls back to including feedback edges only when the container consists
+    solely of feedback edges (e.g. a folded feedback-only open arc).
+    """
     nodes = {n["id"]: n for n in _container_nodes(container)}
-    adj, in_deg, out_deg = _active_topology(container, include_feedback=False)
+    edges = _container_edges(container)
+    feedback_only = bool(edges) and all(_is_feedback(e) for e in edges)
+    adj, in_deg, out_deg = _active_topology(container, include_feedback=feedback_only)
     solid_ids = {nid for nid in adj if nodes[nid]["status"] in SOLID_STATUSES}
     starts = [nid for nid in adj if in_deg[nid] == 0 and nid in solid_ids]
     ends = {nid for nid in adj if out_deg[nid] == 0 and nid in solid_ids}
@@ -509,16 +525,29 @@ def _container_skeleton(
 ) -> Optional[List[str]]:
     """Topology-aware walking skeleton for a single container (root or super_node)."""
     topo = _container_topology(container)
-    if topo == "ring":
-        return _solid_ring(container, _seen=_seen)
-    if topo == "star":
-        return _solid_star(container, _seen=_seen)
-
     flat, top_of = _flatten_folds(container, _seen=_seen)
+
+    if topo == "ring":
+        path = _solid_ring(flat, _seen=_seen)
+        if not path:
+            return None
+        shown: List[str] = []
+        for nid in path:
+            tid = top_of[nid]
+            if not shown or shown[-1] != tid:
+                shown.append(tid)
+        return shown
+
+    if topo == "star":
+        path = _solid_star(flat, _seen=_seen)
+        if not path:
+            return None
+        return list(dict.fromkeys(top_of[nid] for nid in path))
+
     path = _solid_path(flat)
     if not path:
         return None
-    shown: List[str] = []
+    shown = []
     for nid in path:
         if not shown or shown[-1] != top_of[nid]:
             shown.append(top_of[nid])
@@ -536,6 +565,8 @@ def _skeleton_banner(container: Dict[str, Any], skeleton: List[str]) -> str:
     if topo == "ring":
         return f"[WALKING_SKELETON_READY] 检测到无空洞可运行闭环: {' -> '.join(skeleton)}"
     if topo == "star":
+        if len(skeleton) == 1:
+            return f"[WALKING_SKELETON_READY] 检测到无空洞可运行星形中枢: {skeleton[0]}"
         hub, spokes = skeleton[0], skeleton[1:]
         return f"[WALKING_SKELETON_READY] 检测到无空洞可运行星形中枢: {hub} <-> [{', '.join(spokes)}]"
     return f"[WALKING_SKELETON_READY] 检测到无空洞可运行主干: {' -> '.join(skeleton)}"

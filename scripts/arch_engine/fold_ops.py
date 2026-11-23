@@ -19,7 +19,8 @@ def _infer_folded_topology(
     """Infer an internal topology for a folded subgraph when none was given explicitly.
 
     Avoids inheriting `ring` onto an open arc (which has no internal cycle and
-    would make `_is_super_ready` permanently False).
+    would make `_is_super_ready` permanently False), while keeping star fragments
+    connected by bidirectional edges runnable as `star`.
     """
     hubs = [nid for nid, n in members.items() if n.get("role") == "hub"]
     for h in hubs:
@@ -27,13 +28,16 @@ def _infer_folded_topology(
             e["to"] if e["from"] == h else e["from"]
             for e in inner if h in (e["from"], e["to"]) and e["from"] != e["to"]
         }
-        if len(nbrs) >= 2:
+        if nbrs:
             return "star"
 
     directed_inner = [e for e in inner if _edge_kind(e) != "bidirectional"]
     scc_sizes = Counter(_sccs(members.keys(), directed_inner, include_feedback=True).values())
     if any(sz >= 2 for sz in scc_sizes.values()):
         return "ring"
+
+    if inner and all(_edge_kind(e) == "bidirectional" for e in inner):
+        return "star"
     return "pipeline"
 
 

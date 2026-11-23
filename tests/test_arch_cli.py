@@ -1101,6 +1101,41 @@ class MultiTopologyTest(EngineTestCase):
         self.assertIn("未自动缝合旁路", out)
         self.assertEqual(arch_cli._load_graph()["edges"], [])
 
+    def test_folding_feedback_arc_and_whole_ring_preserves_readiness(self) -> None:
+        # Codex round-3 regression: folding `act,perceive` (feedback-only arc) or
+        # folding the entire ring must preserve parent readiness.
+        arch_cli.op_init("Ring whole fold", topology="ring")
+        for nid in ("perceive", "decide", "act"):
+            self.collapse(nid)
+        out = arch_cli.op_fold(["act", "perceive"], "wrap", "回流感知", "spec")
+        self.assertIn("WALKING_SKELETON_READY", out)
+        self.assertEqual(
+            arch_cli._find_walking_skeleton(arch_cli._load_graph()),
+            ["wrap", "decide", "wrap"],
+        )
+        # Folding the remaining node together collapses the entire ring into one ready module.
+        out2 = arch_cli.op_fold(["wrap", "decide"], "loop_all", "完整闭环", "spec")
+        self.assertIn("[WALKING_SKELETON_READY] 检测到无空洞可运行闭环: loop_all", out2)
+        self.assertEqual(arch_cli._find_walking_skeleton(arch_cli._load_graph()), ["loop_all"])
+
+    def test_folding_star_pair_and_whole_star_preserves_readiness(self) -> None:
+        # Codex round-3 regression: folding `core_hub,spoke_a` (bidirectional pair) or
+        # folding the entire star must preserve parent readiness, and resetting hub clears it.
+        arch_cli.op_init("Star whole fold", topology="star")
+        for nid in ("core_hub", "spoke_a", "spoke_b"):
+            self.collapse(nid)
+        out = arch_cli.op_fold(["core_hub", "spoke_a"], "core_a", "中枢+A", "spec")
+        self.assertIn("WALKING_SKELETON_READY", out)
+        self.assertEqual(arch_cli._find_walking_skeleton(arch_cli._load_graph()), ["core_a", "spoke_b"])
+
+        out2 = arch_cli.op_fold(["core_a", "spoke_b"], "bus_all", "完整总线", "spec")
+        self.assertIn("[WALKING_SKELETON_READY] 检测到无空洞可运行星形中枢: bus_all", out2)
+        self.assertEqual(arch_cli._find_walking_skeleton(arch_cli._load_graph()), ["bus_all"])
+
+        # Resetting hub inside nested fold must immediately clear readiness.
+        arch_cli.op_reset_node("core_hub", "重选中枢", scope="core_a")
+        self.assertIsNone(arch_cli._find_walking_skeleton(arch_cli._load_graph()))
+
 
 class SubsystemSuperNodeTest(EngineTestCase):
     def test_promote_creates_isolated_subsystem_with_compositional_skeleton(self) -> None:
