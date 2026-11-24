@@ -1093,13 +1093,22 @@ class MultiTopologyTest(EngineTestCase):
         out3 = self.collapse("spoke_b")
         self.assertIn("[WALKING_SKELETON_READY] 检测到无空洞可运行星形中枢: core_hub <-> [spoke_a, spoke_b]", out3)
 
-    def test_star_hub_deactivate_guard_and_no_bridge(self) -> None:
+    def test_star_hub_deactivate_leaves_placeholder_slot(self) -> None:
         arch_cli.op_init("事件总线", topology="star")
-        with self.assertRaisesRegex(arch_cli.ArchEngineError, "AutoBridgeLimitError"):
-            arch_cli.op_deactivate_node("core_hub", "先下线")
-        out = arch_cli.op_deactivate_node("core_hub", "拆除", no_bridge=True)
-        self.assertIn("未自动缝合旁路", out)
-        self.assertEqual(arch_cli._load_graph()["edges"], [])
+        out = arch_cli.op_deactivate_node("core_hub", "先下线")
+        self.assertIn("core_hub_slot", out)
+        graph = arch_cli._load_graph()
+        slot = next(n for n in graph["nodes"] if n["id"] == "core_hub_slot")
+        self.assertEqual((slot["status"], slot["role"]), ("hole", "hub"))
+        self.assertEqual(next(n for n in graph["nodes"] if n["id"] == "core_hub")["status"], "fog")
+        # The star keeps its shape: every spoke now hangs off the slot.
+        self.assertEqual(
+            {(e["from"], e["to"], e.get("kind")) for e in graph["edges"]},
+            {("core_hub_slot", "spoke_a", "bidirectional"), ("core_hub_slot", "spoke_b", "bidirectional")},
+        )
+        # The slot is the next hole to settle.
+        from arch_engine.graph import _next_focus_hole
+        self.assertEqual(_next_focus_hole(graph), "core_hub_slot")
 
     def test_folding_feedback_arc_and_whole_ring_preserves_readiness(self) -> None:
         # Codex round-3 regression: folding `act,perceive` (feedback-only arc) or
@@ -1417,6 +1426,295 @@ class PresetAndBootstrapTest(EngineTestCase):
         self.assertIn("topology: ring", res)
         arch_mcp._dispatch_tool("arch_config", {"max_chain_len": 9})
         self.assertEqual(arch_cli._load_config()["max_chain_len"], 9)
+
+
+class ReviewRegressionTest(EngineTestCase):
+    """Regressions from the full PR 5 review."""
+
+    def _settle_trunk(self) -> None:
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+
+    def test_fold_rejects_new_primary_cycle_despite_feedback_edge(self) -> None:
+        self._settle_trunk()
+        arch_cli.op_connect("final_output", "entry_input", kind="feedback")
+        with self.assertRaises(arch_cli.ArchEngineError):
+            arch_cli.op_fold(["entry_input", "final_output"], "ends", "E", "spec")
+
+    def test_config_keeps_legacy_global_fact_limit(self) -> None:
+        arch_cli.op_config(global_fact_limit=5000)
+        Path(".arch/config.json").unlink()   # project from before config.json existed
+        arch_cli.op_config(max_depth=3)
+        self.assertEqual(_records()["settings"]["global_fact_char_limit"], 5000)
+        self.assertEqual(arch_cli._load_config()["global_fact_char_limit"], 5000)
+
+    def test_nested_scoped_fold_then_unfold_remaps_saved_ports(self) -> None:
+        arch_cli.op_config(max_depth=3)
+        arch_cli.op_promote("core_transform", topology="pipeline")
+        for nid in ("core_transform_in", "core_transform_core", "core_transform_out"):
+            arch_cli.op_collapse(nid, nid, "spec", scope="core_transform")
+        arch_cli.op_fold(["core_transform_in", "core_transform_core"], "front", "F", "s", scope="core_transform")
+        arch_cli.op_fold(["core_transform_in", "core_transform_core"], "inner", "I", "s", scope="front")
+        arch_cli.op_unfold("front", scope="core_transform")
+        ct = _node("core_transform")
+        self.assertEqual(ct["entry_children"], ["inner"])
+        arch_cli.op_unfold("core_transform")
+        edges = {(e["from"], e["to"]) for e in arch_cli._load_graph()["edges"]}
+        self.assertIn(("entry_input", "inner"), edges)
+
+    def test_deactivate_implicit_hub_keeps_edges_on_slot(self) -> None:
+        arch_cli.op_init("Star", topology="star")
+        graph = arch_cli._load_graph()
+        for n in graph["nodes"]:
+            n.pop("role", None)
+        arch_cli._save_graph(graph)
+        arch_cli.op_deactivate_node("core_hub")
+        edges = {(e["from"], e["to"]) for e in arch_cli._load_graph()["edges"]}
+        self.assertEqual(edges, {("core_hub_slot", "spoke_a"), ("core_hub_slot", "spoke_b")})
+
+    def test_deactivate_over_bridge_limit_slot_keeps_folded_provenance(self) -> None:
+        # Fan-in 3 x fan-out 2 = 6 bypass edges > auto_bridge_limit (4): leave a slot.
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+        for nid in ("src_b", "src_c"):
+            arch_cli.op_add_node(nid, nid, "spec", status="solid", before_node="core_transform")
+        arch_cli.op_add_node("sink_b", "sink_b", "spec", status="solid", after_node="core_transform")
+        arch_cli.op_add_node("sink_c", "sink_c", "spec", status="solid", after_node="sink_b")
+        arch_cli.op_fold(["sink_b", "sink_c"], "tail", "T", "spec")
+        out = arch_cli.op_deactivate_node("core_transform")
+        self.assertIn("core_transform_slot", out)
+        graph = arch_cli._load_graph()
+        edges = {(e["from"], e["to"]) for e in graph["edges"]}
+        self.assertEqual(edges, {
+            ("entry_input", "core_transform_slot"), ("src_b", "core_transform_slot"),
+            ("src_c", "core_transform_slot"), ("core_transform_slot", "final_output"),
+            ("core_transform_slot", "tail"),
+        })
+        # Fold provenance follows the slot, so unfolding restores the edge onto it.
+        self.assertNotIn('"core_transform"', json.dumps(graph["edges"]))
+        arch_cli.op_unfold("tail")
+        edges = {(e["from"], e["to"]) for e in arch_cli._load_graph()["edges"]}
+        self.assertIn(("core_transform_slot", "sink_b"), edges)
+
+    def test_deactivate_simple_chain_still_bridges(self) -> None:
+        out = arch_cli.op_deactivate_node("core_transform")
+        self.assertIn("已自动缝合主干旁路", out)
+        edges = {(e["from"], e["to"]) for e in arch_cli._load_graph()["edges"]}
+        self.assertEqual(edges, {("entry_input", "final_output")})
+
+    def test_fork_with_legacy_tracked_dashboard(self) -> None:
+        from arch_engine.common import _run_shadow_git
+        arch_cli.op_export_ui()
+        # Pre-whitelist snapshots staged the whole .arch/ dir, dashboard included.
+        _run_shadow_git(["add", "-f", ".arch/dashboard.html"])
+        _run_shadow_git(["commit", "-m", "legacy"])
+        _run_shadow_git(["tag", "-f", "legacy-tag"])
+        Path(".arch/dashboard.html").write_text("<!-- v2 -->", encoding="utf-8")
+        _run_shadow_git(["add", "-f", ".arch/dashboard.html"])
+        _run_shadow_git(["commit", "-m", "legacy2"])
+        Path(".arch/dashboard.html").write_text("<!-- newest -->", encoding="utf-8")
+        arch_cli.op_fork("legacy-tag")
+        self.assertEqual(Path(".arch/dashboard.html").read_text(encoding="utf-8"), "<!-- newest -->")
+        self.collapse("entry_input")
+        tracked = _run_shadow_git(["ls-files", "--", ".arch"]).stdout.split()
+        self.assertNotIn(".arch/dashboard.html", tracked)
+
+    def test_bidirectional_edge_keeps_pipeline_skeleton(self) -> None:
+        self._settle_trunk()
+        arch_cli.op_set_edge_contract("entry_input", "core_transform", "req/resp", kind="bidirectional")
+        self.assertEqual(
+            arch_cli._find_walking_skeleton(arch_cli._load_graph()),
+            ["entry_input", "core_transform", "final_output"],
+        )
+
+    def test_promote_guards_implemented_node_and_moves_kept_files(self) -> None:
+        self._settle_trunk()
+        Path("impl.py").write_text("x = 1\n", encoding="utf-8")
+        arch_cli.op_commit_node("core_transform", "impl.py")
+        with self.assertRaises(arch_cli.ArchEngineError):
+            arch_cli.op_promote("core_transform")
+        arch_cli.op_reset_node("core_transform", "split into a subsystem")
+        out = arch_cli.op_promote("core_transform", topology="pipeline")
+        self.assertIn("core_transform_core", out)
+        ct = _node("core_transform")
+        self.assertNotIn("file_path", ct)
+        core = next(c for c in ct["children"] if c["id"] == "core_transform_core")
+        self.assertEqual(core["file_path"], "impl.py")
+
+    def test_cycle_guard_sees_long_loop_behind_short_feedback(self) -> None:
+        from arch_engine.graph import _container_warnings
+        arch_cli.op_init("Ring", topology="ring")
+        for i in range(4):
+            arch_cli.op_add_node(f"step{i}", f"s{i}", "spec", status="solid")
+        graph = arch_cli._load_graph()
+        chain = ["perceive", "decide", "step0", "step1", "step2", "step3", "act"]
+        graph["edges"] = [{"from": a, "to": b, "contract": ""} for a, b in zip(chain, chain[1:])]
+        graph["edges"] += [
+            {"from": "act", "to": "perceive", "contract": "", "kind": "feedback"},
+            {"from": "decide", "to": "perceive", "contract": "", "kind": "feedback"},
+        ]
+        warnings = _container_warnings(graph, arch_cli._load_config())
+        self.assertTrue(any("CYCLE_TOO_LONG" in w for w in warnings), warnings)
+
+
+def _edge(u: str, v: str, edges=None) -> dict:
+    edges = arch_cli._load_graph()["edges"] if edges is None else edges
+    return next(e for e in edges if e["from"] == u and e["to"] == v)
+
+
+class EdgeSpliceTest(EngineTestCase):
+    """Inserting a node between two linked nodes splits their edge, keeping it."""
+
+    def test_add_node_into_ring_feedback_keeps_return_kind(self) -> None:
+        arch_cli.op_init("Ring", topology="ring")
+        arch_cli.op_add_node("verify", "Verify", "spec", status="solid", after_node="act", before_node="perceive")
+        self.assertNotIn("kind", _edge("act", "verify"))
+        back = _edge("verify", "perceive")
+        self.assertEqual(back.get("kind"), "feedback")
+        self.assertEqual(back["contract"], "TBD (闭环反馈)")
+        self.assertFalse(any(e["from"] == "act" and e["to"] == "perceive" for e in arch_cli._load_graph()["edges"]))
+
+    def test_activate_into_ring_feedback_and_explicit_kind_override(self) -> None:
+        arch_cli.op_init("Ring", topology="ring", preset="agent")
+        arch_cli.op_config(max_active_holes=9)
+        arch_cli.op_add_node("log", "Log", "spec", status="fog")
+        arch_cli.op_activate_node("log", after_node="act", before_node="perceive")
+        self.assertEqual(_edge("log", "perceive").get("kind"), "feedback")
+        self.assertNotIn("kind", _edge("act", "log"))
+        arch_cli.op_add_node("trace", "Trace", "spec", status="fog")
+        arch_cli.op_activate_node("trace", after_node="perceive", before_node="decide", edge_kind="bidirectional")
+        self.assertEqual(_edge("perceive", "trace").get("kind"), "bidirectional")
+        self.assertEqual(_edge("trace", "decide").get("kind"), "bidirectional")
+
+    def test_insert_into_reversed_bidirectional_link(self) -> None:
+        arch_cli.op_init("Star", topology="star")
+        arch_cli.op_add_node("proxy", "Proxy", "spec", status="solid", after_node="spoke_a", before_node="core_hub")
+        edges = arch_cli._load_graph()["edges"]
+        self.assertEqual(_edge("spoke_a", "proxy", edges).get("kind"), "bidirectional")
+        self.assertEqual(_edge("proxy", "core_hub", edges).get("kind"), "bidirectional")
+        self.assertFalse(any({e["from"], e["to"]} == {"core_hub", "spoke_a"} for e in edges))
+
+    def test_insert_after_folded_node_keeps_provenance(self) -> None:
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+        arch_cli.op_fold(["entry_input", "core_transform"], "front", "Front", "spec")
+        arch_cli.op_add_node("mid", "Mid", "spec", after_node="front", before_node="final_output")
+        arch_cli.op_unfold("front")
+        edges = {(e["from"], e["to"]) for e in arch_cli._load_graph()["edges"]}
+        self.assertIn(("core_transform", "mid"), edges)
+        self.assertIn(("mid", "final_output"), edges)
+        self.assertNotIn(("core_transform", "final_output"), edges)
+
+
+class RingMainLoopTest(EngineTestCase):
+    """A ring is ready only when its main loop, not a side retry loop, is solid."""
+
+    def _ring_with_retry(self) -> None:
+        arch_cli.op_init("Ring", topology="ring")
+        self.collapse("decide")
+        self.collapse("act")
+        arch_cli.op_connect("act", "decide", kind="feedback")
+
+    def test_retry_loop_is_not_the_main_loop(self) -> None:
+        from arch_engine.graph import _find_walking_skeleton
+        self._ring_with_retry()
+        self.assertIsNone(_find_walking_skeleton(arch_cli._load_graph()))
+        out = self.collapse("perceive")
+        self.assertIn("perceive -> decide -> act -> perceive", out)
+
+    def test_retry_loop_without_entry_role_uses_largest_loop(self) -> None:
+        from arch_engine.graph import _find_walking_skeleton
+        self._ring_with_retry()
+        graph = arch_cli._load_graph()
+        for n in graph["nodes"]:
+            n.pop("role", None)
+        arch_cli._save_graph(graph)
+        self.assertIsNone(_find_walking_skeleton(arch_cli._load_graph()))
+
+
+class ModeTest(EngineTestCase):
+    """basic keeps a project on the minimal pipeline path; advanced unlocks the rest."""
+
+    def _drop_mode_key(self) -> None:
+        cfg_path = Path(".arch/config.json")
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        raw.pop("mode", None)
+        cfg_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    def test_new_project_is_basic_and_gates_advanced_commands(self) -> None:
+        from arch_engine.common import _require_command
+        self.assertEqual(arch_cli._load_config()["mode"], "basic")
+        self.assertIn("mode=basic", arch_cli.op_status())
+        with self.assertRaises(arch_cli.ArchEngineError) as ctx:
+            _require_command("promote")
+        self.assertIn("ADVANCED_MODE_REQUIRED", str(ctx.exception))
+        _require_command("collapse")   # basic commands pass
+        _require_command("set-node-state")
+        out = arch_cli.op_config(mode="advanced")
+        self.assertIn("mode = advanced", out)
+        _require_command("promote")
+
+    def test_init_with_advanced_topology_or_preset_starts_advanced(self) -> None:
+        out = arch_cli.op_init("Ring", topology="ring")
+        self.assertIn("[MODE]", out)
+        self.assertEqual(arch_cli._load_config()["mode"], "advanced")
+        arch_cli.op_init("Platform", preset="platform")
+        self.assertEqual(arch_cli._load_config()["mode"], "advanced")
+        with self.assertRaises(arch_cli.ArchEngineError):
+            arch_cli.op_init("Star", topology="star", mode="basic")
+        arch_cli.op_init("Pipe", preset="lean")
+        self.assertEqual(arch_cli._load_config()["mode"], "basic")
+
+    def test_config_preset_switch_keeps_or_upgrades_mode(self) -> None:
+        out = arch_cli.op_config(preset="agent")
+        self.assertIn("已自动切换", out)
+        self.assertEqual(arch_cli._load_config()["mode"], "advanced")
+        arch_cli.op_config(preset="lean")   # switching preset keeps the mode
+        self.assertEqual(arch_cli._load_config()["mode"], "advanced")
+        arch_cli.op_config(mode="basic")
+        self.assertEqual(arch_cli._load_config()["mode"], "basic")
+        with self.assertRaises(arch_cli.ArchEngineError):
+            arch_cli.op_config(preset="platform", mode="basic")
+
+    def test_cannot_downgrade_once_advanced_features_are_used(self) -> None:
+        arch_cli.op_config(mode="advanced")
+        arch_cli.op_promote("core_transform", topology="ring")
+        with self.assertRaises(arch_cli.ArchEngineError):
+            arch_cli.op_config(mode="basic")
+
+    def test_projects_from_before_modes_are_detected(self) -> None:
+        self._drop_mode_key()
+        self.assertEqual(arch_cli._load_config()["mode"], "basic")
+        arch_cli.op_promote("core_transform", topology="star")
+        self._drop_mode_key()
+        self.assertEqual(arch_cli._load_config()["mode"], "advanced")
+
+    def test_project_with_unmigrated_records_is_advanced(self) -> None:
+        self._drop_mode_key()
+        Path(".arch/records.json").unlink()
+        self.assertEqual(arch_cli._load_config()["mode"], "advanced")
+
+    def test_mcp_basic_tool_list_and_gate(self) -> None:
+        basic = arch_mcp._tools_for_mode("basic")
+        names = {t["name"] for t in basic}
+        self.assertNotIn("arch_fold", names)
+        self.assertNotIn("arch_graveyard_add", names)
+        self.assertIn("arch_set_node_state", names)
+        self.assertEqual(len(arch_mcp._tools_for_mode("advanced")), len(arch_mcp.TOOLS))
+        self.assertTrue(all("scope" not in t["inputSchema"].get("properties", {}) for t in basic))
+        self.assertIn("scope", next(t for t in arch_mcp.TOOLS if t["name"] == "arch_focus")["inputSchema"]["properties"])
+        with self.assertRaises(arch_cli.ArchEngineError):
+            arch_mcp._dispatch_tool("arch_graveyard_add", {"node_id": "entry_input", "scheme": "s", "reason": "r"})
+        arch_mcp._dispatch_tool("arch_config", {"mode": "advanced"})
+        self.assertIn("arch_fold", {t["name"] for t in arch_mcp._tools_for_mode(arch_cli._load_config()["mode"])})
+
+    def test_basic_fold_warning_mentions_advanced_mode(self) -> None:
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+        arch_cli.op_config(max_chain_len=2)
+        out = arch_cli.op_focus()
+        self.assertIn("arch_fold", out)
+        self.assertIn("advanced 模式", out)
 
 
 if __name__ == "__main__":

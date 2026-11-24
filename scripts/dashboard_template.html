@@ -129,6 +129,9 @@
   }
   .node.super { box-shadow: 4px 4px 0 var(--shadow), 8px 8px 0 -2px var(--surface), 8px 8px 0 0 var(--ink); }
   .node.super .qicon { background: var(--accent); color: #fff; }
+  .thumb { flex: none; overflow: visible; }
+  .thumb .tl { fill: none; stroke: var(--ink); stroke-width: 1.4; stroke-linecap: round; }
+  .thumb .td { stroke: var(--ink); stroke-width: 1.3; }
   .node.super.unready { border-style: dashed; }
   .node.dim, .group.dim { opacity: .34; }
   .node.match { outline: 3px dashed var(--accent); outline-offset: 4px; }
@@ -481,6 +484,7 @@
   var predA = new Map(), succA = new Map();
   var nextFocus = null, skeleton = null, skelEdges = new Set(), curWarnings = [];
   var boxes = new Map(), groups = [], nodeEls = new Map(), edgeEls = [], mainPath = [];
+  var edgeRoutes = new Map();   // 'from\u0000to' -> waypoints of a rank-skipping pipeline edge
   var WORLD_W = 1, WORLD_H = 1;
   var matches = null;
 
@@ -510,6 +514,47 @@
     var r = roleOf(n);
     return { text: r.replace(/_/g, ' '), bg: FAM[famFor(r)].tag };
   }
+  // A 34x22 sketch of a subsystem's inside: its direct children laid out by the
+  // subsystem's own topology, each dot coloured by status (settled / hole /
+  // nested subsystem). Up to 7 children are drawn.
+  var THUMB_FILL = { solid: '#36a872', hole: '#f6cf5a', super_node: '#7c6cf0' };
+  function subsystemThumb(n) {
+    var topo = (SUBSYSTEMS[n.id] && SUBSYSTEMS[n.id].topology) || n.topology || 'pipeline';
+    var kids = (n.children || []).filter(function (k) { return k.status !== 'fog'; }).slice(0, 7);
+    // Kept flat so the type chip above and the progress pill below never cover it.
+    var g = sv('svg', { 'class': 'thumb', width: 34, height: 22, viewBox: '0 0 34 22', 'aria-hidden': 'true' });
+    var CX = 17, CY = 11, pts = [];
+    if (!kids.length) return g;
+    if (topo === 'star') {
+      var hi = kids.findIndex(function (k) { return k.role === 'hub'; });
+      if (hi < 0) hi = 0;
+      var rest = kids.filter(function (_, i) { return i !== hi; });
+      pts.push({ k: kids[hi], x: CX, y: CY, r: 3.8 });
+      rest.forEach(function (k, i) {
+        // Two spokes form a V above the hub so it never reads as a 3-dot pipeline.
+        var a = rest.length === 2 ? -3 * Math.PI / 4 + i * Math.PI / 2
+          : -Math.PI / 2 + (2 * Math.PI * i) / rest.length;
+        var p = { k: k, x: CX + Math.cos(a) * 13, y: CY + Math.sin(a) * 7.5, r: 2.8 };
+        g.appendChild(sv('line', { x1: CX, y1: CY, x2: p.x, y2: p.y, 'class': 'tl' }));
+        pts.push(p);
+      });
+    } else if (topo === 'ring') {
+      g.appendChild(sv('ellipse', { cx: CX, cy: CY, rx: 12.5, ry: 7.5, 'class': 'tl' }));
+      kids.forEach(function (k, i) {
+        var a = -Math.PI / 2 + (2 * Math.PI * i) / kids.length;
+        pts.push({ k: k, x: CX + Math.cos(a) * 12.5, y: CY + Math.sin(a) * 7.5, r: 2.9 });
+      });
+    } else {
+      var m = kids.length, x0 = m > 1 ? 3.5 : CX, stepX = m > 1 ? 27 / (m - 1) : 0;
+      kids.forEach(function (k, i) { pts.push({ k: k, x: x0 + i * stepX, y: CY + (m > 3 ? (i % 2 ? 3.5 : -3.5) : 0), r: 2.9 }); });
+      g.appendChild(sv('polyline', { points: pts.map(function (p) { return p.x + ',' + p.y; }).join(' '), 'class': 'tl' }));
+    }
+    pts.forEach(function (p) {
+      g.appendChild(sv('circle', { cx: p.x, cy: p.y, r: p.r, fill: THUMB_FILL[p.k.status] || '#e9e4da', 'class': 'td' }));
+    });
+    return g;
+  }
+
   function nodeWidth(n, kind) {
     if (kind === 'seed') {
       var w0 = textW(trunc(title, 22), '800 17px ' + FONT) + 68;
@@ -520,7 +565,7 @@
       return Math.round(Math.min(240, Math.max(124, wb)));
     }
     var label = displayLabel(n);
-    var iconW = n.status === 'solid' ? 13 : 21;
+    var iconW = n.status === 'solid' ? 13 : (n.status === 'super_node' ? 34 : 21);
     var w = textW(label, (n.role === 'hub' ? '800 16px ' : '650 15px ') + FONT) + 47 + iconW + 8;
     var tw = tagW(tagFor(n).text) + 24;
     w = Math.max(w, tw);
@@ -549,11 +594,18 @@
 
   // ------------------------------------------------------- layout engines
   function buildPipelineLayout(hasSeed, bPorts) {
-    // Topological order on non-feedback edges so feedback arcs do not warp ranks.
+    // Layered (Sugiyama-style) layout:
+    //   1. rank nodes along non-feedback edges (longest path from the sources);
+    //   2. give every edge that skips ranks a chain of invisible waypoints, one
+    //      per skipped column, so it gets its own lane instead of being drawn
+    //      straight through the nodes in between;
+    //   3. reorder each column by neighbour barycenters to cut crossings;
+    //   4. place columns vertically: the main path stays on row 0, everything
+    //      else settles near its neighbours while keeping column order.
     var pPred = new Map(), pSucc = new Map();
     active.forEach(function (n) { pPred.set(n.id, []); pSucc.set(n.id, []); });
     aEdges.forEach(function (e) {
-      if (e.kind === 'feedback') return;
+      if (e.kind === 'feedback' || e.from === e.to) return;
       pSucc.get(e.from).push(e.to);
       pPred.get(e.to).push(e.from);
     });
@@ -584,10 +636,14 @@
       order.forEach(function (id) { if (dist.get(id) > dist.get(endId)) endId = id; });
       for (var cur = endId; cur; cur = prevL.get(cur)) mainPath.unshift(cur);
     }
-
     var onMain = new Set(mainPath);
+
+    // A dead-end side branch (one parent, no children) sits in its parent's
+    // column, directly under it. Sinks fed by several nodes or marked as the
+    // exit keep their own column.
     order.forEach(function (id) {
-      if (onMain.has(id) || pSucc.get(id).length || !pPred.get(id).length) return;
+      if (onMain.has(id) || pSucc.get(id).length || pPred.get(id).length !== 1) return;
+      if (byId.get(id).role === 'exit') return;
       var anchor = null;
       pPred.get(id).forEach(function (pv) { if (!anchor || rank.get(pv) > rank.get(anchor)) anchor = pv; });
       var st = String(byId.get(id).stage || '').trim();
@@ -595,25 +651,103 @@
       rank.set(id, rank.get(anchor));
     });
 
-    var rowOf = new Map();
-    mainPath.forEach(function (id) { rowOf.set(id, 0); });
-    var cols = new Map(), maxCol = 0;
+    var maxCol = 0;
+    order.forEach(function (id) { maxCol = Math.max(maxCol, rank.get(id)); });
+
+    // Layer items: real nodes plus waypoints for rank-skipping edges.
+    var layers = [], item = new Map();
+    for (var c = 0; c <= maxCol + 1; c++) layers.push([]);
     order.forEach(function (id) {
-      var c = rank.get(id); maxCol = Math.max(maxCol, c);
-      if (!cols.has(c)) cols.set(c, []);
-      cols.get(c).push(id);
+      var it = { id: id, col: rank.get(id), real: true, half: (byId.get(id).role === 'hub' ? 56 : NODE_H) / 2 + 37 };
+      item.set(id, it); layers[it.col].push(id);
     });
-    for (var c = 1; c <= maxCol; c++) {
-      var ids = cols.get(c) || [];
-      var used = new Set();
-      ids.forEach(function (id) { if (rowOf.has(id)) used.add(rowOf.get(id)); });
-      ids.forEach(function (id) {
-        if (rowOf.has(id)) return;
-        var pr = pPred.get(id).filter(function (p) { return rowOf.has(p); }).map(function (p) { return rowOf.get(p); });
-        var want = pr.length ? Math.round(pr.reduce(function (a, b) { return a + b; }, 0) / pr.length) : 0;
-        var seq = [want];
-        for (var k = 1; k < 60; k++) seq.push(want + k, want - k);
-        for (var s = 0; s < seq.length; s++) if (!used.has(seq[s])) { rowOf.set(id, seq[s]); used.add(seq[s]); break; }
+    var adjUp = new Map(), adjDown = new Map(), sameCol = new Map();
+    function link(a, b) {
+      var ca = item.get(a).col, cb = item.get(b).col;
+      if (ca === cb) {
+        if (!sameCol.has(a)) sameCol.set(a, []); if (!sameCol.has(b)) sameCol.set(b, []);
+        sameCol.get(a).push(b); sameCol.get(b).push(a); return;
+      }
+      var lo = ca < cb ? a : b, hi = ca < cb ? b : a;
+      if (!adjDown.has(lo)) adjDown.set(lo, []); adjDown.get(lo).push(hi);
+      if (!adjUp.has(hi)) adjUp.set(hi, []); adjUp.get(hi).push(lo);
+    }
+    var routeOf = new Map();
+    aEdges.forEach(function (e) {
+      if (e.kind === 'feedback' || e.from === e.to) return;
+      var cu = rank.get(e.from), cv = rank.get(e.to);
+      if (cv - cu > 1) {
+        var prev = e.from, chain = [];
+        for (var k = cu + 1; k < cv; k++) {
+          var did = '__w_' + e.from + '\u0000' + e.to + '\u0000' + k;
+          item.set(did, { id: did, col: k, real: false, half: 13 });
+          layers[k].push(did); chain.push(did);
+          link(prev, did); prev = did;
+        }
+        link(prev, e.to);
+        routeOf.set(e.from + '\u0000' + e.to, chain);
+      } else {
+        link(e.from, e.to);
+      }
+    });
+
+    // Crossing reduction: alternate downward / upward barycenter sweeps.
+    var pos = new Map();
+    function index() { layers.forEach(function (L) { L.forEach(function (id, i) { pos.set(id, i); }); }); }
+    index();
+    function bary(id, nbrMap) {
+      var ns = (nbrMap.get(id) || []).concat((sameCol.get(id) || []));
+      if (!ns.length) return pos.get(id);
+      var sum = 0;
+      ns.forEach(function (n) { sum += pos.get(n) + ((sameCol.get(id) || []).indexOf(n) >= 0 ? 0.5 : 0); });
+      return sum / ns.length;
+    }
+    for (var it2 = 0; it2 < 12; it2++) {
+      var down = it2 % 2 === 0;
+      for (var li = down ? 1 : maxCol; down ? li <= maxCol : li >= 1; li += down ? 1 : -1) {
+        var L = layers[li];
+        var key = new Map(L.map(function (id) { return [id, bary(id, down ? adjUp : adjDown)]; }));
+        L.sort(function (a, b) { return key.get(a) - key.get(b) || pos.get(a) - pos.get(b); });
+        L.forEach(function (id, i) { pos.set(id, i); });
+      }
+    }
+
+    // Vertical placement. Main-path nodes are fixed at 0; each column keeps
+    // its order with a minimum gap, others pulled towards their neighbours.
+    var y = new Map();
+    layers.forEach(function (L) {
+      var acc = 0;
+      L.forEach(function (id, i) {
+        if (i) acc += item.get(L[i - 1]).half + item.get(id).half;
+        y.set(id, acc);
+      });
+      var mainIdx = L.findIndex(function (id) { return onMain.has(id); });
+      var shift = mainIdx >= 0 ? -y.get(L[mainIdx]) : 0;
+      L.forEach(function (id) { y.set(id, y.get(id) + shift); });
+    });
+    function sep(a, b) { return item.get(a).half + item.get(b).half; }
+    for (var pass = 0; pass < 8; pass++) {
+      layers.forEach(function (L) {
+        if (!L.length) return;
+        var want = L.map(function (id) {
+          if (onMain.has(id)) return 0;
+          var ns = (adjUp.get(id) || []).concat(adjDown.get(id) || []);
+          if (!ns.length) return y.get(id);
+          return ns.reduce(function (s, n) { return s + y.get(n); }, 0) / ns.length;
+        });
+        var mainIdx = L.findIndex(function (id) { return onMain.has(id); });
+        if (mainIdx >= 0) {
+          y.set(L[mainIdx], 0);
+          for (var i = mainIdx + 1; i < L.length; i++) y.set(L[i], Math.max(want[i], y.get(L[i - 1]) + sep(L[i - 1], L[i])));
+          for (var j = mainIdx - 1; j >= 0; j--) y.set(L[j], Math.min(want[j], y.get(L[j + 1]) - sep(L[j], L[j + 1])));
+        } else {
+          var ys = [];
+          for (var m = 0; m < L.length; m++) ys.push(m ? Math.max(want[m], ys[m - 1] + sep(L[m - 1], L[m])) : want[m]);
+          var off = 0;
+          for (m = 0; m < L.length; m++) off += ys[m] - want[m];
+          off /= L.length;
+          for (m = 0; m < L.length; m++) y.set(L[m], ys[m] - off);
+        }
       });
     }
 
@@ -621,27 +755,86 @@
     colW[0] = hasSeed ? nodeWidth(null, 'seed') : (bPorts.in.length ? Math.max.apply(null, bPorts.in.map(function (p) { return nodeWidth(p, 'boundary'); })) : 0);
     for (c = 1; c <= maxCol; c++) colW[c] = 0;
     active.forEach(function (n) { n._w = nodeWidth(n); colW[rank.get(n.id)] = Math.max(colW[rank.get(n.id)], n._w); });
-    var outColW = bPorts.out.length ? Math.max.apply(null, bPorts.out.map(function (p) { return nodeWidth(p, 'boundary'); })) : 0;
+    for (c = 1; c <= maxCol; c++) if (!colW[c] && layers[c].length) colW[c] = 60;   // waypoint-only column
     var colX = [], xAcc = 0;
     for (c = 0; c <= maxCol; c++) { colX[c] = xAcc; if (colW[c]) xAcc += colW[c] + GAP_X; }
 
     if (hasSeed) boxes.set('__seed__', { x: 0, y: -SEED_H / 2, w: colW[0], h: SEED_H });
     bPorts.in.forEach(function (p, i) {
       var w = nodeWidth(p, 'boundary');
-      var y = (i - (bPorts.in.length - 1) / 2) * 76 - 22;
-      boxes.set(p.id, { x: colX[0] + (colW[0] - w), y: y, w: w, h: 44 });
+      var yy = (i - (bPorts.in.length - 1) / 2) * 76 - 22;
+      boxes.set(p.id, { x: colX[0] + (colW[0] - w), y: yy, w: w, h: 44 });
     });
     bPorts.out.forEach(function (p, i) {
       var w = nodeWidth(p, 'boundary');
-      var y = (i - (bPorts.out.length - 1) / 2) * 76 - 22;
-      boxes.set(p.id, { x: xAcc, y: y, w: w, h: 44 });
+      var yy = (i - (bPorts.out.length - 1) / 2) * 76 - 22;
+      boxes.set(p.id, { x: xAcc, y: yy, w: w, h: 44 });
     });
     active.forEach(function (n) {
       var cc = rank.get(n.id);
       var nh = n.role === 'hub' ? 56 : NODE_H;
-      boxes.set(n.id, { x: colX[cc] + (colW[cc] - n._w) / 2, y: rowOf.get(n.id) * ROW_H - nh / 2, w: n._w, h: nh });
+      boxes.set(n.id, { x: colX[cc] + (colW[cc] - n._w) / 2, y: y.get(n.id) - nh / 2, w: n._w, h: nh });
+    });
+    // Waypoint lanes: the edge runs straight across each skipped column at its own height.
+    routeOf.forEach(function (chain, key) {
+      edgeRoutes.set(key, chain.map(function (did) {
+        var cc = item.get(did).col, yy = y.get(did);
+        return [{ x: colX[cc] - 6, y: yy }, { x: colX[cc] + colW[cc] + 6, y: yy }];
+      }).reduce(function (a, b) { return a.concat(b); }, []));
     });
     return { guides: [] };
+  }
+
+  // Order spokes around the hub so that spokes linked to each other (directly,
+  // or through a shared outer node) sit next to each other: their links then
+  // run along the rim instead of cutting across the hub. Greedy chain grown
+  // from both ends: always add the unplaced spoke most connected to either end
+  // of the chain; ties go to the same stage, then overall connectedness, then
+  // stage order.
+  function orderSpokes(spokes, outer) {
+    var base = spokes.slice().sort(function (a, b) { return String(a.stage || '').localeCompare(String(b.stage || '')); });
+    if (base.length < 3) return base;
+    var idx = new Map(base.map(function (n, i) { return [n.id, i]; }));
+    var wt = base.map(function () { return base.map(function () { return 0; }); });
+    function add(a, b, v) { if (a === b || !idx.has(a) || !idx.has(b)) return; wt[idx.get(a)][idx.get(b)] += v; wt[idx.get(b)][idx.get(a)] += v; }
+    aEdges.forEach(function (e) { add(e.from, e.to, 1); });
+    var outerIds = new Set(outer.map(function (n) { return n.id; }));
+    var viaOuter = new Map();
+    aEdges.forEach(function (e) {
+      var o = outerIds.has(e.from) ? e.from : (outerIds.has(e.to) ? e.to : null);
+      var sp = o === e.from ? e.to : e.from;
+      if (!o || !idx.has(sp)) return;
+      if (!viaOuter.has(o)) viaOuter.set(o, []);
+      viaOuter.get(o).push(sp);
+    });
+    viaOuter.forEach(function (list) {
+      for (var i = 0; i < list.length; i++) for (var j = i + 1; j < list.length; j++) add(list[i], list[j], 0.5);
+    });
+    var total = wt.map(function (row) { return row.reduce(function (s, v) { return s + v; }, 0); });
+    if (!total.some(function (t) { return t > 0; })) return base;
+    function lexGreater(k1, k2) {
+      for (var t = 0; t < k1.length; t++) if (k1[t] !== k2[t]) return k1[t] > k2[t];
+      return false;
+    }
+    var placed = [], left = new Set(base.map(function (_, i) { return i; }));
+    var start = 0;
+    left.forEach(function (i) { if (total[i] > total[start]) start = i; });
+    placed.push(start); left.delete(start);
+    function sameStage(a, b) { return String(base[a].stage || '') === String(base[b].stage || '') ? 1 : 0; }
+    while (left.size) {
+      var head = placed[0], tail = placed[placed.length - 1], best = -1, bestKey = null, atHead = false;
+      left.forEach(function (i) {
+        var toAll = placed.reduce(function (s, p) { return s + wt[p][i]; }, 0);
+        // Tail first, so a tie keeps the plain forward order.
+        [[tail, false], [head, true]].forEach(function (end) {
+          var key = [wt[end[0]][i], sameStage(end[0], i), toAll, -i];
+          if (!bestKey || lexGreater(key, bestKey)) { best = i; bestKey = key; atHead = end[1]; }
+        });
+      });
+      if (atHead) placed.unshift(best); else placed.push(best);
+      left.delete(best);
+    }
+    return placed.map(function (i) { return base[i]; });
   }
 
   function buildStarLayout(hasSeed, bPorts) {
@@ -668,8 +861,7 @@
     });
     var spokes = active.filter(function (n) { return n.id !== hub.id && nbrSet.has(n.id); });
     var outer = active.filter(function (n) { return n.id !== hub.id && !nbrSet.has(n.id); });
-    // Group same-stage spokes in adjacent angular sectors.
-    spokes.sort(function (a, b) { return String(a.stage || '').localeCompare(String(b.stage || '')); });
+    spokes = orderSpokes(spokes, outer);
 
     var r1 = Math.max(255, spokes.length * 46);
     guides.push({ cx: 0, cy: 0, rx: r1 + 40, ry: r1 * 0.78 + 18 });
@@ -682,15 +874,7 @@
     });
 
     var r2 = r1 + 195;
-    outer.forEach(function (n, i) {
-      var parentAng = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(1, outer.length);
-      aEdges.forEach(function (e) {
-        if (e.to === n.id && angleOf.has(e.from)) parentAng = angleOf.get(e.from);
-        else if (e.from === n.id && angleOf.has(e.to)) parentAng = angleOf.get(e.to);
-      });
-      var w = nodeWidth(n), cx = Math.cos(parentAng) * (r2 + 40), cy = Math.sin(parentAng) * (r2 * 0.78);
-      boxes.set(n.id, { x: cx - w / 2, y: cy - NODE_H / 2, w: w, h: NODE_H });
-    });
+    fanOut(outer, angleOf, r2 + 40, r2 * 0.78);
 
     var leftX = -(outer.length ? r2 : r1) - 290;
     var rightX = (outer.length ? r2 : r1) + 200;
@@ -707,6 +891,36 @@
       boxes.set(p.id, { x: rightX, y: (i - (bPorts.out.length - 1) / 2) * 76 - 22, w: w, h: 44 });
     });
     return { guides: guides };
+  }
+
+  // Place off-circle nodes on an outer ellipse next to the circle node they
+  // attach to. Siblings that share a parent spread into a fan around the
+  // parent's angle instead of stacking on one ray.
+  function fanOut(list, angleOf, ox, oy) {
+    var groupsByAng = new Map(), orderKeys = [];
+    list.forEach(function (n, i) {
+      var ang = null;
+      aEdges.forEach(function (e) {
+        if (ang !== null) return;
+        if (e.to === n.id && angleOf.has(e.from)) ang = angleOf.get(e.from);
+        else if (e.from === n.id && angleOf.has(e.to)) ang = angleOf.get(e.to);
+      });
+      if (ang === null) ang = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(1, list.length);
+      var k = ang.toFixed(4);
+      if (!groupsByAng.has(k)) { groupsByAng.set(k, { ang: ang, members: [] }); orderKeys.push(k); }
+      groupsByAng.get(k).members.push(n);
+    });
+    var r = (ox + oy) / 2;
+    orderKeys.forEach(function (k) {
+      var g = groupsByAng.get(k), m = g.members.length;
+      var step = Math.min(0.5, (NODE_H + 70) / r);   // ~120px of arc between siblings
+      g.members.forEach(function (n, j) {
+        var a = g.ang + (j - (m - 1) / 2) * step;
+        var w = nodeWidth(n), cx = Math.cos(a) * ox, cy = Math.sin(a) * oy;
+        angleOf.set(n.id, a);
+        boxes.set(n.id, { x: cx - w / 2, y: cy - NODE_H / 2, w: w, h: NODE_H });
+      });
+    });
   }
 
   function buildRingLayout(hasSeed, bPorts) {
@@ -748,15 +962,7 @@
       boxes.set(id, { x: cx - w / 2, y: cy - NODE_H / 2, w: w, h: NODE_H });
     });
 
-    sideNodes.forEach(function (n, i) {
-      var ang = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(1, sideNodes.length);
-      aEdges.forEach(function (e) {
-        if (e.to === n.id && angleOf.has(e.from)) ang = angleOf.get(e.from);
-        else if (e.from === n.id && angleOf.has(e.to)) ang = angleOf.get(e.to);
-      });
-      var w = nodeWidth(n), cx = Math.cos(ang) * (rx + 230), cy = Math.sin(ang) * (ry + 165);
-      boxes.set(n.id, { x: cx - w / 2, y: cy - NODE_H / 2, w: w, h: NODE_H });
-    });
+    fanOut(sideNodes, angleOf, rx + 230, ry + 165);
 
     var leftX = -(rx + (sideNodes.length ? 300 : 190));
     var rightX = rx + (sideNodes.length ? 260 : 170);
@@ -773,6 +979,53 @@
       boxes.set(p.id, { x: rightX, y: (i - (bPorts.out.length - 1) / 2) * 76 - 22, w: w, h: 44 });
     });
     return { guides: guides };
+  }
+
+  // Constrained overlap repulsion, run once after a layout. Only boxes that
+  // really overlap (plus a small margin) are pushed apart, and only along the
+  // axis that keeps the layout's meaning: vertically in a pipeline (columns
+  // stay columns), radially around the centre in star / ring (angles stay).
+  // No randomness and a fixed iteration cap, so every export looks the same.
+  function relaxOverlaps() {
+    var ids = Array.from(boxes.keys());
+    var main = new Set(mainPath);
+    // pinned never move; main-path nodes move only when the other one is pinned too.
+    var pinned = new Set(['__seed__']);
+    if (curLayout === 'pipeline' || curLayout === 'star') mainPath.forEach(function (id) { pinned.add(id); });
+    var GX = 26, GY = 20;
+    function ctr(b) { return { x: b.x + b.w / 2, y: b.y + b.h / 2 }; }
+    for (var iter = 0; iter < 40; iter++) {
+      var moved = false;
+      for (var i = 0; i < ids.length; i++) {
+        for (var j = i + 1; j < ids.length; j++) {
+          var A = boxes.get(ids[i]), B = boxes.get(ids[j]);
+          var ox = Math.min(A.x + A.w, B.x + B.w) + GX - Math.max(A.x, B.x);
+          var oy = Math.min(A.y + A.h, B.y + B.h) + GY - Math.max(A.y, B.y);
+          if (ox <= 0 || oy <= 0) continue;
+          var pa = pinned.has(ids[i]), pb = pinned.has(ids[j]);
+          if (pa && pb) continue;
+          moved = true;
+          if (curLayout === 'pipeline') {
+            var down = ctr(B).y >= ctr(A).y ? 1 : -1;
+            if (pa) B.y += down * oy;
+            else if (pb) A.y -= down * oy;
+            else { A.y -= down * oy / 2; B.y += down * oy / 2; }
+            continue;
+          }
+          // Radial: move the free box, preferring off-ring nodes, else the outer one.
+          var ca = ctr(A), cb = ctr(B), mover;
+          if (pa || pb) mover = pa ? B : A;
+          else if (main.has(ids[i]) !== main.has(ids[j])) mover = main.has(ids[i]) ? B : A;
+          else mover = Math.hypot(cb.x, cb.y) >= Math.hypot(ca.x, ca.y) ? B : A;
+          var c = ctr(mover), r = Math.hypot(c.x, c.y);
+          var ux = r > 1 ? c.x / r : 0, uy = r > 1 ? c.y / r : 1;
+          var step = Math.min(Math.abs(ux) > 0.05 ? ox / Math.abs(ux) : Infinity, Math.abs(uy) > 0.05 ? oy / Math.abs(uy) : Infinity);
+          step = Math.min(isFinite(step) ? step : oy, 160);
+          mover.x += ux * step; mover.y += uy * step;
+        }
+      }
+      if (!moved) break;
+    }
   }
 
   // ------------------------------------------------------- edge geometry
@@ -817,6 +1070,9 @@
       return curvedBetween(a, b, 34);
     }
     var ax = a.x + a.w, ay = a.y + a.h / 2, bx = b.x, by = b.y + b.h / 2;
+    if (opts.route && opts.route.length) {
+      return { d: smoothThrough([{ x: ax, y: ay }].concat(opts.route, [{ x: bx, y: by }])), gap: 150 };
+    }
     if (bx - ax > 24) {
       var k = Math.max(30, (bx - ax) / 2);
       return { d: 'M' + ax + ',' + ay + ' C' + (ax + k) + ',' + ay + ' ' + (bx - k) + ',' + by + ' ' + bx + ',' + by, gap: bx - ax };
@@ -831,6 +1087,17 @@
       return { d: 'M' + acx + ',' + a.y + ' C' + acx + ',' + (a.y - kk) + ' ' + bcx + ',' + (b.y + b.h + kk) + ' ' + bcx + ',' + (b.y + b.h), gap: 150 };
     }
     return curvedBetween(a, b, 90);
+  }
+  // Left-to-right curve through points, leaving and entering each point horizontally.
+  function smoothThrough(pts) {
+    var d = 'M' + pts[0].x + ',' + pts[0].y;
+    for (var i = 1; i < pts.length; i++) {
+      var p = pts[i - 1], q = pts[i];
+      if (Math.abs(q.y - p.y) < 0.5) { d += ' L' + q.x + ',' + q.y; continue; }
+      var k = Math.max(18, (q.x - p.x) / 2);
+      d += ' C' + (p.x + k) + ',' + p.y + ' ' + (q.x - k) + ',' + q.y + ' ' + q.x + ',' + q.y;
+    }
+    return d;
   }
   function vPath(x1, y1, x2, y2) {
     var m = (y2 - y1) / 2;
@@ -910,13 +1177,18 @@
     });
 
     boxes = new Map();
+    edgeRoutes = new Map();
     groups = [];
-    var hasSeed = !scopeId && !!seedText;
+    // The seed reads as "idea -> entry" only in a left-to-right pipeline; in star
+    // and ring layouts it would steal a slot on the circle (the title pill above
+    // already carries it).
+    var hasSeed = !scopeId && !!seedText && curLayout === 'pipeline';
     var layoutRes = curLayout === 'star'
       ? buildStarLayout(hasSeed, bPorts)
       : curLayout === 'ring'
         ? buildRingLayout(hasSeed, bPorts)
         : buildPipelineLayout(hasSeed, bPorts);
+    relaxOverlaps();
 
     // Stage groups (in pipeline mode, bounding box around each stage's active nodes)
     if (curLayout === 'pipeline') {
@@ -998,6 +1270,7 @@
     groups.forEach(function (g) { g.x += dx; g.y += dy; });
     fogLinks.forEach(function (l) { l.ax += dx; if (l.ay != null) l.ay += dy; });
     layoutRes.guides.forEach(function (g) { g.cx += dx; g.cy += dy; });
+    edgeRoutes.forEach(function (pts) { pts.forEach(function (pt) { pt.x += dx; pt.y += dy; }); });
     WORLD_W = maxX - minX + PAD * 2;
     WORLD_H = maxY - minY + PAD * 2;
 
@@ -1061,7 +1334,7 @@
           el.classList.add('super');
           var sinfo = SUBSYSTEMS[n.id];
           if (sinfo && !sinfo.ready) el.classList.add('unready');
-          el.appendChild(h('span', 'qicon', String(childCount(n))));
+          el.appendChild(subsystemThumb(n));
           el.addEventListener('dblclick', function (ev) { ev.stopPropagation(); enterScope(n.id); });
         } else {
           var dot = h('span', 'dot'); dot.style.setProperty('--c', FAM[famFor(roleOf(n))].dot); el.appendChild(dot);
@@ -1076,6 +1349,13 @@
         } else if (n.status === 'super_node') {
           var lv = leavesOf(n), nb = lv.filter(function (c) { return stateOf(c.id).impl === 'built'; }).length;
           if (nb) el.appendChild(h('span', 'impl-pill' + (nb === lv.length ? ' built' : ' building'), nb + '/' + lv.length + ' 已实现'));
+          else {
+            // Not implemented yet: show how far the inside has been decided instead.
+            var kids = (n.children || []).filter(function (c) { return c.status !== 'fog'; });
+            var settled = kids.filter(function (c) { return c.status === 'solid' || c.status === 'super_node'; }).length;
+            var ready = !!(SUBSYSTEMS[n.id] && SUBSYSTEMS[n.id].ready);
+            el.appendChild(h('span', 'impl-pill' + (ready ? ' built' : ''), (ready ? '已贯通 · ' : '已确定 ') + settled + '/' + kids.length));
+          }
         }
         if (id === nextFocus) el.appendChild(h('span', 'next-pill', '下一个决定'));
         el.title = displayLabel(n) + (n.spec ? '\n' + n.spec : '') + (n.status === 'super_node' ? '\n（双击进入子系统）' : '');
@@ -1093,6 +1373,59 @@
     nodes.forEach(function (n) { makeNode(n.id, n); });
 
     edgeEls = [];
+
+    // Edge routing that steers around node boxes: try the layout's own path
+    // first, then detour lanes (pipeline) or stronger bends (star / ring), and
+    // keep whichever candidate crosses the fewest other nodes.
+    var probe = sv('path', { d: 'M0,0', fill: 'none' });
+    probe.style.visibility = 'hidden';
+    svg.appendChild(probe);
+    function crossedBoxes(d, skip) {
+      probe.setAttribute('d', d);
+      var len = probe.getTotalLength(), hit = new Set();
+      for (var t = 8; t < len - 8; t += 9) {
+        var pt = probe.getPointAtLength(t);
+        boxes.forEach(function (b, id) {
+          if (hit.has(id) || skip.indexOf(id) >= 0) return;
+          if (pt.x > b.x - 5 && pt.x < b.x + b.w + 5 && pt.y > b.y - 5 && pt.y < b.y + b.h + 5) hit.add(id);
+        });
+      }
+      return hit;
+    }
+    function routeEdge(fromId, toId, opts) {
+      opts = opts || {};
+      var a = boxes.get(fromId), b = boxes.get(toId);
+      var base = sidePath(a, b, opts);
+      if (opts.feedback && curLayout === 'pipeline') return base;   // feedback lanes already run below everything
+      var skip = [fromId, toId];
+      var hit = crossedBoxes(base.d, skip);
+      if (!hit.size) return base;
+      var best = base, bestN = hit.size, cands = [];
+      var ax = a.x + a.w, ay = a.y + a.h / 2, bx = b.x, by = b.y + b.h / 2;
+      if (curLayout === 'pipeline' && !opts.reversePair && bx - ax > 24) {
+        var obs = Array.from(hit).map(function (id) { return boxes.get(id); });
+        var x0 = Math.max(ax + 20, Math.min.apply(null, obs.map(function (o) { return o.x; })) - 26);
+        var x1 = Math.min(bx - 20, Math.max.apply(null, obs.map(function (o) { return o.x + o.w; })) + 26);
+        var top = Math.min.apply(null, obs.map(function (o) { return o.y; })) - 30;
+        var bot = Math.max.apply(null, obs.map(function (o) { return o.y + o.h; })) + 30;
+        var mid = (ay + by) / 2;
+        [top, bot].sort(function (p1, p2) { return Math.abs(p1 - mid) - Math.abs(p2 - mid); }).forEach(function (lane) {
+          var pts = [{ x: ax, y: ay }];
+          if (x1 > x0) pts.push({ x: x0, y: lane }, { x: x1, y: lane });
+          else pts.push({ x: (ax + bx) / 2, y: lane });
+          pts.push({ x: bx, y: by });
+          cands.push({ d: smoothThrough(pts), gap: base.gap });
+        });
+      } else {
+        [70, -70, 140, -140, 210, -210].forEach(function (bend) { cands.push(curvedBetween(a, b, bend)); });
+      }
+      for (var i = 0; i < cands.length && bestN; i++) {
+        var n = crossedBoxes(cands[i].d, skip).size;
+        if (n < bestN) { best = cands[i]; bestN = n; }
+      }
+      return best;
+    }
+
     function addEdge(path, cls, meta) {
       var p = sv('path', { d: path.d, 'class': 'edge ' + cls });
       var isFogLink = cls.indexOf('foglink') >= 0;
@@ -1119,7 +1452,6 @@
 
     // Seed edges: attach to zero-indegree nodes, else entry/hub anchor so rings & stars never orphan IDEA.
     if (hasSeed) {
-      var sb = boxes.get('__seed__');
       var seedTargets = [];
       if (curTopology === 'star') {
         var hNode = active.find(function (n) { return n.role === 'hub'; }) || active[0];
@@ -1135,7 +1467,7 @@
       }
       seedTargets.forEach(function (n) {
         var onSkel = skeleton && skeleton[0] === n.id;
-        addEdge(sidePath(sb, boxes.get(n.id)), onSkel ? 'skeleton' : '', { from: '__seed__', to: n.id, contract: '', kind: 'primary' });
+        addEdge(routeEdge('__seed__', n.id), onSkel ? 'skeleton' : '', { from: '__seed__', to: n.id, contract: '', kind: 'primary' });
       });
     }
 
@@ -1146,12 +1478,12 @@
     if (!exitIds.length && active.length) exitIds = [active[active.length - 1].id];
     bPorts.in.forEach(function (p) {
       entryIds.forEach(function (eid) {
-        addEdge(sidePath(boxes.get(p.id), boxes.get(eid)), 'boundarylink', { from: p.id, to: eid, contract: p.contract, kind: 'primary' });
+        addEdge(routeEdge(p.id, eid), 'boundarylink', { from: p.id, to: eid, contract: p.contract, kind: 'primary' });
       });
     });
     bPorts.out.forEach(function (p) {
       exitIds.forEach(function (xid) {
-        addEdge(sidePath(boxes.get(xid), boxes.get(p.id)), 'boundarylink', { from: xid, to: p.id, contract: p.contract, kind: 'primary' });
+        addEdge(routeEdge(xid, p.id), 'boundarylink', { from: xid, to: p.id, contract: p.contract, kind: 'primary' });
       });
     });
 
@@ -1172,7 +1504,7 @@
       var laneY = bandBottom + dy + 56 + (fbIdx * 36);
       if (e.kind === 'feedback') fbIdx++;
       addEdge(
-        sidePath(boxes.get(e.from), boxes.get(e.to), { feedback: e.kind === 'feedback', reversePair: hasReverse, laneY: laneY }),
+        routeEdge(e.from, e.to, { feedback: e.kind === 'feedback', reversePair: hasReverse, laneY: laneY, route: edgeRoutes.get(key) }),
         clsList.join(' '),
         e
       );
@@ -1187,6 +1519,7 @@
         : { from: l.fog, to: '__group__', contract: '', kind: 'primary' };
       addEdge({ d: d, gap: 150 }, 'foglink', meta);
     });
+    probe.remove();
 
     renderBadges();
     if (!keepSelection || !boxes.has(state.selected)) state.selected = null;

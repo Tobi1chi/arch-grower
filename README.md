@@ -213,14 +213,15 @@ arch-grower/
 │   └── examples/            # 可直接打开的看板示例 HTML
 ├── references/
 │   ├── onboarding_tutorial.md   # 5 分钟交互式新手演练剧本
-│   ├── topology_patterns.md     # 多拓扑（流水线 / 星形 / 环形）、子系统与 Preset 指南
+│   ├── advanced.md              # basic / advanced 模式、切换时机、子系统与记录维护
+│   ├── topology_patterns.md     # 多拓扑（流水线 / 星形 / 环形）、子系统与 Preset 指南（advanced）
 │   ├── stage_patterns.md        # 阶段内并发并行与多态设计模式
 │   ├── execution_and_hotswap.md # 初次交付、已落地节点变更与热替换
 │   └── grounding_guide.md       # 现实世界黑盒约束与硬件边界确认指南
 └── （目标项目中）.arch/
     ├── scripts/             # 内嵌零依赖 CLI 引擎（arch bootstrap / init --embed 生成，不进 Shadow Git）
     ├── SEED.md              # 一句话初始意图
-    ├── config.json          # 项目 preset 与架构护栏（max_depth / max_chain_len / ...）
+    ├── config.json          # 项目模式（basic / advanced）、preset 与架构护栏（max_depth / max_chain_len / ...）
     ├── graph.json           # 架构图：顶层与子系统拓扑、节点、连线、折叠模块、节点状态
     ├── records.json         # 事实、墓志、待办项、迁移原文（唯一数据源）
     ├── ground_truth.md      # 由 records.json 生成，只读
@@ -292,10 +293,10 @@ ln -s ~/.agents/skills/arch-grower ~/.gemini/config/skills/arch-grower
 本引擎零第三方依赖，推荐在初始化时用 `--embed`（或对已有项目运行一次 `bootstrap`）直接将脚本拷贝到项目 `.arch/scripts/` 下，此后直接用 `python3` 运行，无需 `uv run --no-project`：
 
 ```bash
-# 1. 首次初始化并内嵌 CLI 到当前项目的 .arch/scripts/（可选 --topology pipeline|star|ring 与 --preset standard|lean|agent|platform）
+# 1. 首次初始化并内嵌 CLI 到当前项目的 .arch/scripts/（默认 basic 模式：一条流水线）
 python3 "/实际安装路径/arch-grower/scripts/arch_cli.py" init \
   --seed "实时多模态翻译耳机，BLE 输入到骨传导输出" \
-  --embed --topology pipeline --preset standard
+  --embed
 
 # 之后在项目根目录直接运行内置脚本：
 arch() { python3 .arch/scripts/arch_cli.py "$@"; }
@@ -313,12 +314,13 @@ arch collapse \
 # 4. 在已有节点间补连回流闭环或双向边
 arch connect --from final_output --to entry_input --kind feedback --contract "回声消除参考帧"
 
-# 5. 自顶向下将节点升级为带独立拓扑的子系统（例如内部星形或环形）
+# 5. 主线贯通后，确有需要再切到 advanced 模式，把节点升级为带独立拓扑的子系统（例如内部环形）
+arch config --mode advanced
 arch promote --node core_transform --topology ring
 arch focus --in core_transform
 
-# 6. 查看或调整项目 preset 护栏（如 max_depth / max_chain_len）
-arch config --max-depth 2 --max-chain-len 6
+# 6. 查看或调整项目模式与 preset 护栏（如 max_chain_len / max_active_holes）
+arch config --max-chain-len 6
 
 # 7. 导出多拓扑交互式架构看板 HTML（支持泳道/星形/环形切换与双击子系统下钻）
 arch export-ui
@@ -328,12 +330,26 @@ arch export-ui
 
 ---
 
+## 🧭 两种模式：basic 与 advanced
+
+最小闭环优先，工具本身也一样。新项目默认是 **basic 模式**：只有一条流水线，覆盖推演、储备区、现实验证、实现与回滚这条最小路径，MCP 只暴露 24 个工具，并隐藏子系统相关参数。
+
+系统确实是星形中枢或环形闭环、需要折叠 / 拆分子系统，或要迁移旧项目记录时，经用户同意运行 `arch config --mode advanced`（MCP：`arch_config mode=advanced`），解锁全部 31 个工具，MCP 服务会通知客户端刷新工具列表。
+
+- `init --topology star|ring` 或 `--preset agent|platform` 直接按 advanced 初始化。
+- 旧项目自动识别：用了多拓扑、子系统、`agent` / `platform` 预设或还有待迁移记录的按 advanced 处理，其余按 basic 处理。
+- basic 模式下调用高级命令返回 `[ADVANCED_MODE_REQUIRED]`，图不会被改动。
+
+切换时机与高级用法见 [advanced.md](references/advanced.md)。
+
 ## 🛠️ MCP 工具 / CLI 命令清单
+
+标 **（advanced）** 的只在 advanced 模式下可用。
 
 | 原生 MCP 工具名 | CLI 命令 | 作用说明 |
 | :--- | :--- | :--- |
 | `arch_bootstrap` | `bootstrap [--out DIR]` | 将零依赖 CLI 引擎内嵌拷贝到项目 `.arch/scripts/`，直接 `python3` 运行 |
-| `arch_init` | `init --seed [--topology] [--preset] [--embed]` | 初始化项目状态机（支持 `pipeline`/`star`/`ring` 拓扑与项目 `preset` 护栏） |
+| `arch_init` | `init --seed [--mode] [--topology] [--preset] [--embed]` | 初始化项目状态机（默认 basic 流水线；`star`/`ring` 拓扑与 `agent`/`platform` 预设自动进入 advanced） |
 | `arch_focus` | `focus [--node] [--in <子系统>]` | 获取当前节点的 1-Hop 切片、`global` 事实、护栏告警与最小闭环状态 |
 | `arch_collapse` | `collapse [--role] [--in <子系统>]` | 确定待定节点或更新已确定节点的规范并记录快照 |
 | `arch_connect` | `connect --from --to [--kind primary\|feedback\|bidirectional] [--in]` | 在两个已有节点间建立连线（支持回流闭环与双向边） |
@@ -341,29 +357,26 @@ arch export-ui
 | `arch_set_edge_contract` | `set-edge-contract --from <起点> --to <终点> --contract <契约> [--kind] [--in]` | 更新一条已有连线的契约或类型 |
 | `arch_add_node` | `add-node [--role] [--kind] [--in]` | 在图中增量插入新节点（可指定前驱/后继连线、拓扑角色与 Stage） |
 | `arch_add_fog` | `add-node --status fog` | 快捷工具：将发散想法放入迷雾储备区，保持主干清晰聚焦 |
-| `arch_deactivate`| `deactivate [--no-bridge] [--in]` | 将活跃节点移入暂缓储备区，自动缝合上下游（受 `auto_bridge_limit` 保护） |
+| `arch_deactivate`| `deactivate [--in]` | 将活跃节点移入暂缓储备区；简单链路自动缝合上下游，星形中枢、双向连线或超过 `auto_bridge_limit` 时留空白节点占位 |
 | `arch_activate` | `activate [--kind] [--in]` | 将储备区的节点重新激活为待定节点并接入主线 |
-| `arch_promote` | `promote --node [--topology pipeline\|star\|ring] [--in]` | 自顶向下将节点升级为带独立拓扑的子系统超级节点，外层边保留为边界端口 |
-| `arch_fold` | `fold [--topology] [--in]` | 将已确定、彼此连通的子图折叠为超级节点（受 `max_depth` 保护，支持环弧折叠） |
-| `arch_unfold` | `unfold [--attach] [--in]` | 展开超级节点并原样恢复子节点与连线 |
-| `arch_config` | `config [--preset] [--max-depth] [--max-chain-len] [--global-fact-limit] ...` | 查看或调整项目 `preset` 护栏与记录配置（存 `.arch/config.json`） |
+| `arch_promote` | `promote --node [--topology pipeline\|star\|ring] [--in]` | （advanced）自顶向下将节点升级为带独立拓扑的子系统超级节点，外层边保留为边界端口 |
+| `arch_fold` | `fold [--topology] [--in]` | （advanced）将已确定、彼此连通的子图折叠为超级节点（子节点与内部连线完整保存，受 `max_depth` 保护，支持环弧折叠） |
+| `arch_unfold` | `unfold [--attach] [--in]` | （advanced）展开超级节点并原样恢复；折叠期间新增的连线自动接到唯一的入口/出口子节点，无法判断时通过 `attach` 指定 |
+| `arch_config` | `config [--mode] [--preset] [--max-chain-len] [--global-fact-limit] ...` | 查看或调整项目模式、`preset` 护栏与 `global` 事实字数上限（存 `.arch/config.json`） |
 | `arch_verify` | `verify --fact --constraint [--scope] [--source] [--supersedes GT-xx]` | 沉淀已验证事实与硬约束，可指定作用域、证据来源和取代的旧事实 |
 | `arch_facts` | `facts [--node <节点> \| --all] [--with-superseded]` | 查询事实：缺省列 `global`，`--node` 列节点相关事实与墓志，`--all` 按作用域列全部 |
-| `arch_rescope` | `rescope --id <GT-xx/OI-xx> --scope <作用域>` | 修改事实或待办项的作用域，内容不变 |
+| `arch_rescope` | `rescope --id <GT-xx/OI-xx> --scope <作用域>` | （advanced）修改事实或待办项的作用域，内容不变 |
 | `arch_open` | `open add / resolve / list` | 待办项登记：待验证的未知项，区分实测 / 调研 / 决策、用户 / 代理处理、是否卡开发 |
 | `arch_set_node_state` | `set-node-state --node <节点> [--impl] [--verify] [--ref/--add-ref/--drop-ref] [--file-path]` | 记录节点实现进度、验证程度（带日期）、文档引用与实现文件 |
 | `arch_status` | `status` | 项目进度总览：节点实现 / 验证、待办项、记录统计与迁移提示 |
-| `arch_migrate_records` | `migrate-records` | 把旧格式 md 记录原样切块存入 `records.json` 待处理（幂等，迁移前快照） |
-| `arch_legacy` | `legacy list / show / resolve` | 逐条查看（`show` 缺省给下一条）并关闭迁移原文 |
-| `arch_graveyard_add` | `graveyard add --node --scheme --reason` | 补记废弃方案到墓志，不重置节点 |
-| `arch_config` | `config [--global-fact-limit N]` | 查看或设置 `global` 事实字数上限 |
+| `arch_migrate_records` | `migrate-records` | （advanced）把旧格式 md 记录原样切块存入 `records.json` 待处理（幂等，迁移前快照） |
+| `arch_legacy` | `legacy list / show / resolve` | （advanced）逐条查看（`show` 缺省给下一条）并关闭迁移原文 |
+| `arch_graveyard_add` | `graveyard add --node --scheme --reason` | （advanced）补记废弃方案到墓志，不重置节点 |
 | `arch_ground` | `ground` | 挂载外部资料或探针（文档、命令、代码引用）到 `grounding.json` |
 | `arch_export_task`| `export-task` | 导出单节点的独立编码任务卡（只带相关记录与 `refs` 章节原文，专供临时子代理在沙箱中执行） |
 | `arch_commit_node`| `commit-node --node <节点> --file-path <项目内源码路径>`（可重复） | 验证后提交快照、绑定一个或多个实现文件，并把节点记为 `built` |
 | `arch_sync_manual`| `sync-manual` | 感知人类在 IDE 中的手动修改，同步快照以解除防覆盖拦截 |
 | `arch_reset_node` | `reset-node` | 将节点重置为待定，保留连线，把旧方案记入墓志，实现进度清回 `planned` |
-| `arch_fold` | `fold` | 将已确定、彼此连通的子图折叠为一个超级节点（子节点与内部连线完整保存，对外连线与契约保留），降低认知负荷 |
-| `arch_unfold` | `unfold` | 展开超级节点并原样恢复；折叠期间新增的连线自动接到唯一的入口/出口子节点，无法判断时通过 `attach` 指定 |
 | `arch_fork` | `fork` | 从历史快照分叉，已绑定节点的代码文件随图一并回滚（保留避坑记录；存在未提交改动时拒绝执行） |
 | `arch_export_ui` | `export-ui` | 导出单文件交互式架构看板 HTML（阶段分组、连线与契约、最小闭环、搜索、深链与键盘导航），默认 `.arch/dashboard.html` |
 
