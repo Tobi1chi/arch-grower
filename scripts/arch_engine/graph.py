@@ -294,7 +294,7 @@ def _compact_node(node: Dict[str, Any]) -> Dict[str, Any]:
     if node["status"] != "super_node":
         return node
     view = {k: v for k, v in node.items()
-            if k not in ("children", "inner_edges")}
+            if k not in ("children", "inner_edges", "parent_ports")}
     view["topology"] = _container_topology(node)
     view["sub_ready"] = _is_super_ready(node)
     view["folded_children"] = [

@@ -1305,6 +1305,43 @@ class SubsystemSuperNodeTest(EngineTestCase):
             ["entry_input", "front", "core_transform_out", "final_output"],
         )
 
+    def test_scoped_fold_round_trip_preserves_ring_boundary_port_subsets(self) -> None:
+        # Codex round-6 regression: folding and unfolding `act,perceive` inside a
+        # promoted ring must restore the exact separate entry & exit ports so a
+        # subsequent outer unfold succeeds without ambiguity.
+        for nid in ("entry_input", "final_output"):
+            self.collapse(nid)
+        arch_cli.op_promote("core_transform", topology="ring")
+        for cid in ("core_transform_perceive", "core_transform_decide", "core_transform_act"):
+            arch_cli.op_collapse(cid, cid, "spec", scope="core_transform")
+
+        arch_cli.op_fold(
+            ["core_transform_act", "core_transform_perceive"], "wrap", "回流入口", "spec",
+            scope="core_transform",
+        )
+        arch_cli.op_unfold("wrap", scope="core_transform")
+        sub = arch_cli._find_any_node(arch_cli._load_graph(), "core_transform")
+        self.assertEqual(sub["entry_children"], ["core_transform_perceive"])
+        self.assertEqual(sub["exit_children"], ["core_transform_act"])
+
+        # Outer unfold must now resolve both parent edges unambiguously.
+        arch_cli.op_unfold("core_transform")
+        edges = {(e["from"], e["to"]) for e in arch_cli._load_graph()["edges"]}
+        self.assertIn(("entry_input", "core_transform_perceive"), edges)
+        self.assertIn(("core_transform_act", "final_output"), edges)
+
+    def test_dashboard_accepts_single_module_skeleton(self) -> None:
+        arch_cli.op_init("Single module star", topology="star")
+        for nid in ("core_hub", "spoke_a", "spoke_b"):
+            self.collapse(nid)
+        arch_cli.op_fold(["core_hub", "spoke_a", "spoke_b"], "all_bus", "完整中枢", "spec")
+        arch_cli.op_export_ui()
+        page = Path(".arch/dashboard.html").read_text(encoding="utf-8")
+        data = ExportUiTest.embedded(None, page)
+        self.assertEqual(data["skeleton"], ["all_bus"])
+        self.assertNotIn("skeleton.length < 2", page)
+        self.assertIn("if (skeleton && !skeleton.length) skeleton = null;", page)
+
 
 class PresetAndBootstrapTest(EngineTestCase):
     def test_preset_enforces_max_depth_and_feedback_and_survives_fork(self) -> None:

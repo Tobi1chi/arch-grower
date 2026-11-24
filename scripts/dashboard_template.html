@@ -881,7 +881,7 @@
     nextFocus = rawNext && byId.has(String(rawNext)) ? String(rawNext) : null;
     var rawSkel = subMeta ? subMeta.skeleton : (DATA && DATA.skeleton);
     skeleton = Array.isArray(rawSkel) ? rawSkel.map(String).filter(function (id) { return byId.has(id); }) : null;
-    if (skeleton && skeleton.length < 2) skeleton = null;
+    if (skeleton && !skeleton.length) skeleton = null;
     curWarnings = (subMeta ? subMeta.warnings : (DATA && DATA.warnings)) || [];
 
     skelEdges = new Set();
@@ -1499,7 +1499,7 @@
     var skS = section('最小闭环 · WALKING SKELETON');
     if (skeleton) {
       var skText = curTopology === 'star'
-        ? nameOf(skeleton[0]) + ' ↔ [' + skeleton.slice(1).map(nameOf).join(', ') + ']'
+        ? (skeleton.length === 1 ? nameOf(skeleton[0]) : nameOf(skeleton[0]) + ' ↔ [' + skeleton.slice(1).map(nameOf).join(', ') + ']')
         : skeleton.map(nameOf).join('  →  ');
       skS.appendChild(h('div', 'box chain', skText));
     } else {
