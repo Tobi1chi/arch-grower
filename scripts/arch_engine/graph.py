@@ -427,7 +427,18 @@ def _solid_path(container: Dict[str, Any]) -> Optional[List[str]]:
     nodes = {n["id"]: n for n in _container_nodes(container)}
     edges = _container_edges(container)
     feedback_only = bool(edges) and all(_is_feedback(e) for e in edges)
-    adj, in_deg, out_deg = _active_topology(container, include_feedback=feedback_only)
+    adj, _, _ = _active_topology(container, include_feedback=feedback_only)
+    # Entries and exits come from directed edges only: a bidirectional edge
+    # (request/response) can be walked both ways but must not give the entry
+    # an incoming edge or the exit an outgoing one.
+    in_deg = {nid: 0 for nid in adj}
+    out_deg = {nid: 0 for nid in adj}
+    for e in edges:
+        if _edge_kind(e) == "bidirectional" or (_is_feedback(e) and not feedback_only):
+            continue
+        if e["from"] in adj and e["to"] in adj:
+            out_deg[e["from"]] += 1
+            in_deg[e["to"]] += 1
     solid_ids = {nid for nid in adj if nodes[nid]["status"] in SOLID_STATUSES}
     starts = [nid for nid in adj if in_deg[nid] == 0 and nid in solid_ids]
     ends = {nid for nid in adj if out_deg[nid] == 0 and nid in solid_ids}
@@ -456,15 +467,40 @@ def _effective_solid_ids(container: Dict[str, Any], _seen: Optional[Set[str]] = 
     return solid
 
 
+def _main_loop_anchors(container: Dict[str, Any]) -> List[str]:
+    """Nodes the main loop of a ring must pass through.
+
+    The active `entry` nodes when there are any; otherwise the first node (in
+    container order) of the largest loop region, measured like
+    `_main_cycle_len`. A short retry loop that skips the anchor is then never
+    mistaken for the main loop.
+    """
+    active = [n for n in _container_nodes(container) if n["status"] != "fog"]
+    entries = [n["id"] for n in active if n.get("role") == "entry"]
+    if entries:
+        return entries
+    directed = [e for e in _container_edges(container) if _edge_kind(e) != "bidirectional"]
+    comp_of = _sccs([n["id"] for n in active], directed, include_feedback=True)
+    members: Dict[int, List[str]] = {}
+    for n in active:
+        members.setdefault(comp_of[n["id"]], []).append(n["id"])
+    biggest = max(members.values(), key=len, default=[])
+    return biggest[:1] if len(biggest) >= 2 else []
+
+
 def _solid_ring(container: Dict[str, Any], _seen: Optional[Set[str]] = None) -> Optional[List[str]]:
-    """Find a directed cycle of >= 2 distinct solid nodes in a ring container."""
-    nodes = _container_nodes(container)
-    adj, _, _ = _active_topology(container, include_feedback=True)
+    """Find the ring's main loop as a directed cycle of >= 2 distinct solid nodes.
+
+    The cycle must pass through a main-loop anchor (see `_main_loop_anchors`).
+    Bidirectional links are request/response exchanges, not loop edges.
+    """
+    active_ids = {n["id"] for n in _container_nodes(container) if n["status"] != "fog"}
+    adj: Dict[str, List[str]] = {nid: [] for nid in active_ids}
+    for e in _container_edges(container):
+        if _edge_kind(e) != "bidirectional" and e["from"] in active_ids and e["to"] in active_ids:
+            adj[e["from"]].append(e["to"])
     solid_ids = _effective_solid_ids(container, _seen=_seen)
-    ordered = [n["id"] for n in nodes if n["id"] in solid_ids]
-    # Prefer starting from an explicit entry anchor so the reported cycle reads naturally.
-    anchors = [n["id"] for n in nodes if n["id"] in solid_ids and n.get("role") == "entry"]
-    starts = anchors + [nid for nid in ordered if nid not in anchors]
+    starts = [nid for nid in _main_loop_anchors(container) if nid in solid_ids]
 
     for s in starts:
         queue: deque = deque([[s]])
@@ -641,25 +677,23 @@ def _max_active_degree(container: Dict[str, Any]) -> Tuple[str, int]:
     return best_id, len(nbrs[best_id])
 
 
-def _shortest_active_cycle_len(container: Dict[str, Any]) -> int:
-    """Length (distinct nodes) of the main cycle in a ring container, or 0 if none."""
-    nodes = [n for n in _container_nodes(container) if n["status"] != "fog"]
-    if not nodes:
+def _main_cycle_len(container: Dict[str, Any]) -> int:
+    """Node count of the largest directed loop region in a ring container, or 0 if none.
+
+    Measured as the largest strongly connected component over directed
+    (primary + feedback) edges, so a chord or short feedback edge cannot hide
+    a long main loop. Bidirectional links are left out: each one is a 2-node
+    exchange, not part of the loop.
+    """
+    active_ids = [n["id"] for n in _container_nodes(container) if n["status"] != "fog"]
+    if not active_ids:
         return 0
-    adj, _, _ = _active_topology(container, include_feedback=True)
-    anchors = [n["id"] for n in nodes if n.get("role") == "entry"] or [nodes[0]["id"]]
-    for s in anchors:
-        queue: deque = deque([(s, 0)])
-        visited: Set[str] = set()
-        while queue:
-            curr, d = queue.popleft()
-            for nxt in adj.get(curr, []):
-                if nxt == s and d + 1 >= 2:
-                    return d + 1
-                if nxt not in visited and nxt != s:
-                    visited.add(nxt)
-                    queue.append((nxt, d + 1))
-    return 0
+    directed = [e for e in _container_edges(container) if _edge_kind(e) != "bidirectional"]
+    sizes: Dict[int, int] = {}
+    for comp in _sccs(active_ids, directed, include_feedback=True).values():
+        sizes[comp] = sizes.get(comp, 0) + 1
+    best = max(sizes.values(), default=0)
+    return best if best >= 2 else 0
 
 
 def _container_warnings(container: Dict[str, Any], cfg: Dict[str, Any]) -> List[str]:
@@ -694,7 +728,7 @@ def _container_warnings(container: Dict[str, Any], cfg: Dict[str, Any]) -> List[
                 "建议用 arch_fold 将连续稳定段折叠为子系统，或用 arch_config --max-chain-len 调整。"
             )
     if topo == "ring":
-        cyc = _shortest_active_cycle_len(container)
+        cyc = _main_cycle_len(container)
         if cyc > max_cycle:
             warnings.append(
                 f"[CYCLE_TOO_LONG] 主闭环长度已达 {cyc}（preset 上限 {max_cycle}），"
@@ -706,6 +740,10 @@ def _container_warnings(container: Dict[str, Any], cfg: Dict[str, Any]) -> List[
             f"[HUB_OVERLOADED] 节点 '{top_node}' 连接了 {deg} 个活跃邻居（preset 上限 {max_hub}），"
             "建议把同类分支收拢为子系统超级节点，或用 arch_config --max-hub-degree 调整。"
         )
+    if cfg.get("mode") == "basic":
+        # Folding into subsystems is an advanced-mode tool; say so up front.
+        note = "（折叠 / 子系统属于 advanced 模式：确需时先征得用户同意 arch config --mode advanced）"
+        warnings = [w + note if ("arch_fold" in w or "子系统" in w) else w for w in warnings]
     return warnings
 
 

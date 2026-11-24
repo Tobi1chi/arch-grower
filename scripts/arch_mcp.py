@@ -16,6 +16,9 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import arch_engine as engine  # noqa: E402
+from arch_engine.common import (  # noqa: E402
+    ADVANCED_COMMANDS, BASIC_PRESETS, MODES, _project_mode, _require_command,
+)
 
 # The engine keeps state in a relative `.arch/` directory. Hosts launch MCP
 # servers from different working directories (Claude Desktop and global configs
@@ -54,6 +57,11 @@ TOOLS: List[Dict[str, Any]] = [
                     "description": "可选：项目护栏预设（standard / lean / agent / platform，默认 standard）",
                 },
                 "embed": {"type": "boolean", "description": "可选：同时把 CLI 脚本内嵌到 .arch/scripts/"},
+                "mode": {
+                    "type": "string",
+                    "enum": list(MODES),
+                    "description": "可选：basic（默认，pipeline + standard/lean 最小路径）或 advanced；星形/环形拓扑与 agent/platform 预设自动用 advanced",
+                },
             },
             "required": ["seed"],
         },
@@ -160,7 +168,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "after_node": {"type": "string", "description": "可选：上游前驱节点 ID"},
                 "before_node": {"type": "string", "description": "可选：下游后继节点 ID"},
                 "contract": {"type": "string", "description": "连线契约描述"},
-                "kind": {"type": "string", "enum": list(engine.EDGE_KINDS)},
+                "kind": {"type": "string", "enum": list(engine.EDGE_KINDS), "description": "可选：新连线类型；同时给出 after_node 与 before_node 时默认沿用被拆开连线的类型"},
                 "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
             },
             "required": ["node_id", "label", "spec"],
@@ -184,14 +192,13 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "arch_deactivate",
-        "description": "将活跃节点下线移入战争迷雾区（fog）；默认自动缝合上下游边缘（超上限或星形中枢需用 no_bridge）。",
+        "description": "将活跃节点下线移入战争迷雾区（fog）；简单链路自动缝合上下游，星形中枢、双向连线或缝合边超上限时在原位置留空白节点占位。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "node_id": {"type": "string", "description": "目标节点 ID"},
                 "reason": {"type": "string", "description": "暂缓/移入迷雾的原因说明"},
                 "bypass_contract": {"type": "string", "description": "可选：上下游缝合连线的新契约"},
-                "no_bridge": {"type": "boolean", "description": "可选：断开关联边而不自动缝合旁路"},
                 "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
             },
             "required": ["node_id"],
@@ -207,7 +214,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "after_node": {"type": "string", "description": "可选：挂载在哪个上游节点之后"},
                 "before_node": {"type": "string", "description": "可选：插入在哪个下游节点之前"},
                 "contract": {"type": "string", "description": "连线契约描述"},
-                "kind": {"type": "string", "enum": list(engine.EDGE_KINDS)},
+                "kind": {"type": "string", "enum": list(engine.EDGE_KINDS), "description": "可选：新连线类型；同时给出 after_node 与 before_node 时默认沿用被拆开连线的类型"},
                 "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
             },
             "required": ["node_id"],
@@ -408,10 +415,15 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "arch_config",
-        "description": "查看或设置项目 preset 护栏与记录配置（max_depth、max_chain_len、max_hub_degree、allow_feedback、global_fact_limit 等）。",
+        "description": "查看或设置项目模式（basic / advanced）、preset 护栏与记录配置（max_chain_len、max_active_holes、allow_feedback、global_fact_limit 等）。",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": list(MODES),
+                    "description": "basic：只走流水线最小路径；advanced：解锁星形/环形拓扑、子系统（fold/promote/unfold）与记录维护工具。切换前先征得用户同意",
+                },
                 "preset": {"type": "string", "enum": list(engine.PRESETS)},
                 "default_topology": {"type": "string", "enum": list(engine.TOPOLOGIES)},
                 "max_depth": {"type": "integer"},
@@ -521,7 +533,40 @@ TOOLS: List[Dict[str, Any]] = [
 ]
 
 
+def _command_of(tool_name: str) -> str:
+    """CLI command behind an MCP tool (`arch_graveyard_add` -> `graveyard`)."""
+    cmd = tool_name[len("arch_"):].replace("_", "-") if tool_name.startswith("arch_") else tool_name
+    return "graveyard" if cmd == "graveyard-add" else cmd
+
+
+# Parameters only advanced projects use; basic mode leaves them out of the
+# tool list to keep it small. Calls that still pass them work as before.
+_ADVANCED_PARAMS = {"scope"}
+_ADVANCED_CONFIG_PARAMS = {"default_topology", "max_depth", "max_hub_degree", "max_cycle_len"}
+
+
+def _tools_for_mode(mode: str) -> List[Dict[str, Any]]:
+    """The tool list a project in `mode` sees."""
+    if mode != "basic":
+        return TOOLS
+    out: List[Dict[str, Any]] = []
+    for tool in TOOLS:
+        if _command_of(tool["name"]) in ADVANCED_COMMANDS:
+            continue
+        schema = dict(tool["inputSchema"])
+        drop = _ADVANCED_PARAMS | (_ADVANCED_CONFIG_PARAMS if tool["name"] == "arch_config" else set())
+        props = {k: v for k, v in (schema.get("properties") or {}).items() if k not in drop}
+        if "role" in props:
+            props["role"] = {**props["role"], "enum": ["entry", "exit"]}
+        if tool["name"] == "arch_config" and "preset" in props:
+            props["preset"] = {**props["preset"], "enum": list(BASIC_PRESETS)}
+        schema["properties"] = props
+        out.append({**tool, "inputSchema": schema})
+    return out
+
+
 def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
+    _require_command(_command_of(name))
     if name == "arch_bootstrap":
         return engine.op_bootstrap(args.get("target_dir", ""))
     if name == "arch_init":
@@ -530,6 +575,7 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             topology=args.get("topology", ""),
             preset=args.get("preset", "standard"),
             embed=bool(args.get("embed", False)),
+            mode=args.get("mode", ""),
         )
     if name == "arch_focus":
         return engine.op_focus(args.get("node_id"), scope=args.get("scope", ""))
@@ -580,7 +626,7 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             before_node=args.get("before_node", ""),
             contract=args.get("contract", "TBD"),
             role=args.get("role", ""),
-            edge_kind=args.get("kind", "primary"),
+            edge_kind=args.get("kind", ""),
             scope=args.get("scope", ""),
         )
     if name == "arch_add_fog":
@@ -600,7 +646,6 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             node_id=args["node_id"],
             reason=args.get("reason", ""),
             bypass_contract=args.get("bypass_contract", ""),
-            no_bridge=bool(args.get("no_bridge", False)),
             scope=args.get("scope", ""),
         )
     if name == "arch_activate":
@@ -609,7 +654,7 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             after_node=args.get("after_node", ""),
             before_node=args.get("before_node", ""),
             contract=args.get("contract", "TBD"),
-            edge_kind=args.get("kind", "primary"),
+            edge_kind=args.get("kind", ""),
             scope=args.get("scope", ""),
         )
     if name == "arch_fold":
@@ -694,6 +739,7 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             max_unfolded_solid=args.get("max_unfolded_solid"),
             auto_bridge_limit=args.get("auto_bridge_limit"),
             allow_feedback=args.get("allow_feedback"),
+            mode=args.get("mode"),
         )
     if name == "arch_ground":
         return engine.op_ground(args["source_type"], args["source"], args.get("note", ""))
@@ -716,6 +762,12 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
 
 def _send_response(msg_id: Any, result: Dict[str, Any]) -> None:
     payload = {"jsonrpc": "2.0", "id": msg_id, "result": result}
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def _send_notification(method: str) -> None:
+    payload = {"jsonrpc": "2.0", "method": method}
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
@@ -749,15 +801,16 @@ def serve_stdio() -> None:
                 msg_id,
                 {
                     "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {"listChanged": True}},
                     "serverInfo": {"name": "arch-grower-mcp", "version": engine.ENGINE_VERSION},
                 },
             )
         elif method == "tools/list":
-            _send_response(msg_id, {"tools": TOOLS})
+            _send_response(msg_id, {"tools": _tools_for_mode(_project_mode())})
         elif method == "tools/call":
             tool_name = params.get("name", "")
             tool_args = params.get("arguments") or {}
+            mode_before = _project_mode()
             try:
                 output_text = _dispatch_tool(tool_name, tool_args)
                 _send_response(
@@ -767,6 +820,8 @@ def serve_stdio() -> None:
                         "isError": False,
                     },
                 )
+                if _project_mode() != mode_before:
+                    _send_notification("notifications/tools/list_changed")
             except engine.ArchEngineError as exc:
                 _send_response(
                     msg_id,

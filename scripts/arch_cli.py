@@ -21,7 +21,7 @@ from arch_engine import (
     op_unfold, op_verify,
 )
 from arch_engine.common import (
-    REF_WHOLE_FILE_LIMIT, _load_config, _load_graph, _save_config, _save_graph, _today,
+    ADVANCED_COMMANDS, MODES, REF_WHOLE_FILE_LIMIT, _require_command, _load_config, _load_graph, _save_config, _save_graph, _today,
 )
 from arch_engine.graph import (
     IMPL_LEVELS, SIGNATURE_LINE, VERIFY_LEVELS, _find_any_node, _find_walking_skeleton,
@@ -60,7 +60,10 @@ def _parse_bool(raw: str) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Autoregressive Architecture State Machine CLI")
+    parser = argparse.ArgumentParser(
+        description="Autoregressive Architecture State Machine CLI",
+        epilog="标 [advanced] 的命令需要 advanced 模式：arch config --mode advanced（basic 模式只走流水线最小路径）。",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_boot = sub.add_parser("bootstrap", help="将零依赖 CLI 引擎拷贝到当前项目的 .arch/scripts/ 下直接运行")
@@ -71,6 +74,8 @@ def main() -> None:
     p_init.add_argument("--topology", default="", choices=["", *TOPOLOGIES], help="顶层拓扑：pipeline / star / ring")
     p_init.add_argument("--preset", default="standard", choices=list(PRESETS), help="项目预设护栏：standard / lean / agent / platform")
     p_init.add_argument("--embed", action="store_true", help="初始化时顺带把 CLI 脚本拷贝进 .arch/scripts/")
+    p_init.add_argument("--mode", default="", choices=["", *MODES],
+                        help="basic（默认：pipeline + standard/lean）或 advanced；星形/环形拓扑与 agent/platform 预设自动用 advanced")
 
     p_focus = sub.add_parser("focus")
     p_focus.add_argument("--node", default=None)
@@ -118,17 +123,16 @@ def main() -> None:
     p_add.add_argument("--after", default="")
     p_add.add_argument("--before", default="")
     p_add.add_argument("--contract", default="TBD")
-    p_add.add_argument("--kind", default="primary", choices=list(EDGE_KINDS))
+    p_add.add_argument("--kind", default="", choices=["", *EDGE_KINDS], help="新连线类型；在 --after 与 --before 之间插入时默认沿用原连线类型")
     p_add.add_argument("--in", dest="scope", default="", help="子系统超级节点 ID")
 
     p_exp_ui = sub.add_parser("export-ui", help="导出多拓扑交互式架构看板 HTML（支持子系统下钻）")
     p_exp_ui.add_argument("--out", default="")
 
-    p_deact = sub.add_parser("deactivate", help="将活跃节点下线并移入战争迷雾区，自动缝合上下游边")
+    p_deact = sub.add_parser("deactivate", help="将活跃节点下线并移入战争迷雾区：简单链路自动缝合旁路，否则留空白节点占位")
     p_deact.add_argument("--node", required=True)
     p_deact.add_argument("--reason", default="")
     p_deact.add_argument("--bypass-contract", default="")
-    p_deact.add_argument("--no-bridge", action="store_true", help="直接断开关联连线，不自动缝合旁路")
     p_deact.add_argument("--in", dest="scope", default="", help="子系统超级节点 ID")
 
     p_act = sub.add_parser("activate", help="将迷雾区节点激活为待定空洞并接入主干")
@@ -136,7 +140,7 @@ def main() -> None:
     p_act.add_argument("--after", default="")
     p_act.add_argument("--before", default="")
     p_act.add_argument("--contract", default="TBD")
-    p_act.add_argument("--kind", default="primary", choices=list(EDGE_KINDS))
+    p_act.add_argument("--kind", default="", choices=["", *EDGE_KINDS], help="新连线类型；在 --after 与 --before 之间插入时默认沿用原连线类型")
     p_act.add_argument("--in", dest="scope", default="", help="子系统超级节点 ID")
 
     p_fold = sub.add_parser("fold", help="将已确定、相互连通的子图折叠为一个超级节点")
@@ -232,6 +236,7 @@ def main() -> None:
     p_lres.add_argument("--note", default="", help="处理去向，如“拆为 GT-12、OI-03”")
 
     p_cfg = sub.add_parser("config", help="查看或设置项目 preset 护栏与记录配置")
+    p_cfg.add_argument("--mode", default=None, choices=list(MODES), help="basic（最小路径）或 advanced（多拓扑、子系统、记录维护）")
     p_cfg.add_argument("--preset", default=None, choices=list(PRESETS), help="切换命名预设")
     p_cfg.add_argument("--default-topology", default=None, choices=list(TOPOLOGIES))
     p_cfg.add_argument("--max-depth", type=int, default=None, help="子系统最大嵌套深度（默认 2）")
@@ -240,7 +245,7 @@ def main() -> None:
     p_cfg.add_argument("--max-cycle-len", type=int, default=None, help="主闭环最大节点数软上限")
     p_cfg.add_argument("--max-active-holes", type=int, default=None, help="同作用域最大待定空洞硬上限")
     p_cfg.add_argument("--max-unfolded-solid", type=int, default=None, help="同作用域未折叠实心节点软上限")
-    p_cfg.add_argument("--auto-bridge-limit", type=int, default=None, help="deactivate 自动缝合最大边数")
+    p_cfg.add_argument("--auto-bridge-limit", type=int, default=None, help="deactivate 自动缝合最大边数，超出则留空白节点占位")
     p_cfg.add_argument("--allow-feedback", type=_parse_bool, default=None, help="是否允许 feedback 回流边（true/false）")
     p_cfg.add_argument("--global-fact-limit", type=int, default=None, help="global 事实字数上限（默认 3000）")
 
@@ -271,12 +276,17 @@ def main() -> None:
     p_frk = sub.add_parser("fork")
     p_frk.add_argument("--from-tag", required=True)
 
+    for action in sub._choices_actions:
+        if action.dest in ADVANCED_COMMANDS:
+            action.help = f"[advanced] {action.help or ''}".rstrip()
+
     args = parser.parse_args()
     try:
+        _require_command(args.cmd)
         if args.cmd == "bootstrap":
             print(op_bootstrap(args.out))
         elif args.cmd == "init":
-            print(op_init(args.seed, topology=args.topology, preset=args.preset, embed=args.embed))
+            print(op_init(args.seed, topology=args.topology, preset=args.preset, embed=args.embed, mode=args.mode))
         elif args.cmd == "focus":
             print(op_focus(args.node, scope=args.scope))
         elif args.cmd == "collapse":
@@ -303,7 +313,7 @@ def main() -> None:
             print(op_export_ui(args.out))
         elif args.cmd == "deactivate":
             print(op_deactivate_node(
-                args.node, args.reason, args.bypass_contract, no_bridge=args.no_bridge, scope=args.scope,
+                args.node, args.reason, args.bypass_contract, scope=args.scope,
             ))
         elif args.cmd == "activate":
             print(op_activate_node(
@@ -366,6 +376,7 @@ def main() -> None:
                 max_unfolded_solid=args.max_unfolded_solid,
                 auto_bridge_limit=args.auto_bridge_limit,
                 allow_feedback=args.allow_feedback,
+                mode=args.mode,
             ))
         elif args.cmd == "ground":
             print(op_ground(args.type, args.source, args.note))

@@ -110,6 +110,94 @@ class ArchEngineError(Exception):
     pass
 
 
+# Modes
+# -----
+# `basic` keeps a project on the minimal path: one pipeline, holes, fog,
+# grounding and implementation. `advanced` adds star/ring topologies,
+# subsystems (fold / promote / unfold), the agent/platform presets and the
+# record-maintenance tools (historical graveyard entries, rescoping facts,
+# migrating old-format records).
+# Ops never check the mode themselves; the CLI and MCP entry points call
+# `_require_command` before dispatching.
+MODES = ("basic", "advanced")
+BASIC_PRESETS = ("standard", "lean")
+ADVANCED_COMMANDS = (
+    "fold", "promote", "unfold",
+    "graveyard", "rescope", "legacy", "migrate-records",
+)
+
+
+def _state_needs_advanced() -> bool:
+    """True when the graph or records already rely on advanced-only features."""
+    if GRAPH_FILE.exists():
+        try:
+            graph = json.loads(GRAPH_FILE.read_text(encoding="utf-8"))
+        except ValueError:
+            graph = {}
+        if graph.get("topology", "pipeline") != "pipeline":
+            return True
+
+        def nested(nodes: List[Dict[str, Any]]) -> bool:
+            return any(n.get("status") == "super_node" or n.get("children") for n in nodes)
+
+        if nested(graph.get("nodes") or []):
+            return True
+        if not RECORDS_FILE.exists():
+            return True   # old md records still need `migrate-records`
+    if RECORDS_FILE.exists():
+        try:
+            rec = json.loads(RECORDS_FILE.read_text(encoding="utf-8"))
+        except ValueError:
+            rec = {}
+        if any(lg.get("status") != "resolved" for lg in rec.get("legacy") or []):
+            return True
+    return False
+
+
+def _uses_advanced_features() -> bool:
+    """True when the on-disk project (state or config) relies on advanced-only features."""
+    if _state_needs_advanced():
+        return True
+    if CONFIG_FILE.exists():
+        try:
+            raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except ValueError:
+            raw = {}
+        return _mode_for(raw.get("preset", "standard"), raw.get("default_topology", "pipeline")) == "advanced"
+    return False
+
+
+def _mode_for(preset: str, topology: str) -> str:
+    """Mode a project needs for this preset and topology."""
+    return "basic" if preset in BASIC_PRESETS and topology == "pipeline" else "advanced"
+
+
+def _project_mode() -> str:
+    """`mode` from config.json; projects from before modes are detected from their state."""
+    if CONFIG_FILE.exists():
+        try:
+            raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except ValueError:
+            raw = {}
+        if raw.get("mode") in MODES:
+            return raw["mode"]
+    return "advanced" if _uses_advanced_features() else "basic"
+
+
+def _advanced_hint(what: str) -> str:
+    return (
+        f"[ADVANCED_MODE_REQUIRED] {what} 属于 advanced 模式，当前项目处于 basic 模式（只走流水线最小路径）。"
+        "JIT 指令：先确认最小路径确实不够用，并征得用户同意后运行 arch config --mode advanced"
+        "（MCP：arch_config mode=advanced），再重试。"
+    )
+
+
+def _require_command(command: str) -> None:
+    """Refuse an advanced-only CLI command (or its MCP tool) while the project is basic."""
+    if command in ADVANCED_COMMANDS and _project_mode() == "basic":
+        raise ArchEngineError(_advanced_hint(f"`{command}`"))
+
+
 def _default_config(preset: str = "standard") -> Dict[str, Any]:
     if preset not in PRESETS:
         raise ArchEngineError(
@@ -121,11 +209,25 @@ def _default_config(preset: str = "standard") -> Dict[str, Any]:
 def _load_config() -> Dict[str, Any]:
     """Load `.arch/config.json`, filling any missing keys from its preset defaults."""
     if not CONFIG_FILE.exists():
-        return _default_config("standard")
+        base = _default_config("standard")
+        # Projects created before config.json kept their global fact budget in
+        # records.json; carry it over so the first `config` write keeps it.
+        if RECORDS_FILE.exists():
+            try:
+                settings = json.loads(RECORDS_FILE.read_text(encoding="utf-8")).get("settings") or {}
+                legacy_limit = int(settings.get("global_fact_char_limit") or 0)
+            except (ValueError, TypeError, AttributeError):
+                legacy_limit = 0
+            if legacy_limit > 0:
+                base["global_fact_char_limit"] = legacy_limit
+        base["mode"] = "advanced" if _uses_advanced_features() else "basic"
+        return base
     raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     preset_name = raw.get("preset", "standard")
     base = _default_config(preset_name if preset_name in PRESETS else "standard")
     base.update(raw)
+    if base.get("mode") not in MODES:
+        base["mode"] = "advanced" if _uses_advanced_features() else "basic"
     return base
 
 
@@ -188,8 +290,31 @@ def _shadow_state_targets() -> List[str]:
     return [str(p) for p in SHADOW_STATE_FILES if p.exists()]
 
 
+def _tracked_arch_extras(rev: str = "") -> List[str]:
+    """`.arch/` paths tracked by Shadow Git that are not state files.
+
+    Snapshots made before the state-file whitelist staged the whole `.arch/`
+    directory (e.g. `dashboard.html`). With `rev` the paths come from that
+    commit, otherwise from the index.
+    """
+    arch = ARCH_DIR.as_posix()
+    if rev:
+        res = _run_shadow_git(["ls-tree", "-r", "--name-only", rev, "--", arch], check=False)
+    else:
+        res = _run_shadow_git(["ls-files", "--", arch], check=False)
+    if res.returncode != 0:
+        return []
+    keep = {p.as_posix() for p in SHADOW_STATE_FILES}
+    return [ln for ln in res.stdout.splitlines() if ln.strip() and ln not in keep]
+
+
 def _shadow_commit(tag_name: str, message: str, paths: Optional[List[str]] = None) -> None:
     _init_shadow_git()
+    # Drop legacy non-state `.arch/` files from the index so later exports of
+    # them never leave a tracked-but-modified file that blocks `fork`.
+    legacy = _tracked_arch_extras()
+    if legacy:
+        _run_shadow_git(["rm", "--cached", "-q", "--ignore-unmatch", "--", *legacy], check=False)
     if not paths:
         targets = _shadow_state_targets()
     else:

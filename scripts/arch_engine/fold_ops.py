@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from .common import ArchEngineError, _load_config, _load_graph, _save_graph, _shadow_commit
 from .graph import (
     SOLID_STATUSES, _container_topology, _edge_from_members, _edge_kind, _edge_members,
-    _get_node, _is_feedback, _iter_all_nodes, _max_subtree_depth, _resolve_container, _sccs,
-    _validate_topology,
+    _get_node, _is_feedback, _iter_all_nodes, _max_subtree_depth, _node_state, _resolve_container,
+    _sccs, _validate_topology,
 )
 from .views import op_focus
 
@@ -184,8 +184,14 @@ def op_fold(
     # introduce a *new* cycle through an external node `curr`. If `curr` is
     # already in the same strongly connected component as the member set (e.g.
     # folding a contiguous arc of an existing ring), contracting it does not
-    # invent a new cycle.
-    scc_of = _sccs((n["id"] for n in c_nodes), c_edges, include_feedback=True)
+    # invent a new cycle. In a pipeline, feedback edges are not part of the
+    # primary flow, so they must not count towards that exemption: one
+    # end-to-start feedback edge would otherwise put every node in one SCC and
+    # let a fold of non-adjacent layers create a primary cycle.
+    scc_of = _sccs(
+        (n["id"] for n in c_nodes), c_edges,
+        include_feedback=_container_topology(container) != "pipeline",
+    )
     member_sccs = {scc_of[nid] for nid in ids}
     frontier = [e["to"] for e in outgoing if not _is_feedback(e)]
     reachable_outside = set(frontier)
@@ -291,6 +297,17 @@ def op_promote(
         raise ArchEngineError(
             f"节点 '{node_id}' 处于储备区 (fog)，请先 activate 激活后再升级为子系统。"
         )
+    # A super_node hides its own impl / files from status, export-task and drift
+    # checks, so promoting an implemented node would silently orphan them.
+    state = _node_state(node)
+    if state["impl"] != "planned":
+        bound = f"，已绑定文件：{', '.join(state['files'])}" if state["files"] else ""
+        raise ArchEngineError(
+            f"节点 '{node_id}' 已有实现（impl={state['impl']}{bound}），升级为子系统后这些实现记录将无处挂载。\n"
+            f"JIT 指令：先向用户确认拆分方案；若确认重新拆解，请先 arch reset-node --node {node_id} "
+            "--reason \"拆分为子系统\" 记录原实现，再 promote（已绑定文件会转到子系统的核心子节点上），"
+            "之后在子系统内用 commit-node 重新绑定到对应子节点。"
+        )
 
     max_depth = int(cfg.get("max_depth", 2))
     if depth + 1 > max_depth:
@@ -322,6 +339,15 @@ def op_promote(
     node["entry_children"] = entry_children
     node["exit_children"] = exit_children
     node["last_tag"] = ""
+    # Files still bound to a planned node (e.g. kept by reset-node) move to the
+    # core starter child, where status / export-task / drift checks see them.
+    moved_files = state["files"]
+    if moved_files:
+        core_suffix = {"star": "_hub", "ring": "_decide"}.get(sub_topo, "_core")
+        core = next(c for c in children if c["id"] == f"{node_id}{core_suffix}")
+        core["file_path"] = node["file_path"]
+    for key in ("file_path", "impl", "verify"):
+        node.pop(key, None)
 
     graph["step"] += 1
     tag = f"promote-{node_id}-s{graph['step']:02d}"
@@ -330,7 +356,8 @@ def op_promote(
     return (
         f"已将节点 '{node_id}' 升级为 {sub_topo} 子系统超级节点（快照 {tag}），"
         f"内部生成 {len(children)} 个待定空洞，外层连线已保留为边界端口。\n"
-        f"后续可用 --in {node_id} 在该子系统内部演进。\n\n"
+        + (f"原绑定文件已转到子节点 '{core['id']}'：{', '.join(moved_files)}。\n" if moved_files else "")
+        + f"后续可用 --in {node_id} 在该子系统内部演进。\n\n"
         + op_focus(scope=node_id)
     )
 
@@ -402,14 +429,20 @@ def op_unfold(
     _replace_container_lists(container, new_nodes, new_edges)
     if "children" in container:
         saved_ports = sn.get("parent_ports") or {}
+
+        def current_children(port_ids: List[str]) -> List[str]:
+            # Saved ids may since have been folded deeper inside `sn` (or be
+            # stale); map each to the direct child of `sn` that holds it now.
+            return list(dict.fromkeys(owner[p] for p in port_ids if p in owner))
+
         for port_key in ("entry_children", "exit_children"):
             ports = container.get(port_key) or []
             expanded: List[str] = []
             for cid in ports:
                 if cid == super_id:
                     expanded.extend(
-                        saved_ports.get(port_key)
-                        or sn.get(port_key)
+                        current_children(saved_ports.get(port_key) or [])
+                        or current_children(sn.get(port_key) or [])
                         or [c["id"] for c in sn["children"]]
                     )
                 else:

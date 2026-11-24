@@ -319,7 +319,7 @@ def op_status() -> str:
 
     out = [f"=== 项目状态 · step {graph.get('step', 0)} ==="]
     out.append(
-        f"拓扑与预设：topology={_container_topology(graph)} · preset={cfg['preset']} · "
+        f"模式、拓扑与预设：mode={cfg['mode']} · topology={_container_topology(graph)} · preset={cfg['preset']} · "
         f"嵌套深度 {depth}/{cfg['max_depth']} · 链长上限 {cfg['max_chain_len']}"
     )
     out.append(

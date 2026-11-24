@@ -8,14 +8,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from .common import (
-    ARCH_DIR, ArchEngineError, CONFIG_FILE, ENGINE_VERSION, GRAVEYARD_FILE, GROUNDING_FILE,
+    ARCH_DIR, ArchEngineError, BASIC_PRESETS, CONFIG_FILE, ENGINE_VERSION, MODES, _mode_for, GRAVEYARD_FILE, GROUNDING_FILE,
     GROUND_TRUTH_FILE, OPEN_ITEMS_FILE, RECORDS_FILE, SEED_FILE, _default_config, _init_shadow_git,
     _load_config, _load_graph, _run_shadow_git, _save_config, _save_graph, _shadow_commit, _today,
+    _tracked_arch_extras,
 )
 from .graph import (
-    IMPL_LEVELS, VERIFY_LEVELS, VERIFY_TEXT, _edge_from_members, _edge_kind, _edge_members,
-    _find_any_node, _get_node, _is_feedback, _iter_all_nodes, _node_files, _node_state,
-    _reject_manual_super_type, _resolve_container, _state_text, _store_files,
+    IMPL_LEVELS, VERIFY_LEVELS, VERIFY_TEXT, _container_topology, _edge_from_members, _edge_kind,
+    _edge_members, _find_any_node, _get_node, _is_feedback, _iter_all_nodes, _node_files,
+    _node_state, _reject_manual_super_type, _resolve_container, _star_hub_id, _state_text,
+    _store_files,
     _validate_edge_kind, _validate_node_role, _validate_topology,
 )
 from .records import (
@@ -30,6 +32,73 @@ def _replace_edges(container: Dict[str, Any], new_edges: List[Dict[str, Any]]) -
         container["inner_edges"] = new_edges
     else:
         container["edges"] = new_edges
+
+
+def _wire_inserted_node(
+    container: Dict[str, Any],
+    c_edges: List[Dict[str, Any]],
+    node_id: str,
+    after_node: str,
+    before_node: str,
+    contract: str,
+    edge_kind: str,
+) -> None:
+    """Connect a node placed after and/or before existing nodes.
+
+    With both ends given, an existing `after -> before` edge is split in two.
+    Each half keeps that edge's contract and folded provenance; its kind is kept
+    too unless `edge_kind` overrides it. A feedback edge stays feedback only on
+    the half that returns into `before`, so the new node sits on the forward
+    path. `edge_kind` "" means "inherit, else primary".
+    """
+    def plain(u: str, v: str, kind: str) -> Dict[str, Any]:
+        e: Dict[str, Any] = {"from": u, "to": v, "contract": contract}
+        if kind != "primary":
+            e["kind"] = kind
+        return e
+
+    if not (after_node and before_node):
+        kind = edge_kind or "primary"
+        if after_node:
+            c_edges.append(plain(after_node, node_id, kind))
+        elif before_node:
+            c_edges.append(plain(node_id, before_node, kind))
+        return
+
+    def is_split(e: Dict[str, Any]) -> bool:
+        if e["from"] == after_node and e["to"] == before_node:
+            return True
+        # A bidirectional link may be stored either way round.
+        return e["from"] == before_node and e["to"] == after_node and _edge_kind(e) == "bidirectional"
+
+    old = [e for e in c_edges if is_split(e)]
+    kept = [e for e in c_edges if not is_split(e)]
+    if not old:
+        kind = edge_kind or "primary"
+        kept += [plain(after_node, node_id, kind), plain(node_id, before_node, kind)]
+        _replace_edges(container, kept)
+        return
+
+    inherit_contract = (contract or "TBD").strip() == "TBD"
+    first: Dict[Any, Dict[str, Any]] = {}
+    second: Dict[Any, Dict[str, Any]] = {}
+    for oe in old:
+        reverse = oe["from"] == before_node
+        for m in _edge_members(oe):
+            if reverse:
+                m = {**m, "from": m["to"], "to": m["from"]}
+            mkind = _edge_kind(m)
+            k1 = edge_kind or ("primary" if mkind == "feedback" else mkind)
+            k2 = edge_kind or mkind
+            c = m.get("contract", "") if inherit_contract else contract
+            for bucket, u, v, k in ((first, m["from"], node_id, k1), (second, node_id, m["to"], k2)):
+                item: Dict[str, Any] = {"from": u, "to": v, "contract": c or "TBD"}
+                if k != "primary":
+                    item["kind"] = k
+                bucket.setdefault((u, v), item)
+    kept.append(_edge_from_members(after_node, node_id, list(first.values())))
+    kept.append(_edge_from_members(node_id, before_node, list(second.values())))
+    _replace_edges(container, kept)
 
 
 def _initial_skeleton(topology: str) -> Dict[str, Any]:
@@ -185,11 +254,25 @@ def op_bootstrap(target_dir: str = "") -> str:
     )
 
 
-def op_init(seed: str, topology: str = "", preset: str = "standard", embed: bool = False) -> str:
+def op_init(
+    seed: str, topology: str = "", preset: str = "standard", embed: bool = False, mode: str = "",
+) -> str:
     cfg = _default_config(preset)
     topo = _validate_topology(topology or cfg["default_topology"])
     if topology:
         cfg["default_topology"] = topo
+    needed = _mode_for(preset, topo)
+    if mode and mode not in MODES:
+        raise ArchEngineError(f"未知 mode '{mode}'。可选：{' / '.join(MODES)}。")
+    if mode == "basic" and needed == "advanced":
+        raise ArchEngineError(
+            f"basic 模式只支持 pipeline 拓扑与 {' / '.join(BASIC_PRESETS)} 预设，"
+            f"收到 topology={topo}、preset={preset}。JIT 指令：改用 pipeline，或去掉 --mode basic。"
+        )
+    cfg["mode"] = mode or needed
+    mode_note = ""
+    if cfg["mode"] == "advanced" and not mode:
+        mode_note = f"[MODE] topology={topo} / preset={preset} 需要 advanced 模式，项目已按 advanced 初始化。\n\n"
 
     ARCH_DIR.mkdir(parents=True, exist_ok=True)
     _init_shadow_git()
@@ -222,7 +305,7 @@ def op_init(seed: str, topology: str = "", preset: str = "standard", embed: bool
     _save_graph(graph)
     _shadow_commit("arch-step-01", f"init ({topo}/{preset}): {seed[:40]}")
     extra = f"{op_bootstrap()}\n\n" if embed else ""
-    return extra + op_focus()
+    return extra + mode_note + op_focus()
 
 
 def op_collapse(
@@ -412,11 +495,11 @@ def op_add_node(
     before_node: str = "",
     contract: str = "TBD",
     role: str = "",
-    edge_kind: str = "primary",
+    edge_kind: str = "",
     scope: str = "",
 ) -> str:
     _reject_manual_super_type(node_type)
-    ekind = _validate_edge_kind(edge_kind)
+    ekind = _validate_edge_kind(edge_kind) if edge_kind else ""
     nrole = _validate_node_role(role)
 
     graph = _load_graph()
@@ -455,24 +538,7 @@ def op_add_node(
         new_node["role"] = nrole
     c_nodes.append(new_node)
 
-    def mk_edge(u: str, v: str) -> Dict[str, Any]:
-        e: Dict[str, Any] = {"from": u, "to": v, "contract": contract}
-        if ekind != "primary":
-            e["kind"] = ekind
-        return e
-
-    if after_node and before_node:
-        filtered = [
-            e for e in c_edges
-            if not (e["from"] == after_node and e["to"] == before_node)
-        ]
-        filtered.append(mk_edge(after_node, node_id))
-        filtered.append(mk_edge(node_id, before_node))
-        _replace_edges(container, filtered)
-    elif after_node:
-        c_edges.append(mk_edge(after_node, node_id))
-    elif before_node:
-        c_edges.append(mk_edge(node_id, before_node))
+    _wire_inserted_node(container, c_edges, node_id, after_node, before_node, contract, ekind)
 
     graph["step"] += 1
     tag = f"arch-step-{graph['step']:02d}"
@@ -564,11 +630,34 @@ def op_fork(from_tag: str) -> str:
     kept = (GRAVEYARD_FILE, GROUND_TRUTH_FILE, OPEN_ITEMS_FILE, RECORDS_FILE, CONFIG_FILE)
     backups = {p: p.read_text(encoding="utf-8") for p in kept if p.exists()}
 
+    # Non-state `.arch/` files (e.g. dashboard.html) tracked by older snapshots
+    # are not graph state: keep the current copies, and clear them out of the
+    # way first so a newer export never blocks the checkout.
+    head_extras = set(_tracked_arch_extras("HEAD"))
+    extras = head_extras | set(_tracked_arch_extras(from_tag))
+    extra_backups = {p: Path(p).read_bytes() for p in extras if Path(p).is_file()}
+
+    def restore_extras() -> None:
+        for p in extras:
+            if p in extra_backups:
+                Path(p).parent.mkdir(parents=True, exist_ok=True)
+                Path(p).write_bytes(extra_backups[p])
+            elif Path(p).is_file():
+                Path(p).unlink()
+
+    for p in extras:
+        if p in head_extras:
+            _run_shadow_git(["checkout", "HEAD", "--", p], check=False)
+        elif Path(p).is_file():
+            Path(p).unlink()
+
     branch_name = f"fork-{from_tag}-{datetime.now().strftime('%H%M%S')}"
     res = _run_shadow_git(["checkout", "-b", branch_name, from_tag], check=False)
     if res.returncode != 0:
+        restore_extras()
         raise ArchEngineError(f"无法从快照 '{from_tag}' 分叉：{res.stderr.strip()}")
 
+    restore_extras()
     for path, text in backups.items():
         if text:
             path.write_text(text, encoding="utf-8")
@@ -576,16 +665,42 @@ def op_fork(from_tag: str) -> str:
     return f"已成功安全回滚至 {from_tag} 并开启新分支 {branch_name}（已保留所有避坑记录与项目预设）。\n\n" + op_focus()
 
 
+def _swap_node_refs(graph: Dict[str, Any], old_id: str, new_id: str) -> None:
+    """Point every edge endpoint, edge provenance member and boundary port at `new_id`."""
+    def swap(x: str) -> str:
+        return new_id if x == old_id else x
+
+    containers: List[Dict[str, Any]] = [graph] + [
+        n for n in _iter_all_nodes(graph["nodes"]) if n["status"] == "super_node"
+    ]
+    for c in containers:
+        for e in c.get("inner_edges" if "children" in c else "edges", []):
+            e["from"], e["to"] = swap(e["from"]), swap(e["to"])
+            if e.get("members"):
+                e["members"] = [{**m, "from": swap(m["from"]), "to": swap(m["to"])} for m in e["members"]]
+        for key in ("entry_children", "exit_children"):
+            if key in c:
+                c[key] = [swap(x) for x in c[key]]
+        for key, ports in (c.get("parent_ports") or {}).items():
+            c["parent_ports"][key] = [swap(x) for x in ports]
+
+
 def op_deactivate_node(
     node_id: str,
     reason: str = "",
     bypass_contract: str = "",
-    no_bridge: bool = False,
     scope: str = "",
 ) -> str:
+    """Move a node to fog.
+
+    Simple chains are bridged (upstream joined straight to downstream). When a
+    bridge would distort the structure (a star hub, bidirectional links, or more
+    bypass edges than `auto_bridge_limit`), a blank hole takes the node's place
+    and keeps all of its edges instead, so the gap stays visible.
+    """
     graph = _load_graph()
     cfg = _load_config()
-    container, _, c_edges, _, _ = _resolve_container(graph, scope)
+    container, c_nodes, c_edges, _, _ = _resolve_container(graph, scope)
     node = _get_node(container, node_id, allow_super=False)
 
     if node["status"] == "fog":
@@ -602,30 +717,55 @@ def op_deactivate_node(
         if inc["from"] != out["to"]
     ]
     bridge_limit = int(cfg.get("auto_bridge_limit", 4))
-    if not no_bridge:
-        if node.get("role") == "hub" and (bridge_pairs or len(bidir_edges) >= 2):
-            raise ArchEngineError(
-                f"[AutoBridgeLimitError] 节点 '{node_id}' 是星形中枢 (role=hub)，直接下线会自动缝合大量交叉边并破坏星形结构。\n"
-                "JIT 指令：若要更换中枢方案请使用 arch reset-node；若确实要拆除连接下线，请显式加上 --no-bridge。"
-            )
-        if len(bridge_pairs) > bridge_limit:
-            raise ArchEngineError(
-                f"[AutoBridgeLimitError] 下线 '{node_id}' 将触发 {len(bridge_pairs)} 条旁路缝合边，"
-                f"超过 preset 上限 ({bridge_limit})。\n"
-                "JIT 指令：建议改用 arch reset-node，或显式传 --no-bridge 断开而不自动缝合。"
-            )
+    # The hub may be implicit (no role, picked by degree), so ask the star itself.
+    is_hub = node.get("role") == "hub" or (
+        _container_topology(container) == "star" and _star_hub_id(container) == node_id
+    )
+    slot_reasons: List[str] = []
+    if is_hub and (bridge_pairs or len(bidir_edges) >= 2):
+        slot_reasons.append("它是星形中枢，缝合会把外围节点两两连成网状")
+    if len(bidir_edges) >= 2:
+        slot_reasons.append(f"它有 {len(bidir_edges)} 条双向连线，双向边无法自动缝合")
+    if len(bridge_pairs) > bridge_limit:
+        slot_reasons.append(f"需要 {len(bridge_pairs)} 条旁路缝合边，超过 preset 上限 ({bridge_limit})")
 
     old_status = node["status"]
     node["status"] = "fog"
     node["last_tag"] = ""
 
-    remaining_edges = [
-        e for e in c_edges
-        if e["from"] != node_id and e["to"] != node_id
-    ]
-
-    bridged_edges = []
-    if not no_bridge:
+    bridged_edges: List[str] = []
+    slot: Optional[Dict[str, Any]] = None
+    hole_warning = ""
+    if slot_reasons:
+        existing_ids = {n["id"] for n in _iter_all_nodes(graph["nodes"])}
+        slot_id, i = f"{node_id}_slot", 2
+        while slot_id in existing_ids:
+            slot_id, i = f"{node_id}_slot{i}", i + 1
+        base_label = node["label"].lstrip("? ").strip() or node_id
+        slot = {
+            "id": slot_id,
+            "label": f"? 待定：{base_label}",
+            "status": "hole",
+            "type": node.get("type", "port"),
+            "spec": f"占位：原方案 '{node_id}' 已移入储备区，此位置待重新设计。原职责：{node.get('spec', '')}",
+            "file_path": "",
+            "last_tag": "",
+        }
+        for key in ("stage", "role"):
+            if node.get(key):
+                slot[key] = node[key]
+        max_holes = int(cfg.get("max_active_holes", 3))
+        if sum(1 for n in c_nodes if n["status"] == "hole") >= max_holes:
+            hole_warning = (
+                f"\n[CIRCUIT_BREAKER_WARNING] 占位后未决空洞已超过上限 ({max_holes})，请优先收敛现有空洞。"
+            )
+        c_nodes.insert(c_nodes.index(node) + 1, slot)
+        _swap_node_refs(graph, node_id, slot_id)
+    else:
+        remaining_edges = [
+            e for e in c_edges
+            if e["from"] != node_id and e["to"] != node_id
+        ]
         for inc, out in bridge_pairs:
             u, v = inc["from"], out["to"]
             ct = bypass_contract or inc.get("contract") or out.get("contract") or "Bypass-Bridged"
@@ -656,22 +796,32 @@ def op_deactivate_node(
                 remaining_edges[remaining_edges.index(existing)] = _edge_from_members(
                     u, v, _edge_members(existing) + extra
                 )
-
-    _replace_edges(container, remaining_edges)
+        _replace_edges(container, remaining_edges)
 
     graph["step"] += 1
     tag = f"deactivate-{node_id}-s{graph['step']:02d}"
     _save_graph(graph)
     msg = f"deactivate {node_id} ({old_status} -> fog)"
+    if slot:
+        msg += f", slot {slot['id']}"
     if reason:
         msg += f": {reason[:30]}"
     _shadow_commit(tag, msg)
 
     info = f"已将节点 '{node_id}' 移入战争迷雾区 (fog)。"
+    if slot:
+        info += (
+            f"\n不适合自动缝合旁路（{'；'.join(slot_reasons)}），"
+            f"已在原位置留下空白节点 '{slot['id']}' 占位，原有连线全部转到它身上。"
+            f"\nJIT 指令：与用户一起重新设计这个位置，确定后对 '{slot['id']}' 执行 collapse。"
+            + hole_warning
+        )
+        return info + "\n\n" + op_focus(slot["id"], scope=scope)
     if bridged_edges:
         info += f"\n已自动缝合主干旁路：{', '.join(bridged_edges)}。"
-    elif no_bridge:
-        info += "\n已按 --no-bridge 断开关联连线（未自动缝合旁路）。"
+    if bidir_edges:
+        dropped = [f"{e['from']} <-> {e['to']}" for e in bidir_edges]
+        info += f"\n已移除双向连线：{', '.join(dropped)}。"
     return info + "\n\n" + op_focus(scope=scope)
 
 
@@ -680,10 +830,10 @@ def op_activate_node(
     after_node: str = "",
     before_node: str = "",
     contract: str = "TBD",
-    edge_kind: str = "primary",
+    edge_kind: str = "",
     scope: str = "",
 ) -> str:
-    ekind = _validate_edge_kind(edge_kind)
+    ekind = _validate_edge_kind(edge_kind) if edge_kind else ""
     graph = _load_graph()
     cfg = _load_config()
     if ekind == "feedback" and not cfg.get("allow_feedback", True):
@@ -712,24 +862,7 @@ def op_activate_node(
     if not node["label"].startswith("?"):
         node["label"] = f"? {node['label']}"
 
-    def mk_edge(u: str, v: str) -> Dict[str, Any]:
-        e: Dict[str, Any] = {"from": u, "to": v, "contract": contract}
-        if ekind != "primary":
-            e["kind"] = ekind
-        return e
-
-    if after_node and before_node:
-        filtered = [
-            e for e in c_edges
-            if not (e["from"] == after_node and e["to"] == before_node)
-        ]
-        filtered.append(mk_edge(after_node, node_id))
-        filtered.append(mk_edge(node_id, before_node))
-        _replace_edges(container, filtered)
-    elif after_node:
-        c_edges.append(mk_edge(after_node, node_id))
-    elif before_node:
-        c_edges.append(mk_edge(node_id, before_node))
+    _wire_inserted_node(container, c_edges, node_id, after_node, before_node, contract, ekind)
 
     graph["step"] += 1
     tag = f"activate-{node_id}-s{graph['step']:02d}"

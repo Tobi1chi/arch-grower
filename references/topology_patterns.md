@@ -2,6 +2,8 @@
 
 真实软件系统往往不是单一线性流水线，而是**“宏观一种拓扑 + 局部子系统各自采用最合适的拓扑”**。本指南说明何时选择 `pipeline` / `star` / `ring`，如何用 `super_node` 封装子系统，以及如何用项目 `preset` 控制架构复杂度。
 
+> 本指南中的星形 / 环形拓扑、子系统（`fold` / `promote` / `unfold`）与 `agent` / `platform` 预设都属于 **advanced 模式**。basic 模式只用一条 `pipeline`；何时、如何切换见 [advanced.md](advanced.md)。
+
 ---
 
 ## 一、 三种一等拓扑与适用场景
@@ -58,6 +60,6 @@
 | **`agent`** | `ring` | `2` | `6` | `6` | `6` | `true` | AI Agent、带记忆回写/人机审批的闭环系统 |
 | **`platform`** | `star` | `3` | `8` | `8` | `6` | `true` | 平台中枢、插件生态、多子系统架构 |
 
-- **硬护栏**：`max_depth`（默认 2，对应顶层 → 子系统 → 孙子模块）、`max_active_holes`、`auto_bridge_limit`（防止对星形中枢误执行 `deactivate` 缝出网状乱边，此时应改用 `reset-node` 或 `--no-bridge`）。
+- **硬护栏**：`max_depth`（默认 2，对应顶层 → 子系统 → 孙子模块）、`max_active_holes`、`auto_bridge_limit`（`deactivate` 超过该上限、或下线星形中枢 / 有多条双向连线的节点时，不缝合旁路，而是在原位置留空白节点占位，原连线全部转到它身上）。
 - **软护栏**：`max_chain_len`、`max_hub_degree`、`max_cycle_len`、`max_unfolded_solid`，超限时在 `focus` / `status` / 看板 HUD 给出提醒。
 - **按需调整**：经用户确认后可用 `arch config --max-depth 3 --max-chain-len 8` 单项覆盖，或用 `arch config --preset agent` 切换预设。`config.json` 在 `arch fork` 回滚图分支时会被自动保留。

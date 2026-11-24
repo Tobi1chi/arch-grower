@@ -5,8 +5,9 @@ from datetime import datetime
 from typing import List, Optional, Union
 
 from .common import (
-    ARCH_DIR, ArchEngineError, GROUNDING_FILE, GROUND_TRUTH_FILE, _default_config, _graph_if_any,
-    _load_config, _load_graph, _save_config, _shadow_commit, _today,
+    ARCH_DIR, ArchEngineError, BASIC_PRESETS, GROUNDING_FILE, GROUND_TRUTH_FILE, MODES,
+    _default_config, _graph_if_any, _load_config, _load_graph, _mode_for, _save_config,
+    _shadow_commit, _state_needs_advanced, _today,
 )
 from .graph import _find_any_node, _validate_topology
 from .records import (
@@ -290,10 +291,27 @@ def op_config(
     max_unfolded_solid: Optional[int] = None,
     auto_bridge_limit: Optional[int] = None,
     allow_feedback: Optional[bool] = None,
+    mode: Optional[str] = None,
 ) -> str:
-    """View or update project preset / guardrail config (`.arch/config.json`) and global fact budget."""
+    """View or update project mode, preset / guardrail config (`.arch/config.json`) and global fact budget."""
+    if mode is not None and mode not in MODES:
+        raise ArchEngineError(f"未知 mode '{mode}'。可选：{' / '.join(MODES)}。")
+    prev_mode = _load_config()["mode"]
     cfg = _default_config(preset) if preset is not None else _load_config()
+    cfg["mode"] = prev_mode   # switching preset keeps the mode
     changed = preset is not None
+    notes: List[str] = []
+    if mode is not None and mode != prev_mode:
+        if mode == "basic" and _state_needs_advanced():
+            raise ArchEngineError(
+                "无法切回 basic：项目已在使用 advanced 能力（星形/环形拓扑、子系统，或未处理完的迁移原文）。"
+                "JIT 指令：保持 advanced 模式。"
+            )
+        cfg["mode"] = mode
+        changed = True
+        notes.append(f"[MODE] 已切换为 {mode} 模式。" + (
+            "MCP 工具列表已更新；高级命令说明见 references/advanced.md。" if mode == "advanced" else ""
+        ))
 
     if default_topology is not None:
         cfg["default_topology"] = _validate_topology(default_topology)
@@ -320,13 +338,26 @@ def op_config(
         cfg["allow_feedback"] = bool(allow_feedback)
         changed = True
 
+    if cfg["mode"] == "basic" and _mode_for(cfg["preset"], cfg["default_topology"]) == "advanced":
+        if mode == "basic":
+            raise ArchEngineError(
+                f"basic 模式只支持 pipeline 拓扑与 {' / '.join(BASIC_PRESETS)} 预设。"
+                "JIT 指令：换回这些预设，或改用 --mode advanced。"
+            )
+        cfg["mode"] = "advanced"
+        changed = True
+        notes.append(
+            f"[MODE] preset={cfg['preset']} / default_topology={cfg['default_topology']} 需要 advanced 模式，已自动切换。"
+        )
+
     if changed:
         _save_config(cfg)
-        if _records_enabled():
+        # Only touch records.json when the fact budget itself was asked to change.
+        if (global_fact_limit is not None or preset is not None) and _records_enabled():
             rec = _load_records(for_write=True)
             rec["settings"]["global_fact_char_limit"] = int(cfg["global_fact_char_limit"])
             _save_records(rec)
-        _shadow_commit("config", f"config preset={cfg['preset']}")
+        _shadow_commit("config", f"config mode={cfg['mode']} preset={cfg['preset']}")
 
     used_text = ""
     if _records_enabled():
@@ -338,8 +369,8 @@ def op_config(
     else:
         limit = int(cfg["global_fact_char_limit"])
 
-    lines = [
-        f"preset = {cfg['preset']} | default_topology = {cfg['default_topology']}",
+    lines = notes + [
+        f"mode = {cfg['mode']} | preset = {cfg['preset']} | default_topology = {cfg['default_topology']}",
         f"max_depth = {cfg['max_depth']} | max_chain_len = {cfg['max_chain_len']} | "
         f"max_hub_degree = {cfg['max_hub_degree']} | max_cycle_len = {cfg['max_cycle_len']}",
         f"max_active_holes = {cfg['max_active_holes']} | max_unfolded_solid = {cfg['max_unfolded_solid']} | "
