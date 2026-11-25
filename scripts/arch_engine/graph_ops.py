@@ -10,132 +10,19 @@ from typing import Any, Dict, List, Optional, Union
 from .common import (
     ARCH_DIR, ArchEngineError, BASIC_PRESETS, CONFIG_FILE, ENGINE_VERSION, MODES, _mode_for, GRAVEYARD_FILE, GROUNDING_FILE,
     GROUND_TRUTH_FILE, OPEN_ITEMS_FILE, RECORDS_FILE, SEED_FILE, _default_config, _init_shadow_git,
-    _load_config, _load_graph, _run_shadow_git, _save_config, _save_graph, _shadow_commit, _today,
-    _tracked_arch_extras,
+    _run_shadow_git, _save_config, _shadow_commit, _today, _tracked_arch_extras,
 )
 from .graph import (
     IMPL_LEVELS, VERIFY_LEVELS, VERIFY_TEXT, _container_topology, _edge_from_members, _edge_kind,
-    _container_edges, _merge_bidirectional_pairs,
-    _edge_members, _find_any_node, _get_node, _is_feedback, _iter_all_nodes, _node_files,
-    _node_state, _reject_manual_super_type, _resolve_container, _star_hub_id, _state_text,
-    _store_files,
-    _validate_edge_kind, _validate_node_role, _validate_topology,
+    _edge_members, _is_feedback, _node_files, _node_state, _reject_manual_super_type, _star_hub_id,
+    _state_text, _store_files, _validate_edge_kind, _validate_node_role, _validate_topology,
 )
 from .records import (
     GT_TITLE, GY_TITLE, _load_records, _md_is_boilerplate, _new_records, _next_id,
     _records_enabled, _save_records,
 )
+from .kernel import GraphTx
 from .views import op_focus
-
-
-def _replace_edges(container: Dict[str, Any], new_edges: List[Dict[str, Any]]) -> None:
-    if "inner_edges" in container:
-        container["inner_edges"] = new_edges
-    else:
-        container["edges"] = new_edges
-
-
-def _wire_inserted_node(
-    container: Dict[str, Any],
-    c_edges: List[Dict[str, Any]],
-    node_id: str,
-    after_node: str,
-    before_node: str,
-    contract: str,
-    edge_kind: str,
-) -> None:
-    """Connect a node placed after and/or before existing nodes.
-
-    With both ends given, an existing `after -> before` edge is split in two.
-    Each half keeps that edge's contract and folded provenance; its kind is kept
-    too unless `edge_kind` overrides it. A feedback edge stays feedback only on
-    the half that returns into `before`, so the new node sits on the forward
-    path. `edge_kind` "" means "inherit, else primary".
-    """
-    if node_id in (after_node, before_node):
-        raise ArchEngineError(
-            f"节点 '{node_id}' 不能接在自己前后（会形成自环）。\n"
-            "JIT 指令：--after / --before 应指向其他已有节点。"
-        )
-    if after_node and after_node == before_node:
-        raise ArchEngineError(
-            f"--after 与 --before 不能是同一个节点 '{after_node}'（会形成 {after_node} -> {node_id} -> {after_node} 的往返）。\n"
-            f"JIT 指令：挂成旁支只给 --after；需要双向交互时先只给 --after，再用 connect --kind bidirectional。"
-        )
-
-    def plain(u: str, v: str, kind: str) -> Dict[str, Any]:
-        e: Dict[str, Any] = {"from": u, "to": v, "contract": contract}
-        if kind != "primary":
-            e["kind"] = kind
-        return e
-
-    def linked(edges: List[Dict[str, Any]], u: str, v: str) -> bool:
-        # Same rule as op_connect: one edge per direction, and a bidirectional
-        # link already covers its reverse. A fog node attached with
-        # `add-node --status fog --after X` keeps that edge, so activating it
-        # after X again must not add a second one.
-        return any(
-            (e["from"] == u and e["to"] == v)
-            or (e["from"] == v and e["to"] == u and _edge_kind(e) == "bidirectional")
-            for e in edges
-        )
-
-    if not (after_node and before_node):
-        kind = edge_kind or "primary"
-        u, v = (after_node, node_id) if after_node else (node_id, before_node)
-        if (after_node or before_node) and not linked(c_edges, u, v):
-            c_edges.append(plain(u, v, kind))
-            _replace_edges(container, _merge_bidirectional_pairs(c_edges))
-        return
-
-    def is_split(e: Dict[str, Any]) -> bool:
-        if e["from"] == after_node and e["to"] == before_node:
-            return True
-        # A bidirectional link may be stored either way round.
-        return e["from"] == before_node and e["to"] == after_node and _edge_kind(e) == "bidirectional"
-
-    old = [e for e in c_edges if is_split(e)]
-    kept = [e for e in c_edges if not is_split(e)]
-    if not old:
-        kind = edge_kind or "primary"
-        for u, v in ((after_node, node_id), (node_id, before_node)):
-            if not linked(kept, u, v):
-                kept.append(plain(u, v, kind))
-        _replace_edges(container, _merge_bidirectional_pairs(kept))
-        return
-
-    # Which side of the split each original endpoint sits on (members may name
-    # nodes folded inside `after` / `before`).
-    after_ids = {n["id"] for n in _iter_all_nodes([_get_node(container, after_node, allow_super=True)])}
-    inherit_contract = (contract or "TBD").strip() == "TBD"
-    halves: Dict[Any, Dict[Any, Dict[str, Any]]] = {}
-    for oe in old:
-        for m in _edge_members(oe):
-            mkind = _edge_kind(m)
-            forward = m["from"] in after_ids
-            if not forward and mkind == "bidirectional":
-                # Symmetric: orient it along the split.
-                m, forward = {**m, "from": m["to"], "to": m["from"]}, True
-            # A feedback member stays feedback only on the half that returns
-            # into its original target; the other half joins the forward path.
-            k1 = edge_kind or ("primary" if mkind == "feedback" else mkind)
-            k2 = edge_kind or mkind
-            c = m.get("contract", "") if inherit_contract else contract
-            if forward:   # after-side -> X -> before-side
-                parts = (((after_node, node_id), m["from"], node_id, k1),
-                         ((node_id, before_node), node_id, m["to"], k2))
-            else:         # a merged link's reverse flow: before-side -> X -> after-side
-                parts = (((before_node, node_id), m["from"], node_id, k1),
-                         ((node_id, after_node), node_id, m["to"], k2))
-            for pair, u, v, k in parts:
-                item: Dict[str, Any] = {"from": u, "to": v, "contract": c or "TBD"}
-                if k != "primary":
-                    item["kind"] = k
-                halves.setdefault(pair, {}).setdefault((u, v, k), item)
-    for (u, v), bucket in halves.items():
-        if not linked(kept, u, v):
-            kept.append(_edge_from_members(u, v, list(bucket.values())))
-    _replace_edges(container, _merge_bidirectional_pairs(kept))
 
 
 def _initial_skeleton(topology: str) -> Dict[str, Any]:
@@ -339,8 +226,7 @@ def op_init(
         "nodes": skeleton["nodes"],
         "edges": skeleton["edges"],
     }
-    _save_graph(graph)
-    _shadow_commit("arch-step-01", f"init ({topo}/{preset}): {seed[:40]}")
+    GraphTx(graph).commit("arch-step-01", f"init ({topo}/{preset}): {seed[:40]}")
     extra = f"{op_bootstrap()}\n\n" if embed else ""
     return extra + mode_note + op_focus()
 
@@ -360,9 +246,9 @@ def op_collapse(
     _reject_manual_super_type(node_type)
     if role:
         _validate_node_role(role)
-    graph = _load_graph()
-    container, c_nodes, c_edges, _, _ = _resolve_container(graph, scope)
-    node = _get_node(container, node_id, allow_super=False)
+    tx = GraphTx()
+    c = tx.container(scope)
+    node = c.get(node_id, allow_super=False)
 
     node["label"] = label
     node["spec"] = spec
@@ -376,18 +262,16 @@ def op_collapse(
         node["file_path"] = file_path
 
     if in_contract:
-        for e in c_edges:
+        for e in c.edges:
             if e["to"] == node_id:
                 e["contract"] = in_contract
     if out_contract:
-        for e in c_edges:
+        for e in c.edges:
             if e["from"] == node_id:
                 e["contract"] = out_contract
 
-    graph["step"] += 1
-    tag = f"arch-step-{graph['step']:02d}"
-    _save_graph(graph)
-    _shadow_commit(tag, f"collapse {node_id}: {label}")
+    tag = f"arch-step-{tx.bump():02d}"
+    tx.commit(tag, f"collapse {node_id}: {label}")
     return f"已锁定节点 '{node_id}' ({label})，快照 {tag}。\n\n" + op_focus(scope=scope)
 
 
@@ -403,20 +287,18 @@ def op_connect(
     if from_node == to_node:
         raise ArchEngineError("不支持将节点连向自身（自环）。")
 
-    graph = _load_graph()
-    cfg = _load_config()
-    if ekind == "feedback" and not cfg.get("allow_feedback", True):
+    tx = GraphTx()
+    if ekind == "feedback" and not tx.cfg.get("allow_feedback", True):
         raise ArchEngineError(
             "当前项目 preset 禁止回流边 (allow_feedback=false)。\n"
             "JIT 指令：若该架构确实需要闭环反馈，向用户确认后运行 arch config --allow-feedback true。"
         )
 
-    container, _, c_edges, _, _ = _resolve_container(graph, scope)
-    _get_node(container, from_node)
-    _get_node(container, to_node)
+    c = tx.container(scope)
+    c.get(from_node)
+    c.get(to_node)
 
-    pair = {from_node, to_node}
-    between = [e for e in c_edges if {e["from"], e["to"]} == pair]
+    between = c.edges_between(from_node, to_node)
     if any(_edge_kind(e) == "bidirectional" for e in between):
         raise ArchEngineError(
             f"'{from_node}' 与 '{to_node}' 之间已有双向连线，它已覆盖两个方向；如需修改契约请使用 set-edge-contract。"
@@ -427,17 +309,13 @@ def op_connect(
     edge: Dict[str, Any] = {"from": from_node, "to": to_node, "contract": contract}
     if ekind != "primary":
         edge["kind"] = ekind
-    c_edges.append(edge)
     # A bidirectional link absorbs any one-way edges already between the pair.
+    c.add_edge(edge)
     merged = ekind == "bidirectional" and bool(between)
-    if merged:
-        _replace_edges(container, _merge_bidirectional_pairs(c_edges))
 
-    graph["step"] += 1
-    tag = f"arch-step-{graph['step']:02d}"
-    _save_graph(graph)
+    tag = f"arch-step-{tx.bump():02d}"
     arrow = "<->" if ekind == "bidirectional" else "->"
-    _shadow_commit(tag, f"connect {from_node} {arrow} {to_node} ({ekind})")
+    tx.commit(tag, f"connect {from_node} {arrow} {to_node} ({ekind})")
     note = ""
     if merged:
         absorbed = ", ".join(f"{e['from']} -> {e['to']}" for e in between)
@@ -450,29 +328,15 @@ def op_connect(
 
 def op_disconnect(from_node: str, to_node: str, scope: str = "") -> str:
     """Remove an edge between two nodes in the same container."""
-    graph = _load_graph()
-    container, _, c_edges, _, _ = _resolve_container(graph, scope)
-
-    idx = next(
-        (i for i, e in enumerate(c_edges) if e["from"] == from_node and e["to"] == to_node),
-        None,
-    )
-    if idx is None:
-        idx = next(
-            (
-                i for i, e in enumerate(c_edges)
-                if _edge_kind(e) == "bidirectional" and e["from"] == to_node and e["to"] == from_node
-            ),
-            None,
-        )
-    if idx is None:
+    tx = GraphTx()
+    c = tx.container(scope)
+    found = c.find_link(from_node, to_node)
+    if not found:
         raise ArchEngineError(f"连线 '{from_node} -> {to_node}' 不存在。")
+    removed = c.remove_edge(found[0]["from"], found[0]["to"])
 
-    removed = c_edges.pop(idx)
-    graph["step"] += 1
-    tag = f"arch-step-{graph['step']:02d}"
-    _save_graph(graph)
-    _shadow_commit(tag, f"disconnect {removed['from']} -> {removed['to']}")
+    tag = f"arch-step-{tx.bump():02d}"
+    tx.commit(tag, f"disconnect {removed['from']} -> {removed['to']}")
     return f"已移除连线 '{removed['from']} -> {removed['to']}'，快照 {tag}。\n\n" + op_focus(scope=scope)
 
 
@@ -483,25 +347,16 @@ def op_set_edge_contract(
     kind: str = "",
     scope: str = "",
 ) -> str:
-    graph = _load_graph()
-    cfg = _load_config()
-    container, _, c_edges, _, _ = _resolve_container(graph, scope)
-    matches = [
-        edge for edge in c_edges
-        if edge["from"] == from_node and edge["to"] == to_node
-    ]
-    if not matches:
-        matches = [
-            edge for edge in c_edges
-            if _edge_kind(edge) == "bidirectional" and edge["from"] == to_node and edge["to"] == from_node
-        ]
+    tx = GraphTx()
+    c = tx.container(scope)
+    matches = c.find_link(from_node, to_node)
     edge_label = f"{from_node} -> {to_node}"
     if len(matches) != 1:
         raise ArchEngineError(f"需要唯一的连线 '{edge_label}'，找到 {len(matches)} 条。")
 
     edge = matches[0]
     new_kind = _validate_edge_kind(kind) if kind else _edge_kind(edge)
-    if new_kind == "feedback" and not cfg.get("allow_feedback", True):
+    if new_kind == "feedback" and not tx.cfg.get("allow_feedback", True):
         raise ArchEngineError(
             "当前项目 preset 禁止回流边 (allow_feedback=false)。请先通过 arch config --allow-feedback true 放开。"
         )
@@ -524,28 +379,17 @@ def op_set_edge_contract(
 
     note = ""
     if new_kind == "bidirectional":
-        before = len(c_edges)
-        _replace_edges(container, _merge_bidirectional_pairs(c_edges))
-        if len(_container_edges(container)) < before:
+        before = len(c.edges)
+        c.set_edges(c.edges)   # merges the pair's other edges into this link
+        if len(c.edges) < before:
             note = "\n已将同一对节点间的其他连线并入这条双向连线，原连线保留为溯源成员。"
-    elif kind and edge.get("members"):
-        # A merged bidirectional link may hold flows in both directions; a
-        # one-way edge cannot, so split it back into one edge per direction.
+    elif kind:
         u, v = edge["from"], edge["to"]
-        u_ids = {n["id"] for n in _iter_all_nodes([_get_node(container, u, allow_super=True)])}
-        fwd = [m for m in _edge_members(edge) if m["from"] in u_ids]
-        rev = [m for m in _edge_members(edge) if m["from"] not in u_ids]
-        if rev:
-            split = [_edge_from_members(u, v, fwd)] if fwd else []
-            split.append(_edge_from_members(v, u, rev))
-            idx = next(i for i, e in enumerate(c_edges) if e is edge)
-            _replace_edges(container, c_edges[:idx] + split + c_edges[idx + 1:])
+        if c.split_by_direction(edge):
             note = f"\n原双向连线含两个方向的流，已按方向拆为 {u} -> {v} 与 {v} -> {u}。"
 
-    graph["step"] += 1
-    tag = f"arch-step-{graph['step']:02d}"
-    _save_graph(graph)
-    _shadow_commit(tag, f"set-edge-contract {edge_label}")
+    tag = f"arch-step-{tx.bump():02d}"
+    tx.commit(tag, f"set-edge-contract {edge_label}")
     return f"已更新连线 '{edge_label}' 的契约，快照 {tag}。{note}\n\n" + op_focus(from_node, scope=scope)
 
 
@@ -567,22 +411,22 @@ def op_add_node(
     ekind = _validate_edge_kind(edge_kind) if edge_kind else ""
     nrole = _validate_node_role(role)
 
-    graph = _load_graph()
-    cfg = _load_config()
+    tx = GraphTx()
+    cfg = tx.cfg
     if ekind == "feedback" and not cfg.get("allow_feedback", True):
         raise ArchEngineError(
             "当前项目 preset 禁止回流边 (allow_feedback=false)。请先通过 arch config --allow-feedback true 放开。"
         )
-    if any(n["id"] == node_id for n in _iter_all_nodes(graph["nodes"])):
+    if node_id in tx.all_ids():
         raise ArchEngineError(f"节点 '{node_id}' 已存在。")
 
-    container, c_nodes, c_edges, _, _ = _resolve_container(graph, scope)
+    c = tx.container(scope)
     for ref in (after_node, before_node):
         if ref:
-            _get_node(container, ref)
+            c.get(ref)
 
     max_holes = int(cfg.get("max_active_holes", 3))
-    holes = [n for n in c_nodes if n["status"] == "hole"]
+    holes = [n for n in c.nodes if n["status"] == "hole"]
     if status == "hole" and len(holes) >= max_holes:
         raise ArchEngineError(
             f"[CircuitBreakerError] 未决空洞已达上限 ({max_holes})！"
@@ -601,34 +445,28 @@ def op_add_node(
     }
     if nrole:
         new_node["role"] = nrole
-    c_nodes.append(new_node)
+    c.insert_node(new_node)
+    c.wire_inserted(node_id, after_node, before_node, contract, ekind)
 
-    _wire_inserted_node(container, c_edges, node_id, after_node, before_node, contract, ekind)
-
-    graph["step"] += 1
-    tag = f"arch-step-{graph['step']:02d}"
-    _save_graph(graph)
-    _shadow_commit(tag, f"add-node {node_id} ({status})")
+    tag = f"arch-step-{tx.bump():02d}"
+    tx.commit(tag, f"add-node {node_id} ({status})")
     return f"已添加节点 '{node_id}' ({status})。\n\n" + op_focus(node_id if status == "hole" else None, scope=scope)
 
 
 def op_commit_node(node_id: str, file_path: Union[str, List[str]], scope: str = "") -> str:
-    graph = _load_graph()
-    container, _, _, _, _ = _resolve_container(graph, scope)
-    node = _get_node(container, node_id, allow_super=False)
+    tx = GraphTx()
+    node = tx.container(scope).get(node_id, allow_super=False)
     files = [file_path] if isinstance(file_path, str) else list(file_path)
     files = [f.strip() for f in files if f and f.strip()]
     if not files:
         raise ArchEngineError("commit-node 至少需要一个 --file-path。")
 
-    graph["step"] += 1
-    tag = f"node-{node_id}-s{graph['step']:02d}"
+    tag = f"node-{node_id}-s{tx.bump():02d}"
     _store_files(node, files)
     node["last_tag"] = tag
     node["impl"] = "built"
-    _save_graph(graph)
     shown = ", ".join(files)
-    _shadow_commit(tag, f"implement {node_id} -> {shown}", paths=[str(ARCH_DIR)] + files)
+    tx.commit(tag, f"implement {node_id} -> {shown}", paths=[str(ARCH_DIR)] + files)
     return (
         f"节点 '{node_id}' 代码已锚定至 {shown}，影子快照 {tag} 已生成，实现进度记为 built。\n"
         f"验证程度仍为 {VERIFY_TEXT[_node_state(node)['verify']['level']]}；"
@@ -637,24 +475,20 @@ def op_commit_node(node_id: str, file_path: Union[str, List[str]], scope: str = 
 
 
 def op_sync_manual(node_id: str, summary: str, scope: str = "") -> str:
-    graph = _load_graph()
-    container, _, _, _, _ = _resolve_container(graph, scope)
-    node = _get_node(container, node_id, allow_super=False)
+    tx = GraphTx()
+    node = tx.container(scope).get(node_id, allow_super=False)
 
     node["spec"] = f"{node['spec']} | [人工微调: {summary.strip()}]"
-    graph["step"] += 1
-    tag = f"manual-{node_id}-s{graph['step']:02d}"
+    tag = f"manual-{node_id}-s{tx.bump():02d}"
     node["last_tag"] = tag
-    _save_graph(graph)
     paths = [str(ARCH_DIR)] + _node_files(node)
-    _shadow_commit(tag, f"sync-manual {node_id}: {summary[:40]}", paths=paths)
+    tx.commit(tag, f"sync-manual {node_id}: {summary[:40]}", paths=paths)
     return f"已同步人工修改摘要并更新快照 {tag}。"
 
 
 def op_reset_node(node_id: str, reason: str, scope: str = "") -> str:
-    graph = _load_graph()
-    container, _, _, _, _ = _resolve_container(graph, scope)
-    node = _get_node(container, node_id, allow_super=False)
+    tx = GraphTx()
+    node = tx.container(scope).get(node_id, allow_super=False)
 
     old_label = node["label"]
     rec = _load_records(for_write=True) if _records_enabled() else None
@@ -665,27 +499,27 @@ def op_reset_node(node_id: str, reason: str, scope: str = "") -> str:
     node["impl"] = "planned"
     node["verify"] = {"level": "none", "date": ""}
 
-    if rec is not None:
-        rec["graveyard"].append({
-            "id": _next_id(rec["graveyard"], "GY"),
-            "node": node_id,
-            "scheme": old_label,
-            "reason": reason.strip(),
-            "date": _today(),
-            "detail": "",
-        })
-        _save_records(rec)
-    else:
-        existing_gy = GRAVEYARD_FILE.read_text(encoding="utf-8") if GRAVEYARD_FILE.exists() else "# 踩坑记录\n\n"
-        GRAVEYARD_FILE.write_text(
-            existing_gy + f"- ❌ [节点 {node_id} / {old_label}] 废弃原因：{reason.strip()}\n",
-            encoding="utf-8",
-        )
+    def write_graveyard() -> None:
+        # Runs only after the graph change passed validation.
+        if rec is not None:
+            rec["graveyard"].append({
+                "id": _next_id(rec["graveyard"], "GY"),
+                "node": node_id,
+                "scheme": old_label,
+                "reason": reason.strip(),
+                "date": _today(),
+                "detail": "",
+            })
+            _save_records(rec)
+        else:
+            existing_gy = GRAVEYARD_FILE.read_text(encoding="utf-8") if GRAVEYARD_FILE.exists() else "# 踩坑记录\n\n"
+            GRAVEYARD_FILE.write_text(
+                existing_gy + f"- ❌ [节点 {node_id} / {old_label}] 废弃原因：{reason.strip()}\n",
+                encoding="utf-8",
+            )
 
-    graph["step"] += 1
-    tag = f"reset-{node_id}-s{graph['step']:02d}"
-    _save_graph(graph)
-    _shadow_commit(tag, f"reset {node_id}: {reason[:40]}")
+    tag = f"reset-{node_id}-s{tx.bump():02d}"
+    tx.commit(tag, f"reset {node_id}: {reason[:40]}", before_write=write_graveyard)
     return f"已将节点 '{node_id}' 重置为 '?' 待定状态并记录进踩坑备忘。\n\n" + op_focus(node_id, scope=scope)
 
 
@@ -730,26 +564,6 @@ def op_fork(from_tag: str) -> str:
     return f"已成功安全回滚至 {from_tag} 并开启新分支 {branch_name}（已保留所有避坑记录与项目预设）。\n\n" + op_focus()
 
 
-def _swap_node_refs(graph: Dict[str, Any], old_id: str, new_id: str) -> None:
-    """Point every edge endpoint, edge provenance member and boundary port at `new_id`."""
-    def swap(x: str) -> str:
-        return new_id if x == old_id else x
-
-    containers: List[Dict[str, Any]] = [graph] + [
-        n for n in _iter_all_nodes(graph["nodes"]) if n["status"] == "super_node"
-    ]
-    for c in containers:
-        for e in c.get("inner_edges" if "children" in c else "edges", []):
-            e["from"], e["to"] = swap(e["from"]), swap(e["to"])
-            if e.get("members"):
-                e["members"] = [{**m, "from": swap(m["from"]), "to": swap(m["to"])} for m in e["members"]]
-        for key in ("entry_children", "exit_children"):
-            if key in c:
-                c[key] = [swap(x) for x in c[key]]
-        for key, ports in (c.get("parent_ports") or {}).items():
-            c["parent_ports"][key] = [swap(x) for x in ports]
-
-
 def op_deactivate_node(
     node_id: str,
     reason: str = "",
@@ -763,10 +577,11 @@ def op_deactivate_node(
     bypass edges than `auto_bridge_limit`), a blank hole takes the node's place
     and keeps all of its edges instead, so the gap stays visible.
     """
-    graph = _load_graph()
-    cfg = _load_config()
-    container, c_nodes, c_edges, _, _ = _resolve_container(graph, scope)
-    node = _get_node(container, node_id, allow_super=False)
+    tx = GraphTx()
+    cfg = tx.cfg
+    c = tx.container(scope)
+    node = c.get(node_id, allow_super=False)
+    c_edges = c.edges
 
     if node["status"] == "fog":
         return f"节点 '{node_id}' 已经在迷雾区 (fog) 中。\n\n" + op_focus(scope=scope)
@@ -784,7 +599,7 @@ def op_deactivate_node(
     bridge_limit = int(cfg.get("auto_bridge_limit", 4))
     # The hub may be implicit (no role, picked by degree), so ask the star itself.
     is_hub = node.get("role") == "hub" or (
-        _container_topology(container) == "star" and _star_hub_id(container) == node_id
+        _container_topology(c.raw) == "star" and _star_hub_id(c.raw) == node_id
     )
     slot_reasons: List[str] = []
     if is_hub and (bridge_pairs or len(bidir_edges) >= 2):
@@ -802,7 +617,7 @@ def op_deactivate_node(
     slot: Optional[Dict[str, Any]] = None
     hole_warning = ""
     if slot_reasons:
-        existing_ids = {n["id"] for n in _iter_all_nodes(graph["nodes"])}
+        existing_ids = tx.all_ids()
         slot_id, i = f"{node_id}_slot", 2
         while slot_id in existing_ids:
             slot_id, i = f"{node_id}_slot{i}", i + 1
@@ -820,12 +635,12 @@ def op_deactivate_node(
             if node.get(key):
                 slot[key] = node[key]
         max_holes = int(cfg.get("max_active_holes", 3))
-        if sum(1 for n in c_nodes if n["status"] == "hole") >= max_holes:
+        if sum(1 for n in c.nodes if n["status"] == "hole") >= max_holes:
             hole_warning = (
                 f"\n[CIRCUIT_BREAKER_WARNING] 占位后未决空洞已超过上限 ({max_holes})，请优先收敛现有空洞。"
             )
-        c_nodes.insert(c_nodes.index(node) + 1, slot)
-        _swap_node_refs(graph, node_id, slot_id)
+        c.insert_node(slot, c.index(node_id) + 1)
+        tx.replace_node_refs(node_id, slot_id)
     else:
         remaining_edges = [
             e for e in c_edges
@@ -861,18 +676,16 @@ def op_deactivate_node(
                 remaining_edges[remaining_edges.index(existing)] = _edge_from_members(
                     u, v, _edge_members(existing) + extra
                 )
-        # A bypass that lands next to a bidirectional link joins it.
-        _replace_edges(container, _merge_bidirectional_pairs(remaining_edges))
+        # A bypass that lands next to a bidirectional link joins it (set_edges merges).
+        c.set_edges(remaining_edges)
 
-    graph["step"] += 1
-    tag = f"deactivate-{node_id}-s{graph['step']:02d}"
-    _save_graph(graph)
+    tag = f"deactivate-{node_id}-s{tx.bump():02d}"
     msg = f"deactivate {node_id} ({old_status} -> fog)"
     if slot:
         msg += f", slot {slot['id']}"
     if reason:
         msg += f": {reason[:30]}"
-    _shadow_commit(tag, msg)
+    tx.commit(tag, msg)
 
     info = f"已将节点 '{node_id}' 移入战争迷雾区 (fog)。"
     if slot:
@@ -900,21 +713,21 @@ def op_activate_node(
     scope: str = "",
 ) -> str:
     ekind = _validate_edge_kind(edge_kind) if edge_kind else ""
-    graph = _load_graph()
-    cfg = _load_config()
+    tx = GraphTx()
+    cfg = tx.cfg
     if ekind == "feedback" and not cfg.get("allow_feedback", True):
         raise ArchEngineError(
             "当前项目 preset 禁止回流边 (allow_feedback=false)。请先通过 arch config --allow-feedback true 放开。"
         )
 
-    container, c_nodes, c_edges, _, _ = _resolve_container(graph, scope)
-    node = _get_node(container, node_id, allow_super=True)
+    c = tx.container(scope)
+    node = c.get(node_id, allow_super=True)
 
     if node["status"] != "fog":
         return f"节点 '{node_id}' 当前状态为 '{node['status']}'，并非处于迷雾区。\n\n" + op_focus(node_id, scope=scope)
 
     max_holes = int(cfg.get("max_active_holes", 3))
-    holes = [n for n in c_nodes if n["status"] == "hole"]
+    holes = [n for n in c.nodes if n["status"] == "hole"]
     if len(holes) >= max_holes:
         raise ArchEngineError(
             f"[CircuitBreakerError] 未决空洞已达上限 ({max_holes})！"
@@ -922,18 +735,16 @@ def op_activate_node(
         )
     for ref in (after_node, before_node):
         if ref:
-            _get_node(container, ref)
+            c.get(ref)
 
     node["status"] = "hole"
     if not node["label"].startswith("?"):
         node["label"] = f"? {node['label']}"
 
-    _wire_inserted_node(container, c_edges, node_id, after_node, before_node, contract, ekind)
+    c.wire_inserted(node_id, after_node, before_node, contract, ekind)
 
-    graph["step"] += 1
-    tag = f"activate-{node_id}-s{graph['step']:02d}"
-    _save_graph(graph)
-    _shadow_commit(tag, f"activate {node_id} (fog -> hole)")
+    tag = f"activate-{node_id}-s{tx.bump():02d}"
+    tx.commit(tag, f"activate {node_id} (fog -> hole)")
     return f"已成功从迷雾区激活节点 '{node_id}' 并接入主干！\n\n" + op_focus(node_id, scope=scope)
 
 
@@ -952,8 +763,8 @@ def op_set_node_state(
     Works on folded children too: these fields are bookkeeping, not topology.
     `refs` / `file_paths` replace the whole list; add_refs / drop_refs edit it.
     """
-    graph = _load_graph()
-    node = _find_any_node(graph, node_id)
+    tx = GraphTx()
+    node = tx.find_node(node_id)
     if node is None:
         raise ArchEngineError(f"节点 '{node_id}' 不存在。")
     if node["status"] == "super_node":
@@ -989,10 +800,8 @@ def op_set_node_state(
 
     if json.dumps(_node_state(node), sort_keys=True) == before:
         return f"节点 '{node_id}' 的状态没有变化：{_state_text(node)}。"
-    graph["step"] += 1
-    tag = f"state-{node_id}-s{graph['step']:02d}"
-    _save_graph(graph)
-    _shadow_commit(tag, f"set-node-state {node_id}")
+    tag = f"state-{node_id}-s{tx.bump():02d}"
+    tx.commit(tag, f"set-node-state {node_id}")
     st = _node_state(node)
     lines = [f"已更新节点 '{node_id}' 的状态，快照 {tag}：{_state_text(node)}"]
     if st["files"]:

@@ -4,13 +4,14 @@ node top-down into an isolated sub-system with its own topology."""
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
-from .common import ArchEngineError, _load_config, _load_graph, _save_graph, _shadow_commit
+from .common import ArchEngineError
 from .graph import (
     SOLID_STATUSES, _container_topology, _edge_from_members, _edge_kind, _edge_members,
     _merge_bidirectional_pairs,
     _get_node, _is_feedback, _iter_all_nodes, _max_subtree_depth, _node_state, _resolve_container,
     _sccs, _validate_topology,
 )
+from .kernel import GraphTx
 from .views import op_focus
 
 
@@ -130,8 +131,8 @@ def op_fold(
     same neighbour are merged (contracts joined with " | ") and keep the
     original edges as members, so arch_unfold can restore them exactly.
     """
-    graph = _load_graph()
-    cfg = _load_config()
+    tx = GraphTx()
+    graph, cfg = tx.graph, tx.cfg
     container, c_nodes, c_edges, depth, _ = _resolve_container(graph, scope)
 
     ids = list(dict.fromkeys(i.strip() for i in node_ids if i and i.strip()))
@@ -273,10 +274,8 @@ def op_fold(
         if parent_ports:
             super_node["parent_ports"] = parent_ports
 
-    graph["step"] += 1
-    tag = f"fold-{super_id}-s{graph['step']:02d}"
-    _save_graph(graph)
-    _shadow_commit(tag, f"fold {', '.join(ids)} -> {super_id}")
+    tag = f"fold-{super_id}-s{tx.bump():02d}"
+    tx.commit(tag, f"fold {', '.join(ids)} -> {super_id}")
     return (
         f"已将 {len(ids)} 个节点折叠为超级节点 '{super_id}' ({label} · topology={sub_topo})，快照 {tag}。\n"
         f"入口子节点：{', '.join(entry_children)}；出口子节点：{', '.join(exit_children)}。\n\n"
@@ -292,8 +291,8 @@ def op_promote(
     scope: str = "",
 ) -> str:
     """Promote an existing node top-down into a sub-system super_node with its own topology."""
-    graph = _load_graph()
-    cfg = _load_config()
+    tx = GraphTx()
+    graph, cfg = tx.graph, tx.cfg
     container, c_nodes, c_edges, depth, _ = _resolve_container(graph, scope)
     node = _get_node(container, node_id, allow_super=False)
     if node["status"] == "fog":
@@ -352,10 +351,8 @@ def op_promote(
     for key in ("file_path", "impl", "verify"):
         node.pop(key, None)
 
-    graph["step"] += 1
-    tag = f"promote-{node_id}-s{graph['step']:02d}"
-    _save_graph(graph)
-    _shadow_commit(tag, f"promote {node_id} -> {sub_topo} subsystem")
+    tag = f"promote-{node_id}-s{tx.bump():02d}"
+    tx.commit(tag, f"promote {node_id} -> {sub_topo} subsystem")
     return (
         f"已将节点 '{node_id}' 升级为 {sub_topo} 子系统超级节点（快照 {tag}），"
         f"内部生成 {len(children)} 个待定空洞，外层连线已保留为边界端口。\n"
@@ -377,7 +374,8 @@ def op_unfold(
     child named in `attach` (neighbour -> child).
     """
     attach = attach or {}
-    graph = _load_graph()
+    tx = GraphTx()
+    graph = tx.graph
     container, c_nodes, c_edges, _, _ = _resolve_container(graph, scope)
     sn = _get_node(container, super_id)
     if sn["status"] != "super_node":
@@ -461,10 +459,8 @@ def op_unfold(
                     expanded.append(cid)
             container[port_key] = list(dict.fromkeys(expanded))
 
-    graph["step"] += 1
-    tag = f"unfold-{super_id}-s{graph['step']:02d}"
-    _save_graph(graph)
-    _shadow_commit(tag, f"unfold {super_id}")
+    tag = f"unfold-{super_id}-s{tx.bump():02d}"
+    tx.commit(tag, f"unfold {super_id}")
     return (
         f"已展开超级节点 '{super_id}'，恢复 {len(sn['children'])} 个子节点，快照 {tag}。\n\n"
         + op_focus(scope=scope)

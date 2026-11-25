@@ -18,10 +18,10 @@ os.environ["ARCH_INVARIANTS"] = "strict"
 sys.path.insert(0, str(repo / "scripts"))
 
 import arch_cli  # noqa
-from arch_engine import ArchEngineError, graph_ops, fold_ops, record_ops, common  # noqa
+from arch_engine import ArchEngineError, graph_ops, fold_ops, record_ops, common, kernel  # noqa
 from arch_engine.invariants import validate_graph  # noqa
 
-for mod in (graph_ops, fold_ops, record_ops, common):
+for mod in (graph_ops, fold_ops, record_ops, common, kernel):
     if hasattr(mod, "_shadow_commit"):
         mod._shadow_commit = lambda *a, **k: None
     if hasattr(mod, "_init_shadow_git"):
