@@ -109,6 +109,33 @@ class Container:
         idx = next(i for i, e in enumerate(self.edges) if e is edge)
         self.set_edges(self.edges[:idx] + new_edges + self.edges[idx + 1:])
 
+    def retype_link(self, edge: Edge, contract: str, kind: str = "") -> str:
+        """Set an edge's contract and (optionally) kind, members included.
+
+        Returns "merged" when turning it bidirectional absorbed other edges of
+        the pair, "split" when turning a merged link one-way split it per
+        direction, else "".
+        """
+        new_kind = kind or _edge_kind(edge)
+        edge["contract"] = contract
+        if new_kind == "primary":
+            edge.pop("kind", None)
+        else:
+            edge["kind"] = new_kind
+        if kind and edge.get("members"):
+            for m in edge["members"]:
+                if new_kind == "primary":
+                    m.pop("kind", None)
+                else:
+                    m["kind"] = new_kind
+        if new_kind == "bidirectional":
+            before = len(self.edges)
+            self.set_edges(self.edges)   # absorbs the pair's other edges
+            return "merged" if len(self.edges) < before else ""
+        if kind and self.split_by_direction(edge):
+            return "split"
+        return ""
+
     def split_by_direction(self, edge: Edge) -> bool:
         """Split a merged link holding flows both ways into one edge per direction.
 
@@ -158,6 +185,21 @@ class Container:
         removed = edges.pop(idx)
         self.set_edges(edges)
         return removed
+
+    def add_flows(self, u: str, v: str, flows: List[Edge]) -> bool:
+        """Record original flows (members) on the `u -> v` edge, creating it if needed.
+
+        Flows the edge already carries are skipped. True when the edge is new.
+        """
+        existing = next((e for e in self.edges if e["from"] == u and e["to"] == v), None)
+        if existing is None:
+            self.add_edge(_edge_from_members(u, v, flows))
+            return True
+        known = {(m["from"], m["to"]) for m in _edge_members(existing)}
+        extra = [m for m in flows if (m["from"], m["to"]) not in known]
+        if extra:
+            self.replace_edge(existing, [_edge_from_members(u, v, _edge_members(existing) + extra)])
+        return False
 
     def link(self, u: str, v: str, contract: str = "TBD", kind: str = "primary") -> bool:
         """Add `u -> v` unless the pair already covers it; True when added."""

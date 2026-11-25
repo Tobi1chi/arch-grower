@@ -13,7 +13,7 @@ from .common import (
     _run_shadow_git, _save_config, _shadow_commit, _today, _tracked_arch_extras,
 )
 from .graph import (
-    IMPL_LEVELS, VERIFY_LEVELS, VERIFY_TEXT, _container_topology, _edge_from_members, _edge_kind,
+    IMPL_LEVELS, VERIFY_LEVELS, VERIFY_TEXT, _container_topology, _edge_kind,
     _edge_members, _is_feedback, _node_files, _node_state, _reject_manual_super_type, _star_hub_id,
     _state_text, _store_files, _validate_edge_kind, _validate_node_role, _validate_topology,
 )
@@ -365,28 +365,12 @@ def op_set_edge_contract(
     if edge.get("contract") == contract and _edge_kind(edge) == new_kind and members_match:
         return f"连线 '{edge_label}' 已使用该契约。"
 
-    edge["contract"] = contract
-    if new_kind == "primary":
-        edge.pop("kind", None)
-    else:
-        edge["kind"] = new_kind
-    if kind and edge.get("members"):
-        for m in edge["members"]:
-            if new_kind == "primary":
-                m.pop("kind", None)
-            else:
-                m["kind"] = new_kind
-
-    note = ""
-    if new_kind == "bidirectional":
-        before = len(c.edges)
-        c.set_edges(c.edges)   # merges the pair's other edges into this link
-        if len(c.edges) < before:
-            note = "\n已将同一对节点间的其他连线并入这条双向连线，原连线保留为溯源成员。"
-    elif kind:
-        u, v = edge["from"], edge["to"]
-        if c.split_by_direction(edge):
-            note = f"\n原双向连线含两个方向的流，已按方向拆为 {u} -> {v} 与 {v} -> {u}。"
+    u, v = edge["from"], edge["to"]
+    outcome = c.retype_link(edge, contract, kind)
+    note = {
+        "merged": "\n已将同一对节点间的其他连线并入这条双向连线，原连线保留为溯源成员。",
+        "split": f"\n原双向连线含两个方向的流，已按方向拆为 {u} -> {v} 与 {v} -> {u}。",
+    }.get(outcome, "")
 
     tag = f"arch-step-{tx.bump():02d}"
     tx.commit(tag, f"set-edge-contract {edge_label}")
@@ -642,10 +626,7 @@ def op_deactivate_node(
         c.insert_node(slot, c.index(node_id) + 1)
         tx.replace_node_refs(node_id, slot_id)
     else:
-        remaining_edges = [
-            e for e in c_edges
-            if e["from"] != node_id and e["to"] != node_id
-        ]
+        c.set_edges([e for e in c_edges if e["from"] != node_id and e["to"] != node_id])
         for inc, out in bridge_pairs:
             u, v = inc["from"], out["to"]
             ct = bypass_contract or inc.get("contract") or out.get("contract") or "Bypass-Bridged"
@@ -663,21 +644,9 @@ def op_deactivate_node(
                     if inc_fb or out_fb or _is_feedback(a) or _is_feedback(b):
                         item["kind"] = "feedback"
                     bypass.append(item)
-            if not bypass:
-                continue
-            existing = next((e for e in remaining_edges if e["from"] == u and e["to"] == v), None)
-            if existing is None:
-                remaining_edges.append(_edge_from_members(u, v, bypass))
+            # A bypass next to a bidirectional link joins it (set_edges merges).
+            if bypass and c.add_flows(u, v, bypass):
                 bridged_edges.append(f"{u} -> {v}")
-                continue
-            known = {(m["from"], m["to"]) for m in _edge_members(existing)}
-            extra = [m for m in bypass if (m["from"], m["to"]) not in known]
-            if extra:
-                remaining_edges[remaining_edges.index(existing)] = _edge_from_members(
-                    u, v, _edge_members(existing) + extra
-                )
-        # A bypass that lands next to a bidirectional link joins it (set_edges merges).
-        c.set_edges(remaining_edges)
 
     tag = f"deactivate-{node_id}-s{tx.bump():02d}"
     msg = f"deactivate {node_id} ({old_status} -> fog)"
