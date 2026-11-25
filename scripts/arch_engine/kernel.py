@@ -242,6 +242,209 @@ class Container:
                 kept.append(_edge_from_members(u, v, list(bucket.values())))
         self.set_edges(kept)
 
+    # -- subsystems ----------------------------------------------------------
+    def partition(self, ids: Set[str]) -> Tuple[List[Edge], List[Edge], List[Edge]]:
+        """Split this container's edges by a node set: (inner, incoming, outgoing)."""
+        inner = [e for e in self.edges if e["from"] in ids and e["to"] in ids]
+        incoming = [e for e in self.edges if e["to"] in ids and e["from"] not in ids]
+        outgoing = [e for e in self.edges if e["from"] in ids and e["to"] not in ids]
+        return inner, incoming, outgoing
+
+    def contract_into(self, super_node: Node, ids: List[str]) -> None:
+        """Fold the nodes `ids` into `super_node` (built by the caller, without body).
+
+        Children keep `ids` order; inner edges move inside. Boundary edges are
+        re-pointed at the super node, parallel ones merged with the originals
+        kept as members, so `expand` can restore them exactly. When this
+        container is itself a subsystem, its ports naming a folded node now
+        name the super node, and the super node remembers which of its
+        children those were (`parent_ports`).
+        """
+        if super_node["id"] in self.tx.all_ids():
+            raise ArchEngineError(f"节点 '{super_node['id']}' 已存在，请换一个超级节点 ID。")
+        member_set = set(ids)
+        inner, incoming, outgoing = self.partition(member_set)
+        sid = super_node["id"]
+
+        grouped: Dict[Tuple[str, str], List[Edge]] = {}
+        for e in incoming:
+            grouped.setdefault((e["from"], sid), []).extend(_edge_members(e))
+        for e in outgoing:
+            grouped.setdefault((sid, e["to"]), []).extend(_edge_members(e))
+        folded_edges = [_edge_from_members(u, v, ms) for (u, v), ms in grouped.items()]
+
+        by_id = {n["id"]: n for n in self.nodes}
+        super_node["children"] = [by_id[nid] for nid in ids]
+        super_node["inner_edges"] = inner
+
+        # The super node takes its first member's place, so ordering stays stable.
+        insert_at = min(i for i, n in enumerate(self.nodes) if n["id"] in member_set)
+        remaining = [n for n in self.nodes if n["id"] not in member_set]
+        self.set_nodes(remaining[:insert_at] + [super_node] + remaining[insert_at:])
+        self.set_edges([
+            e for e in self.edges if e["from"] not in member_set and e["to"] not in member_set
+        ] + folded_edges)
+
+        if not self.is_root:
+            parent_ports: Dict[str, List[str]] = {}
+            for key in ("entry_children", "exit_children"):
+                ports = self.raw.get(key) or []
+                matched = [cid for cid in ports if cid in member_set]
+                if matched:
+                    parent_ports[key] = matched
+                self.raw[key] = list(dict.fromkeys(sid if cid in member_set else cid for cid in ports))
+            if parent_ports:
+                super_node["parent_ports"] = parent_ports
+
+    def promote(
+        self, node_id: str, children: List[Node], inner_edges: List[Edge],
+        entry: List[str], exit_: List[str],
+    ) -> Node:
+        """Give a leaf node a body: it becomes a subsystem super node in place."""
+        node = self.get(node_id, allow_super=False)
+        existing = self.tx.all_ids()
+        collisions = [c["id"] for c in children if c["id"] in existing]
+        if collisions:
+            raise ArchEngineError(f"子系统初始子节点 ID 冲突：{', '.join(collisions)}。")
+        node["status"] = "super_node"
+        node["type"] = "super_node"
+        node["children"] = children
+        node["inner_edges"] = inner_edges
+        node["entry_children"] = entry
+        node["exit_children"] = exit_
+        return node
+
+    def expand(self, super_id: str, attach: Optional[Dict[str, str]] = None) -> Node:
+        """Unfold a super node in place and return it.
+
+        - Edges on the super node split back into their members, each routed
+          to the child now holding its endpoint (direction taken per member,
+          since a merged bidirectional link holds flows both ways).
+        - Members added while folded (no child endpoint) go to the unique
+          entry / exit child, or to `attach[neighbour]`.
+        - Ancestor containers' provenance members naming the super node are
+          rewritten to the matching entry / exit child the same way, so a
+          later unfold of an outer subsystem still finds real endpoints.
+        - This container's ports (and saved `parent_ports`) naming the super
+          node expand to its children.
+
+        Everything is computed first; on an unresolved endpoint it raises
+        and the graph is left untouched.
+        """
+        attach = attach or {}
+        sn = self.get(super_id)
+        if sn["status"] != "super_node":
+            raise ArchEngineError(f"节点 '{super_id}' 不是超级节点，无需展开。")
+        child_ids = {c["id"] for c in sn["children"]}
+        bad = {k: v for k, v in attach.items() if v not in child_ids}
+        if bad:
+            raise ArchEngineError(
+                f"attach 指定的子节点不在 '{super_id}' 内：{bad}。可选子节点：{', '.join(sorted(child_ids))}。"
+            )
+        # Which direct child holds a given node id (at any depth).
+        owner = {d["id"]: c["id"] for c in sn["children"] for d in _iter_all_nodes([c])}
+        unresolved: List[str] = []
+
+        def route(inbound: bool, neighbour: str, where: str) -> str:
+            candidates = sn["entry_children"] if inbound else sn["exit_children"]
+            child = attach.get(neighbour) or (candidates[0] if len(candidates) == 1 else "")
+            if not child:
+                arrow = f"{neighbour} -> {super_id}" if inbound else f"{super_id} -> {neighbour}"
+                item = f"{arrow}{where}（可选：{', '.join(candidates or sorted(child_ids))}）"
+                if item not in unresolved:
+                    unresolved.append(item)
+            return child
+
+        # 1. Own boundary edges.
+        grouped: Dict[Tuple[str, str], List[Edge]] = {}
+        for e in (e for e in self.edges if super_id in (e["from"], e["to"])):
+            inbound = e["to"] == super_id
+            neighbour = e["from"] if inbound else e["to"]
+            for m in _edge_members(e):
+                # Direction comes from the member: a merged bidirectional link
+                # may be stored the other way round from the flows it holds.
+                if m["to"] in owner:
+                    m_inbound, inner_end = True, "to"
+                elif m["from"] in owner:
+                    m_inbound, inner_end = False, "from"
+                elif m["to"] == super_id:       # attached while folded
+                    m_inbound, inner_end = True, "to"
+                elif m["from"] == super_id:
+                    m_inbound, inner_end = False, "from"
+                else:
+                    m_inbound, inner_end = inbound, ("to" if inbound else "from")
+                child = owner.get(m[inner_end])
+                if child is None:
+                    child = route(m_inbound, neighbour, "")
+                    if not child:
+                        continue
+                    m = {**m, inner_end: child}
+                key = (neighbour, child) if m_inbound else (child, neighbour)
+                grouped.setdefault(key, []).append(m)
+
+        # 2. Ancestor provenance naming the super node itself.
+        rewrites: List[Tuple[Edge, List[Edge]]] = []
+        for anc in self.ancestors():
+            where = f"（{anc.id or 'root'} 层连线的溯源）"
+            for e in anc.edges:
+                members = e.get("members") or []
+                if not any(super_id in (m["from"], m["to"]) for m in members):
+                    continue
+                new_members: List[Edge] = []
+                for m in members:
+                    if m["to"] == super_id:
+                        child = route(True, m["from"], where)
+                        m = {**m, "to": child or super_id}
+                    elif m["from"] == super_id:
+                        child = route(False, m["to"], where)
+                        m = {**m, "from": child or super_id}
+                    new_members.append(m)
+                rewrites.append((e, new_members))
+
+        if unresolved:
+            raise ArchEngineError(
+                f"超级节点 '{super_id}' 折叠期间新增了无法自动归位的连线：\n  - "
+                + "\n  - ".join(unresolved)
+                + "\nJIT 指令：向用户确认每条连线应接到哪个子节点，然后带上 attach={外部节点ID: 子节点ID} 重新调用 arch_unfold。"
+            )
+
+        # 3. Apply.
+        restored: List[Edge] = [dict(e) for e in sn["inner_edges"]]
+        restored += [_edge_from_members(u, v, ms) for (u, v), ms in grouped.items()]
+        idx = self.index(super_id)
+        self.set_nodes(self.nodes[:idx] + sn["children"] + self.nodes[idx + 1:])
+        self.set_edges([e for e in self.edges if super_id not in (e["from"], e["to"])] + restored)
+        for e, new_members in rewrites:
+            e["members"] = new_members
+
+        if not self.is_root:
+            saved_ports = sn.get("parent_ports") or {}
+
+            def current_children(port_ids: List[str]) -> List[str]:
+                # Saved ids may since have been folded deeper inside `sn` (or be
+                # stale); map each to the direct child of `sn` that holds it now.
+                return list(dict.fromkeys(owner[p] for p in port_ids if p in owner))
+
+            def port_children(key: str) -> List[str]:
+                return (
+                    current_children(saved_ports.get(key) or [])
+                    or current_children(sn.get(key) or [])
+                    or [c["id"] for c in sn["children"]]
+                )
+
+            for key in ("entry_children", "exit_children"):
+                expanded: List[str] = []
+                for cid in self.raw.get(key) or []:
+                    expanded.extend(port_children(key) if cid == super_id else [cid])
+                self.raw[key] = list(dict.fromkeys(expanded))
+            # Ports this container saved for *its* parent may name the super node too.
+            for key, ids in (self.raw.get("parent_ports") or {}).items():
+                expanded = []
+                for cid in ids:
+                    expanded.extend(port_children(key) if cid == super_id else [cid])
+                self.raw["parent_ports"][key] = list(dict.fromkeys(expanded))
+        return sn
+
 
 class GraphTx:
     """One command's change to graph.json.

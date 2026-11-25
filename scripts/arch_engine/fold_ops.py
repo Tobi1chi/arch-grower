@@ -6,10 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .common import ArchEngineError
 from .graph import (
-    SOLID_STATUSES, _container_topology, _edge_from_members, _edge_kind, _edge_members,
-    _merge_bidirectional_pairs,
-    _get_node, _is_feedback, _iter_all_nodes, _max_subtree_depth, _node_state, _resolve_container,
-    _sccs, _validate_topology,
+    SOLID_STATUSES, _container_topology, _edge_kind, _is_feedback, _max_subtree_depth,
+    _node_state, _sccs, _validate_topology,
 )
 from .kernel import GraphTx
 from .views import op_focus
@@ -41,17 +39,6 @@ def _infer_folded_topology(
     if inner and all(_edge_kind(e) == "bidirectional" for e in inner):
         return "star"
     return "pipeline"
-
-
-def _replace_container_lists(
-    container: Dict[str, Any], nodes: List[Dict[str, Any]], edges: List[Dict[str, Any]],
-) -> None:
-    if "children" in container:
-        container["children"] = nodes
-        container["inner_edges"] = edges
-    else:
-        container["nodes"] = nodes
-        container["edges"] = edges
 
 
 def _starter_subsystem_skeleton(
@@ -132,16 +119,17 @@ def op_fold(
     original edges as members, so arch_unfold can restore them exactly.
     """
     tx = GraphTx()
-    graph, cfg = tx.graph, tx.cfg
-    container, c_nodes, c_edges, depth, _ = _resolve_container(graph, scope)
+    cfg = tx.cfg
+    c = tx.container(scope)
+    container, c_nodes, c_edges, depth = c.raw, c.nodes, c.edges, c.depth
 
     ids = list(dict.fromkeys(i.strip() for i in node_ids if i and i.strip()))
     if len(ids) < 2:
         raise ArchEngineError("折叠至少需要 2 个节点。")
-    if any(n["id"] == super_id for n in _iter_all_nodes(graph["nodes"])):
+    if super_id in tx.all_ids():
         raise ArchEngineError(f"节点 '{super_id}' 已存在，请换一个超级节点 ID。")
 
-    members = {nid: _get_node(container, nid) for nid in ids}
+    members = {nid: c.get(nid) for nid in ids}
     unsettled = [f"{nid}({n['status']})" for nid, n in members.items() if n["status"] not in SOLID_STATUSES]
     if unsettled:
         raise ArchEngineError(
@@ -161,9 +149,7 @@ def op_fold(
         )
 
     member_set = set(ids)
-    inner = [e for e in c_edges if e["from"] in member_set and e["to"] in member_set]
-    incoming = [e for e in c_edges if e["to"] in member_set and e["from"] not in member_set]
-    outgoing = [e for e in c_edges if e["from"] in member_set and e["to"] not in member_set]
+    inner, incoming, outgoing = c.partition(member_set)
 
     # Weak connectivity: the members must form one module.
     undirected: Dict[str, set] = {nid: set() for nid in ids}
@@ -225,13 +211,6 @@ def op_fold(
             nid for nid in ids if members[nid].get("role") in ("hub", "exit")
         ] or [ids[-1]]
 
-    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    for e in incoming:
-        grouped.setdefault((e["from"], super_id), []).extend(_edge_members(e))
-    for e in outgoing:
-        grouped.setdefault((super_id, e["to"]), []).extend(_edge_members(e))
-    folded_edges = [_edge_from_members(u, v, ms) for (u, v), ms in grouped.items()]
-
     sub_topo = _validate_topology(topology) if topology else _infer_folded_topology(members, inner)
     child_stages = {members[nid].get("stage", "") for nid in ids}
     super_node: Dict[str, Any] = {
@@ -243,36 +222,12 @@ def op_fold(
         "spec": spec,
         "file_path": "",
         "last_tag": "",
-        "children": [members[nid] for nid in ids],
-        "inner_edges": inner,
         "entry_children": entry_children,
         "exit_children": exit_children,
     }
     if sub_topo != "pipeline" or topology:
         super_node["topology"] = sub_topo
-
-    # Put the super node where its first member was, so ordering stays stable.
-    insert_at = min(i for i, n in enumerate(c_nodes) if n["id"] in member_set)
-    remaining = [n for n in c_nodes if n["id"] not in member_set]
-    new_nodes = remaining[:insert_at] + [super_node] + remaining[insert_at:]
-    # Boundary edges are grouped per direction; a neighbour linked both ways
-    # with a bidirectional edge ends up as one bidirectional link to the super node.
-    new_edges = _merge_bidirectional_pairs([
-        e for e in c_edges if e["from"] not in member_set and e["to"] not in member_set
-    ] + folded_edges)
-    _replace_container_lists(container, new_nodes, new_edges)
-    if "children" in container:
-        parent_ports: Dict[str, List[str]] = {}
-        for port_key in ("entry_children", "exit_children"):
-            ports = container.get(port_key) or []
-            matched = [cid for cid in ports if cid in member_set]
-            if matched:
-                parent_ports[port_key] = matched
-            container[port_key] = list(dict.fromkeys(
-                super_id if cid in member_set else cid for cid in ports
-            ))
-        if parent_ports:
-            super_node["parent_ports"] = parent_ports
+    c.contract_into(super_node, ids)
 
     tag = f"fold-{super_id}-s{tx.bump():02d}"
     tx.commit(tag, f"fold {', '.join(ids)} -> {super_id}")
@@ -292,9 +247,10 @@ def op_promote(
 ) -> str:
     """Promote an existing node top-down into a sub-system super_node with its own topology."""
     tx = GraphTx()
-    graph, cfg = tx.graph, tx.cfg
-    container, c_nodes, c_edges, depth, _ = _resolve_container(graph, scope)
-    node = _get_node(container, node_id, allow_super=False)
+    cfg = tx.cfg
+    c = tx.container(scope)
+    depth = c.depth
+    node = c.get(node_id, allow_super=False)
     if node["status"] == "fog":
         raise ArchEngineError(
             f"节点 '{node_id}' 处于储备区 (fog)，请先 activate 激活后再升级为子系统。"
@@ -323,30 +279,21 @@ def op_promote(
         node_id, sub_topo, stage=node.get("stage", ""),
     )
 
-    existing_ids = {n["id"] for n in _iter_all_nodes(graph["nodes"])}
-    collisions = [c["id"] for c in children if c["id"] in existing_ids]
-    if collisions:
-        raise ArchEngineError(f"子系统初始子节点 ID 冲突：{', '.join(collisions)}。")
+    c.promote(node_id, children, inner_edges, entry_children, exit_children)
 
     clean_label = (label or node["label"]).lstrip("? ").strip() or node_id
     node["label"] = clean_label
     if spec:
         node["spec"] = spec
-    node["status"] = "super_node"
-    node["type"] = "super_node"
     node["topology"] = sub_topo
     node["promoted"] = True
-    node["children"] = children
-    node["inner_edges"] = inner_edges
-    node["entry_children"] = entry_children
-    node["exit_children"] = exit_children
     node["last_tag"] = ""
     # Files still bound to a planned node (e.g. kept by reset-node) move to the
     # core starter child, where status / export-task / drift checks see them.
     moved_files = state["files"]
     if moved_files:
         core_suffix = {"star": "_hub", "ring": "_decide"}.get(sub_topo, "_core")
-        core = next(c for c in children if c["id"] == f"{node_id}{core_suffix}")
+        core = next(ch for ch in children if ch["id"] == f"{node_id}{core_suffix}")
         core["file_path"] = node["file_path"]
     for key in ("file_path", "impl", "verify"):
         node.pop(key, None)
@@ -371,93 +318,12 @@ def op_unfold(
     stands for (its members), regrouped by the child that now holds each
     endpoint. A contract edited while folded overrides the members' contracts.
     Edges attached after folding go to the unique entry / exit child, or to the
-    child named in `attach` (neighbour -> child).
+    child named in `attach` (neighbour -> child). Outer subsystems' provenance
+    that names this super node is re-pointed at its children the same way
+    (see `Container.expand`).
     """
-    attach = attach or {}
     tx = GraphTx()
-    graph = tx.graph
-    container, c_nodes, c_edges, _, _ = _resolve_container(graph, scope)
-    sn = _get_node(container, super_id)
-    if sn["status"] != "super_node":
-        raise ArchEngineError(f"节点 '{super_id}' 不是超级节点，无需展开。")
-
-    child_ids = {c["id"] for c in sn["children"]}
-    bad = {k: v for k, v in attach.items() if v not in child_ids}
-    if bad:
-        raise ArchEngineError(
-            f"attach 指定的子节点不在 '{super_id}' 内：{bad}。可选子节点：{', '.join(sorted(child_ids))}。"
-        )
-
-    # Which child of this super node holds a given node id (at any depth).
-    owner = {d["id"]: c["id"] for c in sn["children"] for d in _iter_all_nodes([c])}
-
-    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    unresolved: List[str] = []
-    for e in (e for e in c_edges if super_id in (e["from"], e["to"])):
-        inbound = e["to"] == super_id
-        neighbour = e["from"] if inbound else e["to"]
-        for m in _edge_members(e):
-            # A merged bidirectional link may hold members running either way,
-            # so take the direction from the member, not from the edge.
-            if m["to"] in owner:
-                m_inbound, inner_end = True, "to"
-            elif m["from"] in owner:
-                m_inbound, inner_end = False, "from"
-            else:
-                m_inbound, inner_end = inbound, ("to" if inbound else "from")
-            child = owner.get(m[inner_end])
-            if child is None:
-                # Attached while folded: route it to the right child and record
-                # that child as the real endpoint for any later unfold.
-                candidates = sn["entry_children"] if inbound else sn["exit_children"]
-                child = attach.get(neighbour) or (candidates[0] if len(candidates) == 1 else "")
-                if not child:
-                    arrow = f"{neighbour} -> {super_id}" if inbound else f"{super_id} -> {neighbour}"
-                    item = f"{arrow}（可选：{', '.join(candidates or sorted(child_ids))}）"
-                    if item not in unresolved:
-                        unresolved.append(item)
-                    continue
-                m = {**m, inner_end: child}
-            key = (neighbour, child) if m_inbound else (child, neighbour)
-            grouped.setdefault(key, []).append(m)
-
-    restored: List[Dict[str, Any]] = [dict(e) for e in sn["inner_edges"]]
-    restored += [_edge_from_members(u, v, ms) for (u, v), ms in grouped.items()]
-
-    if unresolved:
-        raise ArchEngineError(
-            f"超级节点 '{super_id}' 折叠期间新增了无法自动归位的连线：\n  - "
-            + "\n  - ".join(unresolved)
-            + "\nJIT 指令：向用户确认每条连线应接到哪个子节点，然后带上 attach={外部节点ID: 子节点ID} 重新调用 arch_unfold。"
-        )
-
-    idx = next(i for i, n in enumerate(c_nodes) if n["id"] == super_id)
-    new_nodes = c_nodes[:idx] + sn["children"] + c_nodes[idx + 1:]
-    new_edges = _merge_bidirectional_pairs(
-        [e for e in c_edges if super_id not in (e["from"], e["to"])] + restored
-    )
-    _replace_container_lists(container, new_nodes, new_edges)
-    if "children" in container:
-        saved_ports = sn.get("parent_ports") or {}
-
-        def current_children(port_ids: List[str]) -> List[str]:
-            # Saved ids may since have been folded deeper inside `sn` (or be
-            # stale); map each to the direct child of `sn` that holds it now.
-            return list(dict.fromkeys(owner[p] for p in port_ids if p in owner))
-
-        for port_key in ("entry_children", "exit_children"):
-            ports = container.get(port_key) or []
-            expanded: List[str] = []
-            for cid in ports:
-                if cid == super_id:
-                    expanded.extend(
-                        current_children(saved_ports.get(port_key) or [])
-                        or current_children(sn.get(port_key) or [])
-                        or [c["id"] for c in sn["children"]]
-                    )
-                else:
-                    expanded.append(cid)
-            container[port_key] = list(dict.fromkeys(expanded))
+    sn = tx.container(scope).expand(super_id, attach)
 
     tag = f"unfold-{super_id}-s{tx.bump():02d}"
     tx.commit(tag, f"unfold {super_id}")
