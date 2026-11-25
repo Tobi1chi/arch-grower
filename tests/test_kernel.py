@@ -167,6 +167,27 @@ class FoldRoundTripTest(KernelTestCase):
             for ids in (c.raw.get("parent_ports") or {}).values():
                 self.assertNotIn(sub, ids)
 
+    def test_unfold_deep_node_updates_ancestor_parent_ports(self) -> None:
+        # An outer subsystem's parent_ports keep naming a node after it is
+        # folded deeper; unfolding that node must update them (found by fuzzing).
+        arch_cli.op_config(max_depth=5)
+        arch_cli.op_promote("core_transform", topology="pipeline")
+        self.settle("core_transform_in", "core_transform_core", scope="core_transform")
+        arch_cli.op_promote("core_transform_out", topology="pipeline", scope="core_transform")
+        out = "core_transform_out"
+        self.settle(f"{out}_in", f"{out}_core", f"{out}_out", scope=out)
+        arch_cli.op_fold(["core_transform_core", out], "A", "A", "spec", scope="core_transform")
+        self.assertEqual(GraphTx().find_node("A")["parent_ports"], {"exit_children": [out]})
+        arch_cli.op_fold(["core_transform_core", out], "B", "B", "spec", scope="A")
+
+        arch_cli.op_unfold(out, scope="B")
+        self.assertEqual(GraphTx().find_node("A")["parent_ports"], {"exit_children": [f"{out}_out"]})
+
+        # And the outer unfolds still restore the subsystem's exit port.
+        arch_cli.op_unfold("B", scope="A")
+        arch_cli.op_unfold("A", scope="core_transform")
+        self.assertEqual(GraphTx().find_node("core_transform")["exit_children"], [f"{out}_out"])
+
     def test_unfold_reversed_merged_link_routes_each_flow(self) -> None:
         # The merged link is stored `final_output <-> core_transform` but holds
         # `core_transform -> final_output` too; each member must be routed by

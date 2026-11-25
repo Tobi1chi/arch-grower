@@ -140,6 +140,10 @@ def run(seed):
                                  list(history)))
                 continue
             history.append((scope, call)); OK[call[0]] += 1
+            # Soft violations (warnings) do not block a write; count them as findings too.
+            for v in validate_graph(json.loads(Path(".arch/graph.json").read_text()), {"max_depth": 3}):
+                if v.severity == "warning" and v.code != "I11":
+                    findings.append(("WARNING", seed, step, scope, call, [str(v)], list(history)))
     return findings
 
 
