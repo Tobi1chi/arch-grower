@@ -459,32 +459,34 @@ class Container:
         for e, new_members in rewrites:
             e["members"] = new_members
 
+        saved_ports = sn.get("parent_ports") or {}
+
+        def current_children(port_ids: List[str]) -> List[str]:
+            # Saved ids may since have been folded deeper inside `sn` (or be
+            # stale); map each to the direct child of `sn` that holds it now.
+            return list(dict.fromkeys(owner[p] for p in port_ids if p in owner))
+
+        def port_children(key: str) -> List[str]:
+            return (
+                current_children(saved_ports.get(key) or [])
+                or current_children(sn.get(key) or [])
+                or [c["id"] for c in sn["children"]]
+            )
+
+        def expand_ids(ids: List[str], key: str) -> List[str]:
+            out: List[str] = []
+            for cid in ids:
+                out.extend(port_children(key) if cid == super_id else [cid])
+            return list(dict.fromkeys(out))
+
         if not self.is_root:
-            saved_ports = sn.get("parent_ports") or {}
-
-            def current_children(port_ids: List[str]) -> List[str]:
-                # Saved ids may since have been folded deeper inside `sn` (or be
-                # stale); map each to the direct child of `sn` that holds it now.
-                return list(dict.fromkeys(owner[p] for p in port_ids if p in owner))
-
-            def port_children(key: str) -> List[str]:
-                return (
-                    current_children(saved_ports.get(key) or [])
-                    or current_children(sn.get(key) or [])
-                    or [c["id"] for c in sn["children"]]
-                )
-
             for key in ("entry_children", "exit_children"):
-                expanded: List[str] = []
-                for cid in self.raw.get(key) or []:
-                    expanded.extend(port_children(key) if cid == super_id else [cid])
-                self.raw[key] = list(dict.fromkeys(expanded))
-            # Ports this container saved for *its* parent may name the super node too.
-            for key, ids in (self.raw.get("parent_ports") or {}).items():
-                expanded = []
-                for cid in ids:
-                    expanded.extend(port_children(key) if cid == super_id else [cid])
-                self.raw["parent_ports"][key] = list(dict.fromkeys(expanded))
+                self.raw[key] = expand_ids(self.raw.get(key) or [], key)
+        # Saved parent ports may name the super node from any level above:
+        # they keep pointing at a node after it is folded deeper.
+        for holder in [self] + self.ancestors():
+            for key, ids in (holder.raw.get("parent_ports") or {}).items():
+                holder.raw["parent_ports"][key] = expand_ids(ids, key)
         return sn
 
 
