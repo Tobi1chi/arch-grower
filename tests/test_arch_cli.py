@@ -14,6 +14,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
+# Every regression test doubles as an invariant check: any op that writes a
+# structurally broken graph fails here instead of only warning.
+os.environ.setdefault("ARCH_INVARIANTS", "strict")
+
 import arch_cli  # noqa: E402
 
 
@@ -1715,6 +1719,127 @@ class ModeTest(EngineTestCase):
         out = arch_cli.op_focus()
         self.assertIn("arch_fold", out)
         self.assertIn("advanced 模式", out)
+
+
+class InsertWiringGuardTest(EngineTestCase):
+    """Found by invariant fuzzing: insert / activate wiring made loops and duplicates."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        arch_cli.op_config(max_active_holes=9)
+
+    def test_activate_next_to_itself_is_rejected(self) -> None:
+        arch_cli.op_add_node("cache", "Cache", "spec", status="fog")
+        for kw in ({"after_node": "cache"}, {"before_node": "cache"}):
+            with self.assertRaises(arch_cli.ArchEngineError):
+                arch_cli.op_activate_node("cache", **kw)
+        self.assertEqual(arch_cli._load_graph()["nodes"][-1]["status"], "fog")
+
+    def test_after_equals_before_is_rejected(self) -> None:
+        with self.assertRaises(arch_cli.ArchEngineError):
+            arch_cli.op_add_node("n", "? N", "tbd", after_node="core_transform", before_node="core_transform")
+        self.assertFalse(any(n["id"] == "n" for n in arch_cli._load_graph()["nodes"]))
+
+    def test_activate_fog_branch_keeps_single_edge(self) -> None:
+        # A fog branch keeps its edge to the trunk; activating it after the
+        # same node must not add a second copy.
+        arch_cli.op_add_node("backup", "Backup", "later", status="fog", after_node="final_output")
+        arch_cli.op_activate_node("backup", after_node="final_output")
+        edges = arch_cli._load_graph()["edges"]
+        self.assertEqual(sum(1 for e in edges if (e["from"], e["to"]) == ("final_output", "backup")), 1)
+
+    def test_activate_fog_branch_between_keeps_single_edges(self) -> None:
+        arch_cli.op_add_node("tap", "Tap", "later", status="fog", after_node="entry_input")
+        arch_cli.op_activate_node("tap", after_node="entry_input", before_node="core_transform")
+        edges = arch_cli._load_graph()["edges"]
+        pairs = [(e["from"], e["to"]) for e in edges]
+        self.assertEqual(pairs.count(("entry_input", "tap")), 1)
+        self.assertEqual(pairs.count(("tap", "core_transform")), 1)
+
+
+class BidirectionalMergeTest(EngineTestCase):
+    """A bidirectional link absorbs every other edge between the same pair."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        arch_cli.op_config(mode="advanced", max_active_holes=9)
+
+    def pair(self, a: str, b: str, scope_edges=None) -> list:
+        edges = arch_cli._load_graph()["edges"] if scope_edges is None else scope_edges
+        return [e for e in edges if {e["from"], e["to"]} == {a, b}]
+
+    def test_connect_bidirectional_over_reverse_edge_merges(self) -> None:
+        out = arch_cli.op_connect("final_output", "core_transform", "sync", kind="bidirectional")
+        self.assertIn("并入这条双向连线", out)
+        [link] = self.pair("core_transform", "final_output")
+        self.assertEqual(link["kind"], "bidirectional")
+        flows = {(m["from"], m["to"], m.get("kind", "primary")) for m in link["members"]}
+        self.assertEqual(flows, {
+            ("core_transform", "final_output", "primary"),
+            ("final_output", "core_transform", "bidirectional"),
+        })
+
+    def test_connect_anything_onto_bidirectional_is_rejected(self) -> None:
+        arch_cli.op_set_edge_contract("entry_input", "core_transform", "rpc", kind="bidirectional")
+        for a, b, k in (("core_transform", "entry_input", "primary"),
+                        ("core_transform", "entry_input", "bidirectional"),
+                        ("entry_input", "core_transform", "feedback")):
+            with self.assertRaises(arch_cli.ArchEngineError):
+                arch_cli.op_connect(a, b, kind=k)
+
+    def test_set_kind_bidirectional_merges_and_back_splits(self) -> None:
+        arch_cli.op_connect("final_output", "core_transform", "fb", kind="feedback")
+        arch_cli.op_set_edge_contract("core_transform", "final_output", "sync", kind="bidirectional")
+        [link] = self.pair("core_transform", "final_output")
+        self.assertEqual(link["kind"], "bidirectional")
+        self.assertEqual(len(link["members"]), 2)
+        # Turning the merged link one-way again splits it per direction.
+        out = arch_cli.op_set_edge_contract("core_transform", "final_output", "data", kind="primary")
+        self.assertIn("已按方向拆为", out)
+        dirs = {(e["from"], e["to"]) for e in self.pair("core_transform", "final_output")}
+        self.assertEqual(dirs, {("core_transform", "final_output"), ("final_output", "core_transform")})
+
+    def test_insert_into_merged_link_keeps_both_flows(self) -> None:
+        # Before the merge rule, splitting a pair holding `a -> b` and `a <-> b`
+        # kept only one of them (bucketed by endpoints) and silently lost a kind.
+        arch_cli.op_connect("final_output", "core_transform", "sync", kind="bidirectional")
+        arch_cli.op_add_node("proxy", "Proxy", "spec", status="solid",
+                             after_node="core_transform", before_node="final_output")
+        g = arch_cli._load_graph()
+        for a, b in (("core_transform", "proxy"), ("proxy", "final_output")):
+            [half] = self.pair(a, b, g["edges"])
+            self.assertEqual(half["kind"], "bidirectional")
+            kinds = {m.get("kind", "primary") for m in half["members"]}
+            self.assertEqual(kinds, {"primary", "bidirectional"})
+
+    def test_merged_link_keeps_pipeline_skeleton(self) -> None:
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+        arch_cli.op_connect("final_output", "core_transform", "sync", kind="bidirectional")
+        self.assertEqual(
+            arch_cli._find_walking_skeleton(arch_cli._load_graph()),
+            ["entry_input", "core_transform", "final_output"],
+        )
+
+    def test_fold_merges_two_way_boundary_and_unfold_restores(self) -> None:
+        for nid in ("entry_input", "core_transform", "final_output"):
+            self.collapse(nid)
+        arch_cli.op_add_node("mon", "Monitor", "spec", status="solid")
+        arch_cli.op_connect("entry_input", "mon", "probe", kind="bidirectional")
+        arch_cli.op_connect("mon", "core_transform", "tune")
+        before = sorted(
+            (e["from"], e["to"], e.get("kind", "primary"), e["contract"])
+            for e in arch_cli._load_graph()["edges"]
+        )
+        arch_cli.op_fold(["entry_input", "core_transform"], "front", "前端", "spec")
+        [link] = self.pair("mon", "front")
+        self.assertEqual(link["kind"], "bidirectional")
+        arch_cli.op_unfold("front")
+        after = sorted(
+            (e["from"], e["to"], e.get("kind", "primary"), e["contract"])
+            for e in arch_cli._load_graph()["edges"]
+        )
+        self.assertEqual(after, before)
 
 
 if __name__ == "__main__":

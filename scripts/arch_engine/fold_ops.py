@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .common import ArchEngineError, _load_config, _load_graph, _save_graph, _shadow_commit
 from .graph import (
     SOLID_STATUSES, _container_topology, _edge_from_members, _edge_kind, _edge_members,
+    _merge_bidirectional_pairs,
     _get_node, _is_feedback, _iter_all_nodes, _max_subtree_depth, _node_state, _resolve_container,
     _sccs, _validate_topology,
 )
@@ -253,9 +254,11 @@ def op_fold(
     insert_at = min(i for i, n in enumerate(c_nodes) if n["id"] in member_set)
     remaining = [n for n in c_nodes if n["id"] not in member_set]
     new_nodes = remaining[:insert_at] + [super_node] + remaining[insert_at:]
-    new_edges = [
+    # Boundary edges are grouped per direction; a neighbour linked both ways
+    # with a bidirectional edge ends up as one bidirectional link to the super node.
+    new_edges = _merge_bidirectional_pairs([
         e for e in c_edges if e["from"] not in member_set and e["to"] not in member_set
-    ] + folded_edges
+    ] + folded_edges)
     _replace_container_lists(container, new_nodes, new_edges)
     if "children" in container:
         parent_ports: Dict[str, List[str]] = {}
@@ -395,8 +398,15 @@ def op_unfold(
     for e in (e for e in c_edges if super_id in (e["from"], e["to"])):
         inbound = e["to"] == super_id
         neighbour = e["from"] if inbound else e["to"]
-        inner_end = "to" if inbound else "from"
         for m in _edge_members(e):
+            # A merged bidirectional link may hold members running either way,
+            # so take the direction from the member, not from the edge.
+            if m["to"] in owner:
+                m_inbound, inner_end = True, "to"
+            elif m["from"] in owner:
+                m_inbound, inner_end = False, "from"
+            else:
+                m_inbound, inner_end = inbound, ("to" if inbound else "from")
             child = owner.get(m[inner_end])
             if child is None:
                 # Attached while folded: route it to the right child and record
@@ -410,7 +420,7 @@ def op_unfold(
                         unresolved.append(item)
                     continue
                 m = {**m, inner_end: child}
-            key = (neighbour, child) if inbound else (child, neighbour)
+            key = (neighbour, child) if m_inbound else (child, neighbour)
             grouped.setdefault(key, []).append(m)
 
     restored: List[Dict[str, Any]] = [dict(e) for e in sn["inner_edges"]]
@@ -425,7 +435,9 @@ def op_unfold(
 
     idx = next(i for i, n in enumerate(c_nodes) if n["id"] == super_id)
     new_nodes = c_nodes[:idx] + sn["children"] + c_nodes[idx + 1:]
-    new_edges = [e for e in c_edges if super_id not in (e["from"], e["to"])] + restored
+    new_edges = _merge_bidirectional_pairs(
+        [e for e in c_edges if super_id not in (e["from"], e["to"])] + restored
+    )
     _replace_container_lists(container, new_nodes, new_edges)
     if "children" in container:
         saved_ports = sn.get("parent_ports") or {}

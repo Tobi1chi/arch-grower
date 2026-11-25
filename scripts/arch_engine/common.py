@@ -356,6 +356,13 @@ def _load_graph() -> Dict[str, Any]:
 
 
 def _save_graph(data: Dict[str, Any]) -> None:
+    from .invariants import enforce  # lazy: invariants imports this module
+
+    try:
+        cfg: Optional[Dict[str, Any]] = _load_config() if CONFIG_FILE.exists() else None
+    except Exception:
+        cfg = None
+    enforce(data, cfg)
     GRAPH_FILE.write_text(
         json.dumps(data, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",

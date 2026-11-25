@@ -398,7 +398,9 @@ def _flatten_folds(
     for e in raw:
         ekind = _edge_kind(e)
         for m in _edge_members(e):
-            mkind = m.get("kind") or ekind
+            # Members carry their own kind; a member without one is primary
+            # when it sits inside a merged bidirectional link.
+            mkind = m.get("kind") or ("primary" if e.get("members") and ekind == "bidirectional" else ekind)
             # An endpoint that is still ambiguous connects to every candidate:
             # extra dependencies can only remove entries and exits, so the
             # skeleton is never reported ready on a guess.
@@ -872,6 +874,13 @@ def _edge_members(e: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _edge_from_members(u: str, v: str, members: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build the `u -> v` edge standing for `members`.
+
+    Kind: bidirectional if any member is (a bidirectional link absorbs every
+    other edge between the same pair, see `_merge_bidirectional_pairs`), else
+    the members' common kind, else primary. Members keep their own direction;
+    only a bidirectional edge may hold members running `v -> u`.
+    """
     kinds = {_edge_kind(m) for m in members}
     if len(members) == 1 and (members[0]["from"], members[0]["to"]) == (u, v):
         out: Dict[str, Any] = {"from": u, "to": v, "contract": members[0].get("contract", "")}
@@ -880,11 +889,53 @@ def _edge_from_members(u: str, v: str, members: List[Dict[str, Any]]) -> Dict[st
         return out
     contract = _merge_contracts([m.get("contract", "") for m in members])
     out = {"from": u, "to": v, "contract": contract, "auto_contract": contract, "members": members}
-    if len(kinds) == 1:
+    if "bidirectional" in kinds:
+        out["kind"] = "bidirectional"
+    elif len(kinds) == 1:
         only_kind = next(iter(kinds))
         if only_kind != "primary":
             out["kind"] = only_kind
     return out
+
+
+def _merge_bidirectional_pairs(edges: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One link per node pair once it is bidirectional.
+
+    A bidirectional edge already covers both directions, so any other edge
+    between the same two nodes (either way round, any kind) is merged into it.
+    The merged edge keeps the first bidirectional edge's orientation and
+    position; every original edge survives as a member with its own direction
+    and kind, so unfold and skeleton flattening still see the real flows.
+    Pairs without a bidirectional edge are left untouched (`a -> b` primary
+    next to `b -> a` feedback is a normal loop).
+    """
+    by_pair: Dict[frozenset, List[int]] = {}
+    for i, e in enumerate(edges):
+        by_pair.setdefault(frozenset((e["from"], e["to"])), []).append(i)
+
+    replace: Dict[int, Dict[str, Any]] = {}
+    drop: Set[int] = set()
+    for idxs in by_pair.values():
+        if len(idxs) < 2:
+            continue
+        bidir = [i for i in idxs if _edge_kind(edges[i]) == "bidirectional"]
+        if not bidir:
+            continue
+        anchor = edges[bidir[0]]
+        members: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str, str]] = set()
+        for i in idxs:
+            for m in _edge_members(edges[i]):
+                key = (m["from"], m["to"], _edge_kind(m))
+                if key not in seen:
+                    seen.add(key)
+                    members.append(m)
+        replace[bidir[0]] = _edge_from_members(anchor["from"], anchor["to"], members)
+        drop.update(i for i in idxs if i != bidir[0])
+
+    if not replace:
+        return edges
+    return [replace.get(i, e) for i, e in enumerate(edges) if i not in drop]
 
 
 def _public_edge(e: Dict[str, Any]) -> Dict[str, Any]:
