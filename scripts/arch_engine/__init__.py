@@ -4,6 +4,7 @@ presets, typed records, context slicing.
 Module map (dependencies point downwards only):
 
     common      paths, presets, config.json, ArchEngineError, Shadow Git, graph.json I/O
+    invariants  whole-graph structural checks run by _save_graph (ARCH_INVARIANTS)
     graph       multi-topology containers, folds, walking skeleton, edge provenance, node state
     records     records.json storage, scopes, formatting, rendered md
     refs        `file.md#section` / `file.json#key` resolution

@@ -15,6 +15,7 @@ from .common import (
 )
 from .graph import (
     IMPL_LEVELS, VERIFY_LEVELS, VERIFY_TEXT, _container_topology, _edge_from_members, _edge_kind,
+    _container_edges, _merge_bidirectional_pairs,
     _edge_members, _find_any_node, _get_node, _is_feedback, _iter_all_nodes, _node_files,
     _node_state, _reject_manual_super_type, _resolve_container, _star_hub_id, _state_text,
     _store_files,
@@ -51,18 +52,40 @@ def _wire_inserted_node(
     the half that returns into `before`, so the new node sits on the forward
     path. `edge_kind` "" means "inherit, else primary".
     """
+    if node_id in (after_node, before_node):
+        raise ArchEngineError(
+            f"节点 '{node_id}' 不能接在自己前后（会形成自环）。\n"
+            "JIT 指令：--after / --before 应指向其他已有节点。"
+        )
+    if after_node and after_node == before_node:
+        raise ArchEngineError(
+            f"--after 与 --before 不能是同一个节点 '{after_node}'（会形成 {after_node} -> {node_id} -> {after_node} 的往返）。\n"
+            f"JIT 指令：挂成旁支只给 --after；需要双向交互时先只给 --after，再用 connect --kind bidirectional。"
+        )
+
     def plain(u: str, v: str, kind: str) -> Dict[str, Any]:
         e: Dict[str, Any] = {"from": u, "to": v, "contract": contract}
         if kind != "primary":
             e["kind"] = kind
         return e
 
+    def linked(edges: List[Dict[str, Any]], u: str, v: str) -> bool:
+        # Same rule as op_connect: one edge per direction, and a bidirectional
+        # link already covers its reverse. A fog node attached with
+        # `add-node --status fog --after X` keeps that edge, so activating it
+        # after X again must not add a second one.
+        return any(
+            (e["from"] == u and e["to"] == v)
+            or (e["from"] == v and e["to"] == u and _edge_kind(e) == "bidirectional")
+            for e in edges
+        )
+
     if not (after_node and before_node):
         kind = edge_kind or "primary"
-        if after_node:
-            c_edges.append(plain(after_node, node_id, kind))
-        elif before_node:
-            c_edges.append(plain(node_id, before_node, kind))
+        u, v = (after_node, node_id) if after_node else (node_id, before_node)
+        if (after_node or before_node) and not linked(c_edges, u, v):
+            c_edges.append(plain(u, v, kind))
+            _replace_edges(container, _merge_bidirectional_pairs(c_edges))
         return
 
     def is_split(e: Dict[str, Any]) -> bool:
@@ -75,30 +98,44 @@ def _wire_inserted_node(
     kept = [e for e in c_edges if not is_split(e)]
     if not old:
         kind = edge_kind or "primary"
-        kept += [plain(after_node, node_id, kind), plain(node_id, before_node, kind)]
-        _replace_edges(container, kept)
+        for u, v in ((after_node, node_id), (node_id, before_node)):
+            if not linked(kept, u, v):
+                kept.append(plain(u, v, kind))
+        _replace_edges(container, _merge_bidirectional_pairs(kept))
         return
 
+    # Which side of the split each original endpoint sits on (members may name
+    # nodes folded inside `after` / `before`).
+    after_ids = {n["id"] for n in _iter_all_nodes([_get_node(container, after_node, allow_super=True)])}
     inherit_contract = (contract or "TBD").strip() == "TBD"
-    first: Dict[Any, Dict[str, Any]] = {}
-    second: Dict[Any, Dict[str, Any]] = {}
+    halves: Dict[Any, Dict[Any, Dict[str, Any]]] = {}
     for oe in old:
-        reverse = oe["from"] == before_node
         for m in _edge_members(oe):
-            if reverse:
-                m = {**m, "from": m["to"], "to": m["from"]}
             mkind = _edge_kind(m)
+            forward = m["from"] in after_ids
+            if not forward and mkind == "bidirectional":
+                # Symmetric: orient it along the split.
+                m, forward = {**m, "from": m["to"], "to": m["from"]}, True
+            # A feedback member stays feedback only on the half that returns
+            # into its original target; the other half joins the forward path.
             k1 = edge_kind or ("primary" if mkind == "feedback" else mkind)
             k2 = edge_kind or mkind
             c = m.get("contract", "") if inherit_contract else contract
-            for bucket, u, v, k in ((first, m["from"], node_id, k1), (second, node_id, m["to"], k2)):
+            if forward:   # after-side -> X -> before-side
+                parts = (((after_node, node_id), m["from"], node_id, k1),
+                         ((node_id, before_node), node_id, m["to"], k2))
+            else:         # a merged link's reverse flow: before-side -> X -> after-side
+                parts = (((before_node, node_id), m["from"], node_id, k1),
+                         ((node_id, after_node), node_id, m["to"], k2))
+            for pair, u, v, k in parts:
                 item: Dict[str, Any] = {"from": u, "to": v, "contract": c or "TBD"}
                 if k != "primary":
                     item["kind"] = k
-                bucket.setdefault((u, v), item)
-    kept.append(_edge_from_members(after_node, node_id, list(first.values())))
-    kept.append(_edge_from_members(node_id, before_node, list(second.values())))
-    _replace_edges(container, kept)
+                halves.setdefault(pair, {}).setdefault((u, v, k), item)
+    for (u, v), bucket in halves.items():
+        if not linked(kept, u, v):
+            kept.append(_edge_from_members(u, v, list(bucket.values())))
+    _replace_edges(container, _merge_bidirectional_pairs(kept))
 
 
 def _initial_skeleton(topology: str) -> Dict[str, Any]:
@@ -378,27 +415,35 @@ def op_connect(
     _get_node(container, from_node)
     _get_node(container, to_node)
 
-    dup = any(
-        (e["from"] == from_node and e["to"] == to_node)
-        or (ekind == "bidirectional" and e["from"] == to_node and e["to"] == from_node and _edge_kind(e) == "bidirectional")
-        or (_edge_kind(e) == "bidirectional" and e["from"] == to_node and e["to"] == from_node)
-        for e in c_edges
-    )
-    if dup:
+    pair = {from_node, to_node}
+    between = [e for e in c_edges if {e["from"], e["to"]} == pair]
+    if any(_edge_kind(e) == "bidirectional" for e in between):
+        raise ArchEngineError(
+            f"'{from_node}' 与 '{to_node}' 之间已有双向连线，它已覆盖两个方向；如需修改契约请使用 set-edge-contract。"
+        )
+    if ekind != "bidirectional" and any(e["from"] == from_node and e["to"] == to_node for e in between):
         raise ArchEngineError(f"连线 '{from_node} -> {to_node}' 已存在；如需修改契约请使用 set-edge-contract。")
 
     edge: Dict[str, Any] = {"from": from_node, "to": to_node, "contract": contract}
     if ekind != "primary":
         edge["kind"] = ekind
     c_edges.append(edge)
+    # A bidirectional link absorbs any one-way edges already between the pair.
+    merged = ekind == "bidirectional" and bool(between)
+    if merged:
+        _replace_edges(container, _merge_bidirectional_pairs(c_edges))
 
     graph["step"] += 1
     tag = f"arch-step-{graph['step']:02d}"
     _save_graph(graph)
     arrow = "<->" if ekind == "bidirectional" else "->"
     _shadow_commit(tag, f"connect {from_node} {arrow} {to_node} ({ekind})")
+    note = ""
+    if merged:
+        absorbed = ", ".join(f"{e['from']} -> {e['to']}" for e in between)
+        note = f"\n已将原有单向连线（{absorbed}）并入这条双向连线，原连线保留为溯源成员。"
     return (
-        f"已建立连线 '{from_node} {arrow} {to_node}'（类型：{ekind}，契约：{contract}），快照 {tag}。\n\n"
+        f"已建立连线 '{from_node} {arrow} {to_node}'（类型：{ekind}，契约：{contract}），快照 {tag}。{note}\n\n"
         + op_focus(from_node, scope=scope)
     )
 
@@ -477,11 +522,31 @@ def op_set_edge_contract(
             else:
                 m["kind"] = new_kind
 
+    note = ""
+    if new_kind == "bidirectional":
+        before = len(c_edges)
+        _replace_edges(container, _merge_bidirectional_pairs(c_edges))
+        if len(_container_edges(container)) < before:
+            note = "\n已将同一对节点间的其他连线并入这条双向连线，原连线保留为溯源成员。"
+    elif kind and edge.get("members"):
+        # A merged bidirectional link may hold flows in both directions; a
+        # one-way edge cannot, so split it back into one edge per direction.
+        u, v = edge["from"], edge["to"]
+        u_ids = {n["id"] for n in _iter_all_nodes([_get_node(container, u, allow_super=True)])}
+        fwd = [m for m in _edge_members(edge) if m["from"] in u_ids]
+        rev = [m for m in _edge_members(edge) if m["from"] not in u_ids]
+        if rev:
+            split = [_edge_from_members(u, v, fwd)] if fwd else []
+            split.append(_edge_from_members(v, u, rev))
+            idx = next(i for i, e in enumerate(c_edges) if e is edge)
+            _replace_edges(container, c_edges[:idx] + split + c_edges[idx + 1:])
+            note = f"\n原双向连线含两个方向的流，已按方向拆为 {u} -> {v} 与 {v} -> {u}。"
+
     graph["step"] += 1
     tag = f"arch-step-{graph['step']:02d}"
     _save_graph(graph)
     _shadow_commit(tag, f"set-edge-contract {edge_label}")
-    return f"已更新连线 '{edge_label}' 的契约，快照 {tag}。\n\n" + op_focus(from_node, scope=scope)
+    return f"已更新连线 '{edge_label}' 的契约，快照 {tag}。{note}\n\n" + op_focus(from_node, scope=scope)
 
 
 def op_add_node(
@@ -796,7 +861,8 @@ def op_deactivate_node(
                 remaining_edges[remaining_edges.index(existing)] = _edge_from_members(
                     u, v, _edge_members(existing) + extra
                 )
-        _replace_edges(container, remaining_edges)
+        # A bypass that lands next to a bidirectional link joins it.
+        _replace_edges(container, _merge_bidirectional_pairs(remaining_edges))
 
     graph["step"] += 1
     tag = f"deactivate-{node_id}-s{graph['step']:02d}"
