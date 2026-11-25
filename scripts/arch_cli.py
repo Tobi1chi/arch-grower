@@ -16,7 +16,7 @@ from arch_engine import (
     op_activate_node, op_add_node, op_bootstrap, op_collapse, op_commit_node, op_config,
     op_connect, op_deactivate_node, op_disconnect, op_export_task, op_export_ui, op_facts,
     op_focus, op_fold, op_fork, op_graveyard_add, op_ground, op_init, op_legacy,
-    op_migrate_records, op_open_add, op_open_list, op_open_resolve, op_promote, op_rescope,
+    op_migrate_records, op_open_add, op_open_list, op_open_resolve, op_patch, op_promote, op_rescope,
     op_reset_node, op_set_edge_contract, op_set_node_state, op_status, op_sync_manual,
     op_unfold, op_verify,
 )
@@ -41,7 +41,7 @@ __all__ = [
     "op_connect", "op_deactivate_node", "op_disconnect", "op_export_task", "op_export_ui",
     "op_facts", "op_focus", "op_fold", "op_fork", "op_graveyard_add", "op_ground", "op_init",
     "op_legacy", "op_migrate_records", "op_open_add", "op_open_list", "op_open_resolve",
-    "op_promote", "op_rescope", "op_reset_node", "op_set_edge_contract", "op_set_node_state",
+    "op_patch", "op_promote", "op_rescope", "op_reset_node", "op_set_edge_contract", "op_set_node_state",
     "op_status", "op_sync_manual", "op_unfold", "op_verify",
     "REF_WHOLE_FILE_LIMIT", "_load_config", "_load_graph", "_save_config", "_save_graph", "_today",
     "SIGNATURE_LINE", "_find_any_node", "_find_walking_skeleton", "_node_state",
@@ -166,6 +166,15 @@ def main() -> None:
         help="折叠期间新增连线的归位：外部节点ID=子节点ID（可重复）",
     )
     p_unfold.add_argument("--in", dest="scope", default="", help="父级子系统 ID")
+
+    p_patch = sub.add_parser(
+        "patch",
+        help="底层逃生口：在一个事务里批量增删改节点/连线（强制结构校验，仅当语义命令无法表达时使用）",
+    )
+    p_patch_src = p_patch.add_mutually_exclusive_group(required=True)
+    p_patch_src.add_argument("--ops", help='JSON 操作列表，如 \'[{"op":"add_edge","from":"a","to":"b"}]\'')
+    p_patch_src.add_argument("--file", help="包含 JSON 操作列表的文件")
+    p_patch.add_argument("--in", dest="scope", default="", help="子系统超级节点 ID")
 
     p_ver = sub.add_parser("verify", help="沉淀已验证事实与架构约束")
     p_ver.add_argument("--fact", required=True)
@@ -336,6 +345,15 @@ def main() -> None:
                     raise ArchEngineError(f"--attach 格式应为 外部节点ID=子节点ID，收到：{pair}")
                 attach[neighbour.strip()] = child.strip()
             print(op_unfold(args.node, attach, scope=args.scope))
+        elif args.cmd == "patch":
+            if args.file:
+                try:
+                    ops_text = open(args.file, encoding="utf-8").read()
+                except OSError as exc:
+                    raise ArchEngineError(f"无法读取 patch 文件 '{args.file}'：{exc}") from None
+            else:
+                ops_text = args.ops
+            print(op_patch(ops_text, scope=args.scope))
         elif args.cmd == "verify":
             print(op_verify(args.fact, args.constraint, args.scope, args.source, args.supersedes))
         elif args.cmd == "set-node-state":

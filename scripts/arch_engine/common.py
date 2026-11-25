@@ -122,7 +122,7 @@ class ArchEngineError(Exception):
 MODES = ("basic", "advanced")
 BASIC_PRESETS = ("standard", "lean")
 ADVANCED_COMMANDS = (
-    "fold", "promote", "unfold",
+    "fold", "promote", "unfold", "patch",
     "graveyard", "rescope", "legacy", "migrate-records",
 )
 
