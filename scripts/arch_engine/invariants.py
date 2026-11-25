@@ -204,9 +204,11 @@ def invariants_mode() -> str:
     return mode if mode in MODES else "warn"
 
 
-def enforce(graph: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) -> None:
-    """Apply the configured mode; raise in strict mode on hard violations."""
-    mode = invariants_mode()
+def enforce(
+    graph: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None, mode: str = "",
+) -> None:
+    """Apply `mode` (default: ARCH_INVARIANTS); raise in strict mode on hard violations."""
+    mode = mode if mode in MODES else invariants_mode()
     if mode == "off":
         return
     violations = validate_graph(graph, cfg)

@@ -355,18 +355,27 @@ def _load_graph() -> Dict[str, Any]:
     return json.loads(GRAPH_FILE.read_text(encoding="utf-8"))
 
 
-def _save_graph(data: Dict[str, Any]) -> None:
-    from .invariants import enforce  # lazy: invariants imports this module
-
-    try:
-        cfg: Optional[Dict[str, Any]] = _load_config() if CONFIG_FILE.exists() else None
-    except Exception:
-        cfg = None
-    enforce(data, cfg)
+def _write_graph(data: Dict[str, Any]) -> None:
+    """Write graph.json as is. Callers must have validated it (see kernel.GraphTx)."""
     GRAPH_FILE.write_text(
         json.dumps(data, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+
+
+def _load_config_if_any() -> Optional[Dict[str, Any]]:
+    try:
+        return _load_config() if CONFIG_FILE.exists() else None
+    except Exception:
+        return None
+
+
+def _save_graph(data: Dict[str, Any]) -> None:
+    """Validate (per ARCH_INVARIANTS) and write graph.json."""
+    from .invariants import enforce  # lazy: invariants imports this module
+
+    enforce(data, _load_config_if_any())
+    _write_graph(data)
 
 
 def _today() -> str:

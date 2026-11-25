@@ -4,11 +4,13 @@ presets, typed records, context slicing.
 Module map (dependencies point downwards only):
 
     common      paths, presets, config.json, ArchEngineError, Shadow Git, graph.json I/O
-    invariants  whole-graph structural checks run by _save_graph (ARCH_INVARIANTS)
+    invariants  whole-graph structural checks run before graph.json is written (ARCH_INVARIANTS)
     graph       multi-topology containers, folds, walking skeleton, edge provenance, node state
     records     records.json storage, scopes, formatting, rendered md
     refs        `file.md#section` / `file.json#key` resolution
     migration   migrate-records (old md -> verbatim legacy chunks)
+    kernel      GraphTx (one command = one validated write + snapshot) and Container primitives;
+                the only code that changes node / edge lists
     views       focus, export-task, facts, status (read-only)
     graph_ops   init, bootstrap, node and edge operations (connect / disconnect / ...)
     fold_ops    fold / unfold / promote

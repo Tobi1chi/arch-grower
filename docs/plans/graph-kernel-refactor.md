@@ -116,6 +116,39 @@ class Container:                     # 抹平 root / super_node 差异
 ### 阶段 4（可选）：底层逃生口 `arch patch`
 仅在阶段 0–3 完成后考虑。接受 JSON Patch 风格的操作列表，在一个 `GraphTx` 中执行，并经过同一套不变式校验。默认只在 advanced 模式开放，SKILL.md 中写明：仅当语义命令无法表达时使用。
 
+### 阶段 1–4 执行细化（2026-11-26，开工前定稿）
+
+阶段 0 之后，代码现状修正了几处原计划假设：
+
+- **深拷贝不需要**：每个命令都从磁盘重新 load，失败时只要不写盘，内存中的对象直接丢弃即可。`GraphTx` 只需保证"校验失败 → 不写任何文件"。
+- **有命令在写图之前就写了其他文件**：`reset-node` 先写 `records.json`（墓志）再写 `graph.json`。如果图校验失败，墓志已经落盘，二者就不一致了。因此 `commit` 需要一个 `before_write` 钩子，顺序固定为：校验 → 写附属文件 → 写图 → 快照。
+- **tag 依赖自增后的 step**：`commit-node` 会把 tag 写进节点，所以"step+1"必须是单独的 `bump()`，在 commit 之前调用，不能并进 commit。
+
+**阶段 1：`arch_engine/kernel.py` 骨架 + 全部命令走事务**
+1. `common`：拆出 `_write_graph`（纯写盘）；`_save_graph` = 校验 + `_write_graph`，保留给外部调用方。`invariants.enforce` 增加 `mode` 参数，供 `commit(strict=True)` 使用。
+2. `GraphTx`：`graph` / `cfg`（惰性加载）/ `bump()` / `container(scope)` / `containers()` / `find_node()` / `all_ids()` / `replace_node_refs()` / `commit(tag, message, paths=None, before_write=None, strict=None)`。
+3. `Container`：`nodes` / `edges` / `path` / `depth` / `ancestors()` / `get()` / `has()` / `subtree_ids()` / `insert_node()` / `remove_nodes()` / `set_edges()`（**统一做双向边合并**）/ `add_edge()` / `remove_edge()` / `link()` / `wire_inserted()`（由 `_wire_inserted_node` 迁入）。
+4. 从 `graph_ops` / `fold_ops` 移入：`_replace_edges`、`_replace_container_lists`、`_swap_node_refs`、`_wire_inserted_node`。
+5. 所有写图命令（init / collapse / connect / disconnect / set-edge-contract / add-node / commit-node / sync-manual / reset-node / deactivate / activate / set-node-state / fold / promote / unfold）都改成 `tx = GraphTx()` … `tx.bump()` … `tx.commit(...)`。
+
+**阶段 2：fold / promote / unfold 结构下沉 + 修 D**
+1. `Container.partition(ids)` → `(inner, incoming, outgoing)`，供 `op_fold` 做校验；`Container.contract_into(super_node, ids)` 负责移动子节点、分组边界边、合并双向边、重写父级端口。
+2. `Container.promote(node_id, children, inner_edges, entry, exit)`：负责全局 ID 冲突检查和结构字段设置。
+3. `Container.expand(super_id, attach)`：
+   - 本层边界边按成员方向归位（现有逻辑）；
+   - **D 修复**：所有祖先容器中，溯源成员指向 `super_id` 的，按"入向用 entry_children、出向用 exit_children"重写到具体子节点。候选不唯一时使用 `attach[成员另一端]`，仍无法确定则与本层未归位项一起报错；**先全部算完再修改**，报错时图保持原样。
+   - **I8 修复**：本容器 `parent_ports` 中的 `super_id` 同样展开为对应的子节点。
+4. 新增性质测试：随机合法图上做 `fold → unfold`，结构应与原图相等；嵌套 `fold A ⊃ B → unfold B → unfold A`，结果应等于直接展开。
+
+**阶段 3：graph_ops 收尾**
+- `deactivate`（占位：`insert_node` + `replace_node_refs`；缝合：`set_edges`）、`add-node` / `activate`（`wire_inserted`）、`connect` / `disconnect` / `set-edge-contract`（`link` / `remove_edge` / `set_edges`）、其余只改字段的命令（通过 `get` 取节点）。
+- 完成标准检查：`graph_ops.py` / `fold_ops.py` 中不再出现 `_save_graph`、`graph["step"]`，也不再直接对 `edges` / `nodes` / `children` / `inner_edges` 赋值或 append（用 grep 检查）。
+
+**阶段 4：`arch patch`**
+- 操作：`add_node` / `update_node` / `remove_node` / `add_edge` / `update_edge` / `remove_edge`，作用于一个 scope，在一个事务里执行。**无论 `ARCH_INVARIANTS` 怎么设，都强制 strict**。
+- 字段白名单：不允许通过 patch 创建 super_node，也不允许改 `children` / `inner_edges` / 端口 / `members`（这些只能走 fold / promote / unfold）。删除节点会同时删除其连线；如果这个节点被端口或溯源成员引用，不变式会拒绝这次修改。
+- 入口：CLI `arch patch --ops '<json>' | --file ops.json [--scope]`，MCP 工具 `arch_patch`；归入 `ADVANCED_COMMANDS`。文档写明：仅当语义命令无法表达时使用。
+
 ### 阶段 0 结果（2026-11-26）
 
 **已落地**
