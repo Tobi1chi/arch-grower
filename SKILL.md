@@ -78,7 +78,7 @@ description: Progressive, autoregressive architecture facilitator. Use when star
 ## 三、 按需路由手册（触发以下场景时，先读取对应文件再行动）
 
 * **用户想要系统学习 / 演练完整使用流程时** $\rightarrow$ 读取 `references/onboarding_tutorial.md` 开启新手教练模式
-* **考虑切到 advanced 模式、引擎返回 `[ADVANCED_MODE_REQUIRED]`、需要折叠 / 拆分子系统、迁移旧记录或收窄事实作用域时** $\rightarrow$ 读取 `references/advanced.md`
+* **考虑切到 advanced 模式、引擎返回 `[ADVANCED_MODE_REQUIRED]` 或 `[GraphInvariant:…]`、需要折叠 / 拆分子系统、语义命令无法表达的底层修补（`patch`）、迁移旧记录或收窄事实作用域时** $\rightarrow$ 读取 `references/advanced.md`
 * **advanced 模式下选择或组合流水线 / 星形 / 环形拓扑、调整 `preset` 护栏时** $\rightarrow$ 读取 `references/topology_patterns.md`
 * **Stage 阶段内部遇到并列 / 并发 / 多态路由需要建模时** $\rightarrow$ 读取 `references/stage_patterns.md` 
 * **遇到代码不可见的现实环境、硬件或黑盒约束需要向用户确认时** $\rightarrow$ 读取 `references/grounding_guide.md`  

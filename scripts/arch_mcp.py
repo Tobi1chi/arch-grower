@@ -276,6 +276,30 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "arch_patch",
+        "description": (
+            "底层逃生口：在一个事务里对同一作用域批量执行节点/连线的增删改，全部成功才写入，并强制通过结构校验。"
+            "仅当 collapse / connect / add-node / deactivate 等语义命令无法表达时使用；"
+            "不能创建或改动子系统（请用 fold / promote / unfold）。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ops": {
+                    "type": "array",
+                    "description": (
+                        "操作列表。每项 op 为 add_node {id,label,spec?,status?(hole/solid/fog),type?,stage?,role?} / "
+                        "update_node {id,set:{label|spec|status|type|stage|role}} / remove_node {id} / "
+                        "add_edge {from,to,kind?,contract?} / update_edge {from,to,contract?,kind?} / remove_edge {from,to}"
+                    ),
+                    "items": {"type": "object"},
+                },
+                "scope": {"type": "string", "description": "可选：子系统超级节点 ID"},
+            },
+            "required": ["ops"],
+        },
+    },
+    {
         "name": "arch_verify",
         "description": (
             "沉淀已验证的客观事实与架构硬约束（结构化记录在 .arch/records.json，ground_truth.md 由工具生成）。"
@@ -675,6 +699,8 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
             spec=args.get("spec", ""),
             scope=args.get("scope", ""),
         )
+    if name == "arch_patch":
+        return engine.op_patch(args["ops"], scope=args.get("scope", ""))
     if name == "arch_unfold":
         return engine.op_unfold(args["node_id"], args.get("attach") or {}, scope=args.get("scope", ""))
     if name == "arch_verify":

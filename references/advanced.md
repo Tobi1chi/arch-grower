@@ -8,7 +8,7 @@
 | :--- | :--- | :--- |
 | 拓扑 | 只有一条流水线 `pipeline` | 另有星形中枢 `star`、环形闭环 `ring`，可分层嵌套子系统 |
 | 预设 | `standard` / `lean` | 另有 `agent`（默认环形）、`platform`（默认星形） |
-| 命令 | 推演、储备区、连线与契约、现实验证（`verify` / `open` / `facts` / `ground`）、实现与回滚 | 另有 `fold` / `promote` / `unfold`、`graveyard add`、`rescope`、`legacy`、`migrate-records` |
+| 命令 | 推演、储备区、连线与契约、现实验证（`verify` / `open` / `facts` / `ground`）、实现与回滚 | 另有 `fold` / `promote` / `unfold`、`patch`、`graveyard add`、`rescope`、`legacy`、`migrate-records` |
 | MCP | 只列出 basic 工具，并隐藏子系统参数（`scope`）与星形角色 | 列出全部工具 |
 
 - `init --topology star|ring` 或 `--preset agent|platform` 时，项目直接按 advanced 初始化。
@@ -35,6 +35,26 @@
   - 嵌套深度受 `preset.max_depth`（默认 2）保护。
   - 只能升级还没开始实现的节点；已经实现的节点先 `reset-node`。
 - **护栏**：`max_depth`、`max_chain_len`、`max_hub_degree`、`max_cycle_len` 都在 `.arch/config.json` 里，可用 `arch config` 查看，经用户确认后调整。
+- **在外层子系统里展开内层子系统**（`unfold --in 外层`）时，外层边界连线里指向内层子系统的溯源会一并改到它的入口 / 出口子节点。入口或出口不唯一时，引擎会报错并列出候选，带上 `attach={外部节点ID: 子节点ID}` 重试即可；报错时图不会有任何改动。
+
+## 3.1 底层修补（`patch`，逃生口）
+
+语义命令（`collapse` / `connect` / `add-node` / `deactivate` …）能表达的修改，一律用语义命令。只有它们表达不了时（例如一次性改名并重连一组节点，或删掉误建的节点），才用 `patch` 在同一作用域内批量增删改节点和连线：
+
+```bash
+arch patch --in "$SCOPE" --ops '[
+  {"op": "add_node", "id": "cache", "label": "缓存", "status": "solid"},
+  {"op": "add_edge", "from": "core", "to": "cache", "contract": "get/put"},
+  {"op": "remove_node", "id": "legacy_adapter"}
+]'
+```
+
+- 操作：`add_node` / `update_node`（`set` 只能改 `label` / `spec` / `status`(hole/solid/fog) / `type` / `stage` / `role`）/ `remove_node`（连带删掉它在本层的连线）/ `add_edge` / `update_edge`（`contract` / `kind`）/ `remove_edge`。也可以写进文件，用 `--file ops.json` 传入；MCP 工具为 `arch_patch`。
+- 全部操作成功才写入，并生成一个 `patch-sNN` 快照；任何一步失败，图保持原样。
+- 不能创建、修改或删除子系统节点，也不能改端口 / 溯源。这些只能通过 `fold` / `promote` / `unfold` 完成。
+- 无论 `ARCH_INVARIANTS` 怎么设置，`patch` 都会强制做结构校验。例如删掉子系统的入口子节点会被拒绝，错误中会带 `[GraphInvariant:I7]`。
+
+**结构校验**：每次写图前，引擎都会检查图结构是否完整（ID 唯一、连线端点存在、端口与溯源可解析等）。语义命令触发 `[GraphInvariant:Ix]` 时，说明是引擎内部错误，不是用户输入有问题：保留报错原文，用 `arch fork` 回退到上一个快照。环境变量 `ARCH_INVARIANTS=off|warn|strict` 控制普通命令的处理方式，默认 `warn`，只打印告警、仍然写入。
 
 ## 4. 记录维护
 

@@ -14,6 +14,7 @@ Module map (dependencies point downwards only):
     views       focus, export-task, facts, status (read-only)
     graph_ops   init, bootstrap, node and edge operations (connect / disconnect / ...)
     fold_ops    fold / unfold / promote
+    patch_ops   patch: low-level node / edge edits in one strict transaction (escape hatch)
     record_ops  verify, graveyard add, open items, rescope, legacy, config, ground
     dashboard   export-ui
 
@@ -30,6 +31,7 @@ from .graph_ops import (
     op_set_node_state, op_sync_manual,
 )
 from .migration import op_migrate_records
+from .patch_ops import op_patch
 from .record_ops import (
     op_config, op_graveyard_add, op_ground, op_legacy, op_open_add, op_open_list,
     op_open_resolve, op_rescope, op_verify,
@@ -42,6 +44,6 @@ __all__ = [
     "op_connect", "op_deactivate_node", "op_disconnect", "op_export_task", "op_export_ui",
     "op_facts", "op_focus", "op_fold", "op_fork", "op_graveyard_add", "op_ground", "op_init",
     "op_legacy", "op_migrate_records", "op_open_add", "op_open_list", "op_open_resolve",
-    "op_promote", "op_rescope", "op_reset_node", "op_set_edge_contract", "op_set_node_state",
+    "op_patch", "op_promote", "op_rescope", "op_reset_node", "op_set_edge_contract", "op_set_node_state",
     "op_status", "op_sync_manual", "op_unfold", "op_verify",
 ]

@@ -1,6 +1,6 @@
 # 图内核重构计划：语义命令不变，内部收敛到 CRUD 内核 + 不变式校验
 
-> 状态：阶段 0 已完成（含 C 类修复）· 2026-11-26 · 分支基线 `feat/multi-topology-subsystems-presets` (d346aa4)
+> 状态：阶段 0–4 全部完成 · 2026-11-26 · 分支基线 `feat/multi-topology-subsystems-presets` (d346aa4)
 
 ## 1. 背景与结论
 
@@ -57,31 +57,34 @@
 
 > 每条不变式都要能指出违规位置（容器路径 + 节点/边），错误信息沿用 `ArchEngineError` 的 JIT 指令风格，前缀 `[GraphInvariant:I7]`。
 
-## 5. 图内核原语（`arch_engine/kernel.py`）
+## 5. 图内核原语（`arch_engine/kernel.py`，已实现）
 
-只负责结构变更，不含业务语义（护栏、提示文案、快照都不在这里）：
+只负责结构变更，不含业务语义（护栏、提示文案都不在这里）：
 
 ```python
-class GraphTx:                       # 一次命令一个事务
-    def __init__(self, graph, cfg)   # 深拷贝 graph，失败时原对象不受影响
-    def container(self, scope) -> Container
-    def commit(self, tag, message)   # validate → _save_graph → _shadow_commit → step += 1
+class GraphTx:                        # 一次命令一个事务；每个命令都从磁盘重新 load，无需深拷贝
+    graph / cfg / step
+    bump() -> int                     # step+1（tag 里要用，必须在 commit 之前调用）
+    root / container(scope) / containers()
+    all_ids() / find_node(id)
+    replace_node_refs(old, new)       # 连线端点、溯源成员、端口一并改
+    commit(tag, msg, paths=None, before_write=None, strict=False)
+                                      # 校验 → before_write（附属文件）→ 写图 → 快照
 
-class Container:                     # 抹平 root / super_node 差异
-    nodes / edges / topology
-    def get(node_id) / has(node_id)
-    def add_node(node, index=None)
-    def remove_node(node_id, *, drop_edges=True) -> removed_edges
-    def add_edge(u, v, *, contract="TBD", kind="primary", members=None)
-    def remove_edge(u, v) -> edge
-    def edges_of(node_id, direction="any", include_feedback=True)
-    def replace_endpoint(old_id, new_id)        # 合并 _swap_node_refs 的逻辑
-    def split_edge(u, v, mid, *, kind_override="", contract="")   # 来自 _wire_inserted_node
-    def contract_into(member_ids, super_node) -> boundary_edges    # fold 的结构部分
-    def expand(super_id) -> restored_ids                            # unfold 的结构部分
+class Container:                      # root 或 super_node 的内部，统一视图
+    nodes / edges / path / depth / ancestors()
+    get / has / index / subtree_ids / edges_between / covers / find_link
+    set_nodes / insert_node / remove_nodes
+    set_edges                         # 写入时统一合并双向边对
+    add_edge / remove_edge / replace_edge / link / add_flows
+    retype_link / split_by_direction
+    wire_inserted                     # add-node / activate 的 --after / --before
+    partition / contract_into         # fold
+    promote                           # promote
+    expand                            # unfold（含祖先层溯源、parent_ports 改写）
 ```
 
-`_edge_members`、`_edge_from_members`、`_merge_contracts` 移入 kernel，作为边溯源的唯一实现。
+`_edge_members` / `_edge_from_members` / `_merge_bidirectional_pairs` 留在 `graph.py`，因为视图层（`_flatten_folds`）同样要读溯源；但修改溯源的代码只在 kernel 中。
 
 ## 6. 分阶段推进
 
@@ -186,6 +189,27 @@ class Container:                     # 抹平 root / super_node 差异
 
 **决策点结论**：检查器抓到了真 bug，阶段 1–3 按原计划推进；其中 D 证实 fold/unfold 的溯源维护需要集中到内核。
 
+### 阶段 1–4 结果（2026-11-26）
+
+| 阶段 | 提交 | 内容 |
+| :--- | :--- | :--- |
+| 1 | `99a23d0` | `kernel.py`：`GraphTx` + `Container` 基础原语；所有写图命令改为走事务。`reset-node` 改为图校验通过后才写墓志（修复"图被拒绝但墓志已落盘"）。行为不变：模糊测试结果与重构前完全一致。 |
+| 2 | `453335a` | fold / promote / unfold 的结构操作下沉到 `contract_into` / `promote` / `expand`。**修复 D**：祖先层溯源改写 + `parent_ports` 展开。另由更大规模的模糊测试发现并修复一处：反向存储的合并双向边中，"折叠期间新增"的成员按边方向归位，改写了错误的一端。 |
+| 3 | `1a7cb86` | `add_flows`（deactivate 旁路）、`retype_link`（set-edge-contract）下沉；`graph_ops` / `fold_ops` 中不再直接操作节点 / 连线列表。 |
+| 收尾修复 | 单独提交 | 阶段 2 的 `expand` 只改写了当前容器的 `parent_ports`，但祖先容器的 `parent_ports` 会继续指向后来被折叠到更深层的节点。改为对所有祖先一起改写。这个问题是发现模糊测试之前丢弃了 stderr、漏统计告警后查出来的，统计口径已随之修正。 |
+| 4 | 本次提交 | `arch patch` / MCP `arch_patch`：六种底层操作，单事务，强制 strict，归入 advanced 命令；文档见 `references/advanced.md` §3.1。 |
+
+**完成标准核对**
+- `grep` 检查：`graph_ops.py` / `fold_ops.py` / `patch_ops.py` 中没有 `_save_graph`、`graph["step"]`，也没有对 `edges` / `nodes` / `children` / `inner_edges` / 端口 / `members` 的赋值或 append。✅
+- 测试：176 个全部通过（test_arch_cli 128，test_invariants 23，test_kernel 15，test_patch 10）。✅
+- 模糊测试：300 seeds × 150 步，strict 模式下 **0 违规、0 崩溃、0 告警**（阶段 0 修复前为 65 条违规；阶段 2 之后仍有 69 条 I8 告警，见上表"收尾修复"行）。`fuzz_ops.py` 现在把告警也计为发现。✅
+- 对 agent 的接口：原有命令的名称、参数、输出文案不变；唯一新增的命令是 `patch`。✅
+
+**未做 / 遗留**
+- `ARCH_INVARIANTS` 仍默认 `warn`。按原计划应先观察一个版本再改为默认 `strict`。
+- I8（parent_ports）、I11（深度）仍是软告警：旧引擎写出的图可能已经带着失效端口，升级为硬错误会锁死这些项目的写操作。
+- 视图层（`views.py`）仍直接读取原始列表，只读不写，不在本次范围内。
+
 ## 7. 测试策略
 
 - **回归**：现有 `tests/test_arch_cli.py`（118 个用例）每个阶段必须全绿，输出文案不变。
@@ -205,6 +229,6 @@ class Container:                     # 抹平 root / super_node 差异
 ## 9. 完成标准
 
 - `_save_graph` 只能经由 `GraphTx.commit` 调用，op 中不再直接调用。
-- `fold_ops.py` / `graph_ops.py` 中不再直接对 `nodes/edges/children/inner_edges` 做赋值或 append（可用 grep 检查）。
+- `fold_ops.py` / `graph_ops.py` 中不再直接对 `nodes/edges/children/inner_edges` 做赋值或 append（可用 grep 检查）。✅
 - 不变式默认 `strict`，全部测试绿，新增往返性质测试通过。
 - 对 agent 而言，CLI / MCP 的行为没有可观察的变化。
