@@ -188,6 +188,26 @@ class FoldRoundTripTest(KernelTestCase):
         arch_cli.op_unfold("A", scope="core_transform")
         self.assertEqual(GraphTx().find_node("core_transform")["exit_children"], [f"{out}_out"])
 
+    def test_refolded_port_child_maps_to_its_new_owner(self) -> None:
+        # PR #5 review: fold a subsystem's port child twice, unfold the outer
+        # fold; the saved entry port must name the new direct child, not the
+        # now-nested original, so the final unfold wires a real node.
+        arch_cli.op_config(max_depth=3)
+        self.settle("entry_input", "final_output")
+        arch_cli.op_promote("core_transform", topology="pipeline")
+        self.settle("core_transform_in", "core_transform_core", "core_transform_out", scope="core_transform")
+        pair = ["core_transform_in", "core_transform_core"]
+        arch_cli.op_fold(pair, "front", "前段", "spec", scope="core_transform")
+        arch_cli.op_fold(pair, "inner", "内层", "spec", scope="front")
+        arch_cli.op_unfold("front", scope="core_transform")
+        self.assertEqual(GraphTx().find_node("core_transform")["entry_children"], ["inner"])
+
+        arch_cli.op_unfold("core_transform")
+        g = self.disk()
+        ids = {n["id"] for n in g["nodes"]}
+        self.assertIn(("entry_input", "inner"), {(e["from"], e["to"]) for e in g["edges"]})
+        self.assertTrue(all(e["from"] in ids and e["to"] in ids for e in g["edges"]))
+
     def test_unfold_reversed_merged_link_routes_each_flow(self) -> None:
         # The merged link is stored `final_output <-> core_transform` but holds
         # `core_transform -> final_output` too; each member must be routed by
